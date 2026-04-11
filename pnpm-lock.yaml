@@ -20,6 +20,9 @@ importers:
 
   apps/local-cli:
     dependencies:
+      '@diffmind/core-native':
+        specifier: workspace:*
+        version: link:../../packages/core-native
       '@diffmind/core-wasm':
         specifier: workspace:*
         version: link:../../packages/core-wasm
