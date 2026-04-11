@@ -61,7 +61,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.3")
+  .version("0.3.4")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -83,6 +83,22 @@ program
   .description("Build a symbol index of the local repository for context-aware reviews")
   .action(async () => {
     await runIndexer();
+  });
+
+program
+  .command("download")
+  .description("Download or refresh the local AI model files")
+  .option("-f, --force", "Force a fresh download of the model and tokenizer")
+  .action(async (options) => {
+    if (options.force) {
+      const modelPath = path.join(MODEL_DIR, MODEL_FILENAME);
+      const tokenizerPath = path.join(MODEL_DIR, TOKENIZER_FILENAME);
+      if (fs.existsSync(modelPath)) fs.unlinkSync(modelPath);
+      if (fs.existsSync(tokenizerPath)) fs.unlinkSync(tokenizerPath);
+      console.log(chalk.yellow("✓ Force flag active: existing model files cleared."));
+    }
+    await ensureModelFiles();
+    console.log(chalk.green("\n✓ Setup complete. Model is ready for use."));
   });
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -298,6 +314,10 @@ async function ensureModelFiles(): Promise<void> {
     await downloadFile(TOKENIZER_URL, tokenizerPath);
   }
 
+  if (fs.existsSync(modelPath) && fs.statSync(modelPath).size < 1024) {
+    fs.unlinkSync(modelPath);
+  }
+
   if (!fs.existsSync(modelPath)) {
     console.log(
       chalk.cyan(
@@ -313,10 +333,11 @@ function downloadFile(url: string, dest: string): Promise<void> {
     const file = fs.createWriteStream(dest);
     const get = url.startsWith("https") ? https.get : http.get;
     get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
-      if (res.statusCode === 302 || res.statusCode === 301) {
+      const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
+      if (isRedirect && res.headers.location) {
         file.close();
         fs.unlinkSync(dest);
-        downloadFile(res.headers.location!, dest).then(resolve).catch(reject);
+        downloadFile(res.headers.location, dest).then(resolve).catch(reject);
         return;
       }
       res.pipe(file);
@@ -332,8 +353,9 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const get = url.startsWith("https") ? https.get : http.get;
     get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
-      if (res.statusCode === 302 || res.statusCode === 301) {
-        downloadFileWithProgress(res.headers.location!, dest)
+      const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
+      if (isRedirect && res.headers.location) {
+        downloadFileWithProgress(res.headers.location, dest)
           .then(resolve)
           .catch(reject);
         return;
