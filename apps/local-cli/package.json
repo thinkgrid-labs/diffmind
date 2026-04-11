@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "diffmind CLI — local-first AI code review for your git diffs",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",
   "license": "MIT",
@@ -16,7 +16,8 @@
     "dist/"
   ],
   "bin": {
-    "diffmind": "./dist/index.js"
+    "diffmind": "./dist/index.js",
+    "@diffmind/cli": "./dist/index.js"
   },
   "main": "./dist/index.js",
   "scripts": {
