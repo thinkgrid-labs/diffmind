@@ -61,7 +61,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.4")
+  .version("0.3.5")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -70,7 +70,16 @@ program
   .option("--stdin", "Read git diff from stdin instead of running git diff")
   .option("--no-color", "Disable colored output")
   .action(async (options) => {
-    // This is the default action (no subcommand used)
+    // Check if we are actually running a subcommand
+    // commander names the subcommand as the first element of program.args
+    const isSubcommand = program.commands.some(
+      (cmd) => program.args[0] === cmd.name() || cmd.aliases().includes(program.args[0])
+    );
+
+    if (isSubcommand) {
+      return; // Let the subcommand handler take over
+    }
+
     Object.assign(opts, options);
     await main().catch((err) => {
       console.error(chalk.red(`Fatal Error: ${err.message}`));
@@ -337,7 +346,8 @@ function downloadFile(url: string, dest: string): Promise<void> {
       if (isRedirect && res.headers.location) {
         file.close();
         fs.unlinkSync(dest);
-        downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+        const nextUrl = new URL(res.headers.location, url).href;
+        downloadFile(nextUrl, dest).then(resolve).catch(reject);
         return;
       }
       res.pipe(file);
@@ -355,7 +365,8 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
     get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
       const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
       if (isRedirect && res.headers.location) {
-        downloadFileWithProgress(res.headers.location, dest)
+        const nextUrl = new URL(res.headers.location, url).href;
+        downloadFileWithProgress(nextUrl, dest)
           .then(resolve)
           .catch(reject);
         return;
@@ -398,9 +409,4 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
   });
 }
 
-if (require.main === module) {
-  main().catch((err) => {
-    console.error(chalk.red("\nUnexpected error:"), err);
-    process.exit(1);
-  });
-}
+// End of file
