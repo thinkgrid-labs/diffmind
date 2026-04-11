@@ -109,7 +109,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.1")
+  .version("0.4.2")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -351,7 +351,15 @@ async function getDiff(): Promise<string> {
     }
 
     const diff = result.stdout.toString();
-    spinner.succeed(`Diff captured (${Math.round(diff.length / 1024)}KB)`);
+    const sizeKB = Math.round(diff.length / 1024);
+    spinner.succeed(`Diff captured (${sizeKB}KB)`);
+
+    if (sizeKB > 500) {
+      console.log(chalk.yellow(`\n⚠️  Warning: Large diff detected (${sizeKB}KB).`));
+      console.log(chalk.dim(`  Analyzing very large diffs can be slow on local AI and may impact quality.`));
+      console.log(chalk.dim(`  Consider reviewing in smaller increments or using --branch to target specific changes.\n`));
+    }
+
     return diff;
   } catch (err) {
     spinner.fail("Failed to get git diff");

@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/core-native",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Native Node.js addon for diffmind AI engine",
   "main": "index.js",
   "types": "index.d.ts",
