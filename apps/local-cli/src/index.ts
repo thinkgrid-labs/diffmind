@@ -36,12 +36,12 @@ import {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MODEL_DIR = path.join(os.homedir(), ".diffmind", "models");
-const MODEL_FILENAME = "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf";
+const MODEL_FILENAME = "qwen2.5-coder-3b-instruct-q4_k_m.gguf";
 const TOKENIZER_FILENAME = "tokenizer.json";
 
 // HuggingFace Hub URLs
 const MODEL_URL =
-  "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf";
+  "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf";
 const TOKENIZER_URL =
   "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct/resolve/main/tokenizer.json";
 
@@ -61,7 +61,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.6")
+  .version("0.3.7")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -366,9 +366,16 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
       const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
       if (isRedirect && res.headers.location) {
         const nextUrl = new URL(res.headers.location, url).href;
+        console.log(chalk.dim(`  Redirecting to: ${nextUrl}`));
         downloadFileWithProgress(nextUrl, dest)
           .then(resolve)
           .catch(reject);
+        return;
+      }
+
+      const statusCode = res.statusCode || 0;
+      if (statusCode < 200 || statusCode >= 300) {
+        reject(new Error(`Server returned status code ${statusCode} for ${url}`));
         return;
       }
 
@@ -411,10 +418,24 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
       res.on("end", () => {
         bar.stop();
         file.close(() => {
-          if (downloaded === 0) {
-            reject(new Error("Download failed: 0 bytes received"));
+          const isModel = dest.endsWith(".gguf");
+          const minSize = isModel ? 1024 * 1024 * 100 : 1024; // 100MB for model, 1kb for tokenizer
+          
+          if (downloaded < minSize) {
+            fs.unlinkSync(dest);
+            reject(
+              new Error(
+                `Download failed: file is too small (${(
+                  downloaded / 1024 / 1024
+                ).toFixed(2)} MB received). The connection may have been throttled or interrupted.`
+              )
+            );
           } else {
-            console.log(chalk.dim(`  Downloaded: ${(downloaded / 1024 / 1024).toFixed(1)} MB`));
+            console.log(
+              chalk.dim(
+                `  Downloaded: ${(downloaded / 1024 / 1024).toFixed(1)} MB`
+              )
+            );
             resolve();
           }
         });
