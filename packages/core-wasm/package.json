@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/core-wasm",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "diffmind Wasm core — compiled from Rust via wasm-pack",
   "license": "MIT",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",
@@ -16,6 +16,7 @@
   "types": "./pkg/core_wasm.d.ts",
   "scripts": {
     "build": "wasm-pack build --target nodejs --out-dir pkg --out-name core_wasm",
+    "postbuild": "node -e \"const fs = require('fs'); if (fs.existsSync('pkg/.gitignore')) fs.unlinkSync('pkg/.gitignore')\"",
     "build:web": "wasm-pack build --target web --out-dir pkg-web --out-name core_wasm",
     "test": "wasm-pack test --node"
   },
