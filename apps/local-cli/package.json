@@ -1,0 +1,45 @@
+{
+  "name": "@diffmind/cli",
+  "version": "0.1.0",
+  "description": "diffmind CLI — local-first AI code review for your git diffs",
+  "author": "Thinkgrid Labs <hello@thinkgrid.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkgrid-labs/diffmind.git",
+    "directory": "apps/local-cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/"
+  ],
+  "bin": {
+    "diffmind": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@diffmind/core-wasm": "workspace:*",
+    "@diffmind/shared-types": "workspace:*",
+    "chalk": "^5.3.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.0.0",
+    "ora": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.11.5",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

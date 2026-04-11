@@ -1,0 +1,35 @@
+{
+  "name": "@diffmind/shared-types",
+  "version": "0.1.0",
+  "description": "Shared TypeScript types for diffmind review findings",
+  "license": "MIT",
+  "author": "Thinkgrid Labs <hello@thinkgrid.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkgrid-labs/diffmind.git",
+    "directory": "packages/shared-types"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
