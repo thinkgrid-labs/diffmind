@@ -5,12 +5,10 @@
  * Local-first AI code review for your git diffs.
  * Powered by Qwen2.5-Coder-3B running entirely on-device via WebAssembly.
  *
- * Usage:
- *   diffmind --branch main
- *   diffmind --branch develop --format json
  *   git diff main...HEAD | diffmind --stdin
  */
 
+import { Indexer } from "./indexer";
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
@@ -47,9 +45,16 @@ const TOKENIZER_URL =
 const program = new Command();
 
 program
+  .command("index")
+  .description("Build a symbol index of the local repository for context-aware reviews")
+  .action(async () => {
+    await runIndexer();
+  });
+
+program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.2.0")
+  .version("0.3.0")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option(
     "-f, --format <type>",
@@ -67,8 +72,26 @@ program
     "low"
   )
   .option("--stdin", "Read git diff from stdin instead of running git diff")
-  .option("--no-color", "Disable colored output")
-  .parse(process.argv);
+  .option("--no-color", "Disable colored output");
+
+// ─── Entry Point ──────────────────────────────────────────────────────────────
+
+function run() {
+  program.parse(process.argv);
+  
+  // If no subcommand is used, run the default analysis
+  if (!program.args.length || program.args[0] !== "index") {
+    main().catch((err) => {
+      console.error(chalk.red(`Fatal Error: ${err.message}`));
+      process.exit(1);
+    });
+  }
+}
+
+// Only run if executed directly
+if (require.main === module) {
+  run();
+}
 
 const opts = program.opts<{
   branch: string;
@@ -80,11 +103,9 @@ const opts = program.opts<{
   context?: string;
 }>();
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main Logic ───────────────────────────────────────────────────────────────
 
 import { Worker } from "worker_threads";
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   printBanner();
@@ -109,7 +130,13 @@ async function main(): Promise<void> {
     }
   }
 
-  // 4. Run analysis in a background worker
+  // 4. Retrieve architectural context (Local RAG Phase 1)
+  const ragContext = await getRagContext(diff);
+  if (ragContext) {
+    context = `${context}\n\n### Architectural Reference (Local RAG):\n${ragContext}`;
+  }
+
+  // 5. Run analysis in a background worker
   // This keeps the process responsive and the spinner animated.
   const analyzeSpinner = ora("Initializing engine & analyzing diff...").start();
   
@@ -132,7 +159,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 5. Format and output results
+  // 6. Format and output results
   const output =
     opts.format === "json"
       ? formatJson(report)
@@ -188,6 +215,57 @@ function runAnalysisInWorker(workerData: {
       }
     });
   });
+}
+
+// ─── Local RAG ────────────────────────────────────────────────────────────────
+
+async function runIndexer(): Promise<void> {
+  const spinner = ora("Scanning repository for symbols...").start();
+  try {
+    const indexer = new Indexer(process.cwd());
+    const index = await indexer.buildIndex();
+    indexer.save(index);
+    spinner.succeed(`Index built: ${Object.keys(index.symbols).length} symbols found`);
+  } catch (err) {
+    spinner.fail("Indexing failed");
+    console.error(chalk.red(String(err)));
+    process.exit(1);
+  }
+}
+
+async function getRagContext(diff: string): Promise<string | null> {
+  const index = Indexer.load(process.cwd());
+  if (!index) return null;
+
+  const foundSymbols = new Set<string>();
+  const lines = diff.split("\n");
+
+  // Simple heuristic: find all words that match a known symbol name in added/modified lines
+  for (const line of lines) {
+    if (!line.startsWith("+") || line.startsWith("+++")) continue;
+
+    const words = line.match(/[a-zA-Z0-9_$]+/g);
+    if (!words) continue;
+
+    for (const word of words) {
+      if (index.symbols[word]) {
+        foundSymbols.add(word);
+      }
+    }
+  }
+
+  if (foundSymbols.size === 0) return null;
+
+  let contexts = "";
+  // Pick top 10 symbols to avoid prompt overflow
+  const symbolsToInclude = Array.from(foundSymbols).slice(0, 10);
+  
+  for (const symName of symbolsToInclude) {
+    const def = index.symbols[symName];
+    contexts += `\n--- Symbol: ${symName} (from ${def.file}) ---\n${def.snippet}\n`;
+  }
+
+  return contexts;
 }
 
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
@@ -395,7 +473,7 @@ export function categoryBadge(category: Category): string {
 }
 
 function printBanner(): void {
-  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.2.0 — local-first AI code review"));
+  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.3.0 — local-first AI code review"));
   console.log(chalk.dim("  Model: Qwen2.5-Coder-3B-Instruct Q4_K_M | Inference: on-device Wasm\n"));
 }
 
