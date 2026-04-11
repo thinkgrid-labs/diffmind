@@ -128,7 +128,8 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.3")
+  .version("0.4.4")
+  .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -136,11 +137,11 @@ program
   .option("--min-severity <level>", 'Minimum severity to report: "high", "medium", or "low"', "low")
   .option("--stdin", "Read git diff from stdin instead of running git diff")
   .option("--no-color", "Disable colored output")
-  .action(async (options) => {
+  .action(async (files, options) => {
     // Check if we are actually running a subcommand
     // commander names the subcommand as the first element of program.args
     const isSubcommand = program.commands.some(
-      (cmd) => program.args[0] === cmd.name() || cmd.aliases().includes(program.args[0])
+      (cmd) => files[0] === cmd.name() || cmd.aliases().includes(files[0])
     );
 
     if (isSubcommand) {
@@ -148,7 +149,7 @@ program
     }
 
     Object.assign(opts, options);
-    await main().catch((err) => {
+    await main(files).catch((err) => {
       console.error(chalk.red(`Fatal Error: ${err.message}`));
       process.exit(1);
     });
@@ -203,7 +204,7 @@ if (require.main === module) {
 
 import { Worker } from "worker_threads";
 
-async function main(): Promise<void> {
+async function main(files: string[] = []): Promise<void> {
   const modelId = getActiveModelId();
   const model = MODELS[modelId];
   printBanner();
@@ -214,7 +215,7 @@ async function main(): Promise<void> {
   await ensureModelFiles(modelId);
 
   // 2. Get the git diff
-  const diff = await getDiff();
+  const diff = await getDiff(files);
   if (!diff.trim()) {
     console.log(chalk.green("✓ No changes detected. Nothing to analyze."));
     process.exit(0);
@@ -349,15 +350,33 @@ async function runIndexer(): Promise<void> {
 
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
 
-async function getDiff(): Promise<string> {
+function extractFilesFromDiff(diff: string): string[] {
+  const files = new Set<string>();
+  const lines = diff.split("\n");
+  for (const line of lines) {
+    if (line.startsWith("diff --git a/")) {
+      const parts = line.split(" ");
+      if (parts.length >= 3) {
+        // Extract from "a/path/to/file"
+        const filePath = parts[2].substring(2);
+        files.add(filePath);
+      }
+    }
+  }
+  return Array.from(files);
+}
+
+async function getDiff(includePaths: string[] = []): Promise<string> {
   if (opts.stdin) {
     return readStdin();
   }
+  
+  const targetPaths = includePaths.length > 0 ? includePaths : ["."];
   const spinner = ora(`Running git diff ${opts.branch}...HEAD`).start();
   try {
     const result = child_process.spawnSync(
       "git",
-      ["diff", `${opts.branch}...HEAD`, "--", ".", ...DEFAULT_IGNORED_PATHSPECS],
+      ["diff", `${opts.branch}...HEAD`, "--", ...targetPaths, ...DEFAULT_IGNORED_PATHSPECS],
       {
         maxBuffer: 20 * 1024 * 1024, // 20MB max raw buffer
         encoding: "utf-8",
@@ -372,6 +391,18 @@ async function getDiff(): Promise<string> {
     const diff = result.stdout.toString();
     const sizeKB = Math.round(diff.length / 1024);
     spinner.succeed(`Diff captured (${sizeKB}KB)`);
+
+    const capturedFiles = extractFilesFromDiff(diff);
+    if (capturedFiles.length > 0) {
+      if (capturedFiles.length <= 12) {
+        console.log(chalk.dim(`  Files: ${capturedFiles.join(", ")}`));
+      } else {
+        console.log(chalk.dim(`  Files: ${capturedFiles.length} files detected`));
+      }
+    } else if (diff.trim().length > 0) {
+      // If we have content but couldn't parse file names (e.g. non-git format)
+      console.log(chalk.dim("  Files: Detected changes in diff content"));
+    }
 
     // Hard Safety Limit: 1.5MB
     if (sizeKB > 1500) {
