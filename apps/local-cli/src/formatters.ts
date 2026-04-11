@@ -72,6 +72,6 @@ export function filterBySeverity(report: ReviewReport, minSeverity: Severity): R
 }
 
 export function printBanner(): void {
-  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.3.8 — local-first AI code review"));
+  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.3.9 — local-first AI code review"));
   console.log(chalk.dim("  Model: Qwen2.5-Coder-3B-Instruct Q4_K_M | Inference: on-device Wasm\n"));
 }

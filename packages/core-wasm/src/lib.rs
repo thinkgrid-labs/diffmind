@@ -99,12 +99,16 @@ impl ReviewAnalyzer {
         &mut self,
         diff: &str,
         context: &str,
-        _max_tokens_per_chunk: u32,
+        max_tokens_per_chunk: u32,
     ) -> Result<String, JsError> {
-        let chunks = split_diff_by_file(diff);
+        // More aggressive chunking for large files/diffs
+        let chunks = chunk_diff(diff, 150); 
         let mut all_findings: Vec<ReviewFinding> = Vec::new();
 
         for chunk in chunks {
+            if chunk.trim().is_empty() {
+                continue;
+            }
             let chunk_findings = self.analyze_diff_internal(&chunk, context)?;
             all_findings.extend(chunk_findings);
         }
@@ -125,11 +129,14 @@ impl ReviewAnalyzer {
         let prompt = self.format_prompt(diff, context);
         let response = self.generate(&prompt, 1024)?;
 
-        // Extract JSON block
+        // Extract JSON block safer
         let json_start = response.find('[').unwrap_or(0);
-        let json_end = response
-            .rfind(']')
-            .unwrap_or(response.len().saturating_sub(1));
+        let json_end = response.rfind(']').unwrap_or_else(|| response.len().saturating_sub(1));
+        
+        if json_end <= json_start || json_end >= response.len() {
+            return Ok(Vec::new()); // No valid JSON array found, safely skip
+        }
+
         let json_slice = &response[json_start..=json_end];
 
         // Validate and deserialize
@@ -213,23 +220,27 @@ impl ReviewAnalyzer {
     }
 }
 
-fn split_diff_by_file(diff: &str) -> Vec<String> {
+fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(diff.len() / 2);
+    let mut current = String::with_capacity(4096);
+    let mut line_count = 0;
 
     for line in diff.lines() {
-        if line.starts_with("diff --git") && !current.is_empty() {
+        // Start a new chunk if we hit a new file OR reached line limit
+        if (line.starts_with("diff --git") || line_count >= max_lines) && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
+            line_count = 0;
         }
         current.push_str(line);
         current.push('\n');
+        line_count += 1;
     }
 
     if !current.is_empty() {
         chunks.push(current);
     }
 
-    if chunks.is_empty() {
+    if chunks.is_empty() && !diff.is_empty() {
         vec![diff.to_string()]
     } else {
         chunks
