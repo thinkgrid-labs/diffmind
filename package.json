@@ -30,7 +30,7 @@
     "dev:cli": "pnpm --filter @diffmind/cli dev",
     "lint:types": "pnpm --filter @diffmind/shared-types build",
     "lint:cli": "pnpm --filter @diffmind/cli build",
-    "lint": "pnpm lint:types && pnpm lint:cli",
+    "lint": "pnpm build:wasm && pnpm lint:types && pnpm lint:cli",
     "test:wasm": "pnpm --filter @diffmind/core-wasm test",
     "test:js": "jest",
     "test": "pnpm test:js && pnpm test:wasm"
