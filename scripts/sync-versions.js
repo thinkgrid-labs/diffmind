@@ -20,6 +20,7 @@ const filesToUpdate = [
   'packages/core-wasm/package.json',
   'packages/core-wasm/Cargo.toml',
   'apps/local-cli/src/index.ts',
+  'apps/local-cli/src/formatters.ts',
 ];
 
 filesToUpdate.forEach(file => {
@@ -37,9 +38,10 @@ filesToUpdate.forEach(file => {
   } else if (file.endsWith('Cargo.toml')) {
     // Update TOML version field (usually under [package])
     content = content.replace(/^version\s*=\s*"[^"]+"/m, `version = "${cleanVersion}"`);
-  } else if (file.endsWith('src/index.ts')) {
-    // Update CLI hardcoded version string
+  } else if (file.endsWith('.ts')) {
+    // Update CLI commander version
     content = content.replace(/version\("[^"]+"\)/, `version("${cleanVersion}")`);
+    // Update hardcoded versions (like in the banner)
     content = content.replace(/v[0-9]+\.[0-9]+\.[0-9]+/, `v${cleanVersion}`);
   }
 
