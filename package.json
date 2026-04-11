@@ -1,6 +1,6 @@
 {
   "name": "diffmind",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "private": true,
   "description": "Local-first AI code review agent — powered by on-device Wasm inference",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
