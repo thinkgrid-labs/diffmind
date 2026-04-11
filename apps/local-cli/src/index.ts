@@ -49,7 +49,7 @@ const program = new Command();
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.1.0")
+  .version("0.2.0")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option(
     "-f, --format <type>",
@@ -57,6 +57,10 @@ program
     "markdown"
   )
   .option("-o, --output <file>", "Write output to a file instead of stdout")
+  .option(
+    "-c, --context <text|file>",
+    "Business context (ticket description, acceptance criteria)"
+  )
   .option(
     "--min-severity <level>",
     'Minimum severity to report: "high", "medium", or "low"',
@@ -73,6 +77,7 @@ const opts = program.opts<{
   minSeverity: Severity;
   stdin: boolean;
   color: boolean;
+  context?: string;
 }>();
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -94,7 +99,17 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // 3. Run analysis in a background worker
+  // 3. Prepare business context
+  let context = "";
+  if (opts.context) {
+    if (fs.existsSync(opts.context)) {
+      context = fs.readFileSync(opts.context, "utf-8");
+    } else {
+      context = opts.context;
+    }
+  }
+
+  // 4. Run analysis in a background worker
   // This keeps the process responsive and the spinner animated.
   const analyzeSpinner = ora("Initializing engine & analyzing diff...").start();
   
@@ -103,6 +118,7 @@ async function main(): Promise<void> {
       modelPath: path.join(MODEL_DIR, MODEL_FILENAME),
       tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
       diff,
+      context,
       maxTokens: 2048,
     });
 
@@ -116,7 +132,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 4. Format and output results
+  // 5. Format and output results
   const output =
     opts.format === "json"
       ? formatJson(report)
@@ -140,6 +156,7 @@ function runAnalysisInWorker(workerData: {
   modelPath: string;
   tokenizerPath: string;
   diff: string;
+  context: string;
   maxTokens: number;
 }): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -378,7 +395,7 @@ export function categoryBadge(category: Category): string {
 }
 
 function printBanner(): void {
-  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.1.0 — local-first AI code review"));
+  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.2.0 — local-first AI code review"));
   console.log(chalk.dim("  Model: Qwen2.5-Coder-3B-Instruct Q4_K_M | Inference: on-device Wasm\n"));
 }
 

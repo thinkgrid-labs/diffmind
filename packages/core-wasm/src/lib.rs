@@ -89,8 +89,8 @@ impl ReviewAnalyzer {
         })
     }
 
-    pub fn analyze_diff(&mut self, diff: &str) -> Result<String, JsError> {
-        let findings = self.analyze_diff_internal(diff)?;
+    pub fn analyze_diff(&mut self, diff: &str, context: &str) -> Result<String, JsError> {
+        let findings = self.analyze_diff_internal(diff, context)?;
         serde_json::to_string(&findings)
             .map_err(|e| JsError::new(&format!("failed to serialize findings: {e}")))
     }
@@ -98,13 +98,14 @@ impl ReviewAnalyzer {
     pub fn analyze_diff_chunked(
         &mut self,
         diff: &str,
+        context: &str,
         _max_tokens_per_chunk: u32,
     ) -> Result<String, JsError> {
         let chunks = split_diff_by_file(diff);
         let mut all_findings: Vec<ReviewFinding> = Vec::new();
 
         for chunk in chunks {
-            let chunk_findings = self.analyze_diff_internal(&chunk)?;
+            let chunk_findings = self.analyze_diff_internal(&chunk, context)?;
             all_findings.extend(chunk_findings);
         }
 
@@ -112,12 +113,12 @@ impl ReviewAnalyzer {
             .map_err(|e| JsError::new(&format!("failed to serialize merged findings: {e}")))
     }
 
-    fn analyze_diff_internal(&mut self, diff: &str) -> Result<Vec<ReviewFinding>, JsError> {
+    fn analyze_diff_internal(&mut self, diff: &str, context: &str) -> Result<Vec<ReviewFinding>, JsError> {
         if diff.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let prompt = self.format_prompt(diff);
+        let prompt = self.format_prompt(diff, context);
         let response = self.generate(&prompt, 1024)?;
 
         // Extract JSON block
@@ -134,9 +135,16 @@ impl ReviewAnalyzer {
 }
 
 impl ReviewAnalyzer {
-    fn format_prompt(&self, diff: &str) -> String {
+    fn format_prompt(&self, diff: &str, context: &str) -> String {
+        let context_section = if context.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n### Business Context / Requirements:\n{}\n", context)
+        };
+
         format!(
-            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for TypeScript, NestJS, and React Native code.\nFocus on:\n1. **Security**: Vulnerabilities, secrets, insecure handling.\n2. **Quality**: Bugs, anti-patterns, logical errors.\n3. **Performance**: Bottlenecks, inefficient code.\n4. **Maintainability**: Readability, naming, complexity.\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": \"security\"|\"quality\"|\"performance\"|\"maintainability\", \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf no issues, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for TypeScript, NestJS, and React Native code.{} \n\nFocus on:\n1. **Security**: Vulnerabilities, secrets, insecure handling.\n2. **Quality**: Bugs, anti-patterns, logical errors.\n3. **Performance**: Bottlenecks, inefficient code.\n4. **Maintainability**: Readability, naming, complexity.\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": \"security\"|\"quality\"|\"performance\"|\"maintainability\", \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf no issues, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            context_section,
             diff
         )
     }

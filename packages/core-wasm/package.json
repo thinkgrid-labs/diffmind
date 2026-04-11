@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/core-wasm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "diffmind Wasm core — compiled from Rust via wasm-pack",
   "license": "MIT",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",

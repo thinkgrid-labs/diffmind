@@ -1,6 +1,6 @@
 {
   "name": "diffmind",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Local-first AI code review agent — powered by on-device Wasm inference",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
@@ -32,6 +32,7 @@
     "lint:cli": "pnpm --filter @diffmind/cli build",
     "lint": "pnpm build:wasm && pnpm lint:types && pnpm lint:cli",
     "test:wasm": "pnpm --filter @diffmind/core-wasm test",
+    "sync-version": "node scripts/sync-versions.js",
     "test:js": "jest",
     "test": "pnpm test:js && pnpm test:wasm"
   },

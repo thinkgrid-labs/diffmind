@@ -72,6 +72,12 @@ diffmind --branch develop
 diffmind --format json --min-severity high
 ```
 
+### Business-Aware Reviews
+Provide requirements or ticket descriptions to verify that the code actually meets the business criteria:
+```bash
+diffmind --branch develop --context ticket.md
+```
+
 ### Custom Diff (Stdin)
 ```bash
 git diff main...HEAD | diffmind --stdin
@@ -87,6 +93,7 @@ git diff main...HEAD | diffmind --stdin
 |--------|-------------|---------|
 | `--branch, -b` | Base branch to compare against | `main` |
 | `--format, -f` | Output format (`markdown` or `json`) | `markdown` |
+| `--context, -c` | Business context (ticket text or file path) | `""` |
 | `--min-severity` | Minimum severity level (`high`, `medium`, `low`) | `low` |
 | `--stdin` | Read diff from stdin | `false` |
 | `--output, -o` | Write report to a specific file | `stdout` |
