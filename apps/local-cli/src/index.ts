@@ -87,29 +87,37 @@ const DEFAULT_IGNORED_PATHSPECS = [
   ":!*.min.css",
 ];
 
-function getActiveModelId(): string {
-  const configPath = path.join(os.homedir(), ".diffmind", "config.json");
-  if (fs.existsSync(configPath)) {
-    try {
-      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      return config.model || DEFAULT_MODEL;
-    } catch {
-      return DEFAULT_MODEL;
-    }
-  }
-  return DEFAULT_MODEL;
+interface Config {
+  model?: string;
 }
 
-function setActiveModelId(id: string) {
+const CONFIG_PATH = path.join(os.homedir(), ".diffmind", "config.json");
+
+function readConfig(): Config {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) as Config;
+  } catch {
+    return {};
+  }
+}
+
+/** Writes config atomically (temp file → rename) to avoid torn writes in parallel runs. */
+function writeConfig(config: Config): void {
+  const tmp = CONFIG_PATH + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), "utf-8");
+  fs.renameSync(tmp, CONFIG_PATH);
+}
+
+function getActiveModelId(): string {
+  return readConfig().model ?? DEFAULT_MODEL;
+}
+
+function setActiveModelId(id: string): void {
   const configDir = path.join(os.homedir(), ".diffmind");
   fs.mkdirSync(configDir, { recursive: true });
-  const configPath = path.join(configDir, "config.json");
-  let config = {};
-  if (fs.existsSync(configPath)) {
-    try { config = JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch {}
-  }
-  (config as any).model = id;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  const config = readConfig();
+  config.model = id;
+  writeConfig(config);
 }
 
 // ─── CLI Definition ───────────────────────────────────────────────────────────
@@ -124,7 +132,14 @@ const opts: {
   stdin: boolean;
   color: boolean;
   context?: string;
-} = {} as any;
+} = {
+  branch: "main",
+  format: "markdown",
+  minSeverity: "low",
+  maxTokens: 1024,
+  stdin: false,
+  color: true,
+};
 
 program
   .name("diffmind")
@@ -372,18 +387,15 @@ async function runIndexer(): Promise<void> {
 
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
 
+// Regex captures the b/ path which may contain spaces, up to end of line.
+// git always formats this header as: diff --git a/<path> b/<path>
+const DIFF_HEADER_RE = /^diff --git a\/.+ b\/(.+)$/;
+
 function extractFilesFromDiff(diff: string): string[] {
   const files = new Set<string>();
-  const lines = diff.split("\n");
-  for (const line of lines) {
-    if (line.startsWith("diff --git a/")) {
-      const parts = line.split(" ");
-      if (parts.length >= 3) {
-        // Extract from "a/path/to/file"
-        const filePath = parts[2].substring(2);
-        files.add(filePath);
-      }
-    }
+  for (const line of diff.split("\n")) {
+    const match = DIFF_HEADER_RE.exec(line);
+    if (match) files.add(match[1]);
   }
   return Array.from(files);
 }
