@@ -144,7 +144,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.5")
+  .version("0.4.6")
   .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
@@ -335,12 +335,7 @@ function runAnalysisInWorker(
 
     const worker = new Worker(workerPath, {
       workerData,
-      // --expose-gc allows the Wasm path to release the model Buffer after
-      // it has been copied into Wasm linear memory, halving peak memory usage.
-      execArgv: [
-        ...(isTsNode ? ["-r", "ts-node/register"] : []),
-        "--expose-gc",
-      ],
+      execArgv: isTsNode ? ["-r", "ts-node/register"] : [],
     });
 
     let settled = false;
