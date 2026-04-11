@@ -48,6 +48,35 @@ const TOKENIZER_URL =
 // ─── CLI Definition ───────────────────────────────────────────────────────────
 
 const program = new Command();
+const opts: {
+  branch: string;
+  format: "markdown" | "json";
+  output?: string;
+  minSeverity: Severity;
+  stdin: boolean;
+  color: boolean;
+  context?: string;
+} = {} as any;
+
+program
+  .name("diffmind")
+  .description("Local-first AI code review for your git diffs")
+  .version("0.3.3")
+  .option("-b, --branch <name>", "Target branch to diff against", "main")
+  .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
+  .option("-o, --output <file>", "Write output to a file instead of stdout")
+  .option("-c, --context <text|file>", "Business context (ticket description, acceptance criteria)")
+  .option("--min-severity <level>", 'Minimum severity to report: "high", "medium", or "low"', "low")
+  .option("--stdin", "Read git diff from stdin instead of running git diff")
+  .option("--no-color", "Disable colored output")
+  .action(async (options) => {
+    // This is the default action (no subcommand used)
+    Object.assign(opts, options);
+    await main().catch((err) => {
+      console.error(chalk.red(`Fatal Error: ${err.message}`));
+      process.exit(1);
+    });
+  });
 
 program
   .command("index")
@@ -56,57 +85,16 @@ program
     await runIndexer();
   });
 
-program
-  .name("diffmind")
-  .description("Local-first AI code review for your git diffs")
-  .version("0.3.2")
-  .option("-b, --branch <name>", "Target branch to diff against", "main")
-  .option(
-    "-f, --format <type>",
-    'Output format: "markdown" or "json"',
-    "markdown"
-  )
-  .option("-o, --output <file>", "Write output to a file instead of stdout")
-  .option(
-    "-c, --context <text|file>",
-    "Business context (ticket description, acceptance criteria)"
-  )
-  .option(
-    "--min-severity <level>",
-    'Minimum severity to report: "high", "medium", or "low"',
-    "low"
-  )
-  .option("--stdin", "Read git diff from stdin instead of running git diff")
-  .option("--no-color", "Disable colored output");
-
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
 function run() {
   program.parse(process.argv);
-  
-  // If no subcommand is used, run the default analysis
-  if (!program.args.length || program.args[0] !== "index") {
-    main().catch((err) => {
-      console.error(chalk.red(`Fatal Error: ${err.message}`));
-      process.exit(1);
-    });
-  }
 }
 
 // Only run if executed directly
 if (require.main === module) {
   run();
 }
-
-const opts = program.opts<{
-  branch: string;
-  format: "markdown" | "json";
-  output?: string;
-  minSeverity: Severity;
-  stdin: boolean;
-  color: boolean;
-  context?: string;
-}>();
 
 // ─── Main Logic ───────────────────────────────────────────────────────────────
 
