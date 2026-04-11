@@ -3,7 +3,7 @@ module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
   moduleNameMapper: {
-    '^@diffmind/(.*)$': '<rootDir>/packages/$1/src',
+    '^@diffmind/shared-types$': '<rootDir>/packages/shared-types/src',
   },
   testMatch: ['**/src/**/*.test.ts'],
   transformIgnorePatterns: [

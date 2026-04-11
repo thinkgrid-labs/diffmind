@@ -36,14 +36,62 @@ import {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MODEL_DIR = path.join(os.homedir(), ".diffmind", "models");
-const MODEL_FILENAME = "qwen2.5-coder-3b-instruct-q4_k_m.gguf";
 const TOKENIZER_FILENAME = "tokenizer.json";
 
-// HuggingFace Hub URLs
-const MODEL_URL =
-  "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf";
-const TOKENIZER_URL =
-  "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct/resolve/main/tokenizer.json";
+interface ModelConfig {
+  id: string;
+  name: string;
+  filename: string;
+  modelUrl: string;
+  tokenizerUrl: string;
+  minMemoryGB: number;
+}
+
+const MODELS: Record<string, ModelConfig> = {
+  "1.5b": {
+    id: "1.5b",
+    name: "Qwen2.5-Coder-1.5B-Instruct Q4_K_M",
+    filename: "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    modelUrl: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    tokenizerUrl: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct/resolve/main/tokenizer.json",
+    minMemoryGB: 2,
+  },
+  "3b": {
+    id: "3b",
+    name: "Qwen2.5-Coder-3B-Instruct Q4_K_M",
+    filename: "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+    modelUrl: "https://huggingface.co/bartowski/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+    tokenizerUrl: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct/resolve/main/tokenizer.json",
+    minMemoryGB: 4,
+  }
+};
+
+const DEFAULT_MODEL = "1.5b";
+
+function getActiveModelId(): string {
+  const configPath = path.join(os.homedir(), ".diffmind", "config.json");
+  if (fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      return config.model || DEFAULT_MODEL;
+    } catch {
+      return DEFAULT_MODEL;
+    }
+  }
+  return DEFAULT_MODEL;
+}
+
+function setActiveModelId(id: string) {
+  const configDir = path.join(os.homedir(), ".diffmind");
+  fs.mkdirSync(configDir, { recursive: true });
+  const configPath = path.join(configDir, "config.json");
+  let config = {};
+  if (fs.existsSync(configPath)) {
+    try { config = JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch {}
+  }
+  (config as any).model = id;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+}
 
 // ─── CLI Definition ───────────────────────────────────────────────────────────
 
@@ -61,7 +109,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.8")
+  .version("0.4.0")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -97,17 +145,28 @@ program
 program
   .command("download")
   .description("Download or refresh the local AI model files")
+  .option("-m, --model <type>", "Model size to download (1.5b, 3b)", DEFAULT_MODEL)
   .option("-f, --force", "Force a fresh download of the model and tokenizer")
   .action(async (options) => {
+    const modelId = options.model.toLowerCase();
+    if (!MODELS[modelId]) {
+      console.error(chalk.red(`Error: Invalid model "${options.model}". Available: 1.5b, 3b`));
+      process.exit(1);
+    }
+    
+    setActiveModelId(modelId);
+    const model = MODELS[modelId];
+
     if (options.force) {
-      const modelPath = path.join(MODEL_DIR, MODEL_FILENAME);
+      const modelPath = path.join(MODEL_DIR, model.filename);
       const tokenizerPath = path.join(MODEL_DIR, TOKENIZER_FILENAME);
       if (fs.existsSync(modelPath)) fs.unlinkSync(modelPath);
       if (fs.existsSync(tokenizerPath)) fs.unlinkSync(tokenizerPath);
-      console.log(chalk.yellow("✓ Force flag active: existing model files cleared."));
+      console.log(chalk.yellow(`✓ Force flag active: existing ${model.id} model files cleared.`));
     }
-    await ensureModelFiles();
-    console.log(chalk.green("\n✓ Setup complete. Model is ready for use."));
+    
+    await ensureModelFiles(modelId);
+    console.log(chalk.green(`\n✓ Setup complete. Model ${model.name} is ready for use.`));
   });
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -126,10 +185,14 @@ if (require.main === module) {
 import { Worker } from "worker_threads";
 
 async function main(): Promise<void> {
+  const modelId = getActiveModelId();
+  const model = MODELS[modelId];
   printBanner();
 
+  console.log(chalk.dim(`  Using Model: ${model.name}`));
+
   // 1. Ensure model files are downloaded
-  await ensureModelFiles();
+  await ensureModelFiles(modelId);
 
   // 2. Get the git diff
   const diff = await getDiff();
@@ -159,18 +222,28 @@ async function main(): Promise<void> {
   const analyzeSpinner = ora("Initializing engine & analyzing diff...").start();
   
   try {
-    const reportRaw = await runAnalysisInWorker({
-      modelPath: path.join(MODEL_DIR, MODEL_FILENAME),
+    // Pulse the spinner to show activity
+    let pulseCount = 0;
+    const pulseInterval = setInterval(() => {
+      pulseCount++;
+      const dots = ".".repeat((pulseCount % 3) + 1);
+      analyzeSpinner.text = `Analyzing diff (Local AI is thinking${dots})`;
+    }, 3000);
+
+    const { data: reportRaw, engine } = await runAnalysisInWorker({
+      modelPath: path.join(MODEL_DIR, model.filename),
       tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
       diff,
       context,
-      maxTokens: 2048,
+      maxTokens: 512,
+      modelId: model.id,
     });
 
+    clearInterval(pulseInterval);
     report = sortFindings(
       filterBySeverity(parseReport(reportRaw), opts.minSeverity)
     );
-    analyzeSpinner.succeed(`Analysis complete — ${report.length} finding(s)`);
+    analyzeSpinner.succeed(`Analysis complete [engine: ${engine}] — ${report.length} finding(s)`);
   } catch (err) {
     analyzeSpinner.fail("Analysis failed");
     console.error(chalk.red(String(err)));
@@ -203,7 +276,8 @@ function runAnalysisInWorker(workerData: {
   diff: string;
   context: string;
   maxTokens: number;
-}): Promise<string> {
+  modelId: string;
+}): Promise<{ data: string; engine: string }> {
   return new Promise((resolve, reject) => {
     // Determine the worker path. During development with ts-node, we point to the .ts file
     // In production, we point to the transpiled .js file.
@@ -220,7 +294,7 @@ function runAnalysisInWorker(workerData: {
 
     worker.on("message", (message) => {
       if (message.success) {
-        resolve(message.data);
+        resolve({ data: message.data, engine: message.engine });
       } else {
         reject(new Error(message.error));
       }
@@ -312,15 +386,16 @@ function readStdin(): Promise<string> {
 
 // ─── Model Management ─────────────────────────────────────────────────────────
 
-async function ensureModelFiles(): Promise<void> {
+async function ensureModelFiles(modelId: string = getActiveModelId()): Promise<void> {
+  const model = MODELS[modelId];
   fs.mkdirSync(MODEL_DIR, { recursive: true });
 
-  const modelPath = path.join(MODEL_DIR, MODEL_FILENAME);
+  const modelPath = path.join(MODEL_DIR, model.filename);
   const tokenizerPath = path.join(MODEL_DIR, TOKENIZER_FILENAME);
 
   if (!fs.existsSync(tokenizerPath)) {
     console.log(chalk.cyan("Downloading tokenizer.json..."));
-    await downloadFile(TOKENIZER_URL, tokenizerPath);
+    await downloadFile(model.tokenizerUrl, tokenizerPath);
   }
 
   if (fs.existsSync(modelPath) && fs.statSync(modelPath).size < 1024) {
@@ -330,10 +405,10 @@ async function ensureModelFiles(): Promise<void> {
   if (!fs.existsSync(modelPath)) {
     console.log(
       chalk.cyan(
-        `\nDownloading ${MODEL_FILENAME} (~2.2GB). This only happens once.\n`
+        `\nDownloading ${model.filename} (${(model.minMemoryGB * 0.5).toFixed(1)}GB+). This only happens once.\n`
       )
     );
-    await downloadFileWithProgress(MODEL_URL, modelPath);
+    await downloadFileWithProgress(model.modelUrl, modelPath);
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli",
-  "version": "0.3.8",
+  "version": "0.4.0",
   "description": "diffmind CLI — local-first AI code review for your git diffs",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",
   "license": "MIT",
