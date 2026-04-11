@@ -60,6 +60,34 @@ diffmind --branch main
 
 ---
 
+## 🛠️ Commands
+
+Diffmind provides a few specialized commands to manage your local AI environment.
+
+### 1. `review` (Default)
+Run the AI code review against your git changes.
+```bash
+diffmind --branch main
+```
+
+### 2. `index`
+Build a symbol index of your local repository. This enables **Local RAG**, allowing the AI to understand the definitions of functions and types referenced in your diff.
+```bash
+diffmind index
+```
+
+### 3. `download`
+Explicitly manage or refresh your local AI model files.
+```bash
+# Check if model exists and download if missing
+diffmind download
+
+# Force a fresh download (useful if original download was interrupted)
+diffmind download --force
+```
+
+---
+
 ## 📖 Usage Examples
 
 ### Analyze against a specific branch
@@ -95,8 +123,6 @@ git diff main...HEAD | diffmind --stdin
 
 ---
 
----
-
 ## 📊 Output Options
 
 | Option | Description | Default |
@@ -127,7 +153,7 @@ I am committed to making Diffmind the ultimate local-first AI companion for deve
 ### Hardware Requirements
 - **RAM**: 8GB recommended (4GB minimum). The model itself occupies ~2.2GB.
 - **CPU**: Modern x64 or ARM64 processor. Apple Silicon (M1/M2/M3) provides exceptional performance via Wasm SIMD.
-- **Disk**: ~2.5GB free space for the local model download.
+- **Disk**: ~2.5GB free space for the local model download. You can pre-fetch this using `diffmind download`.
 
 ### Current Limitations
 - **Wasm Memory**: Due to the 32-bit architecture of default WebAssembly runtimes, the heap is limited to 4GB. Diffmind automatically chunks large diffs to handle this, but extremely massive changes may see reduced context awareness.
