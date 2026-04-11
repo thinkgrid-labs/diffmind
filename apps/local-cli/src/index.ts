@@ -109,7 +109,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.0")
+  .version("0.4.1")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")

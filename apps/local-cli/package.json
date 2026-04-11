@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "diffmind CLI — local-first AI code review for your git diffs",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",
   "license": "MIT",
@@ -27,6 +27,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@diffmind/core-native": "workspace:*",
     "@diffmind/core-wasm": "workspace:*",
     "@diffmind/shared-types": "workspace:*",
     "chalk": "^5.3.0",
