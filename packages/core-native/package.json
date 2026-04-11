@@ -11,8 +11,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --release",
-    "build:debug": "napi build",
+    "build": "napi build --release --js index.js",
+    "build:debug": "napi build --js index.js",
     "test": "node index.js"
   },
   "devDependencies": {

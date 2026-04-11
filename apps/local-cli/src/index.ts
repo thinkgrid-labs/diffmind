@@ -230,7 +230,7 @@ async function main(): Promise<void> {
       analyzeSpinner.text = `Analyzing diff (Local AI is thinking${dots})`;
     }, 3000);
 
-    const reportRaw = await runAnalysisInWorker({
+    const { data: reportRaw, engine } = await runAnalysisInWorker({
       modelPath: path.join(MODEL_DIR, model.filename),
       tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
       diff,
@@ -243,7 +243,7 @@ async function main(): Promise<void> {
     report = sortFindings(
       filterBySeverity(parseReport(reportRaw), opts.minSeverity)
     );
-    analyzeSpinner.succeed(`Analysis complete — ${report.length} finding(s)`);
+    analyzeSpinner.succeed(`Analysis complete [engine: ${engine}] — ${report.length} finding(s)`);
   } catch (err) {
     analyzeSpinner.fail("Analysis failed");
     console.error(chalk.red(String(err)));
@@ -277,7 +277,7 @@ function runAnalysisInWorker(workerData: {
   context: string;
   maxTokens: number;
   modelId: string;
-}): Promise<string> {
+}): Promise<{ data: string; engine: string }> {
   return new Promise((resolve, reject) => {
     // Determine the worker path. During development with ts-node, we point to the .ts file
     // In production, we point to the transpiled .js file.
@@ -294,7 +294,7 @@ function runAnalysisInWorker(workerData: {
 
     worker.on("message", (message) => {
       if (message.success) {
-        resolve(message.data);
+        resolve({ data: message.data, engine: message.engine });
       } else {
         reject(new Error(message.error));
       }

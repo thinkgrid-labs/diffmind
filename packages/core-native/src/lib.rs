@@ -13,7 +13,7 @@ pub struct ReviewAnalyzer {
 #[napi]
 impl ReviewAnalyzer {
     #[napi(constructor)]
-    pub fn new(model_bytes: Vec<u8>, tokenizer_bytes: Vec<u8>) -> napi::Result<Self> {
+    pub fn new(model_bytes: napi::bindgen_prelude::Buffer, tokenizer_bytes: napi::bindgen_prelude::Buffer) -> napi::Result<Self> {
         let inner = InnerAnalyzer::new(&model_bytes, &tokenizer_bytes)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
