@@ -78,6 +78,16 @@ Provide requirements or ticket descriptions to verify that the code actually mee
 diffmind --branch develop --context ticket.md
 ```
 
+### Architectural-Aware Reviews (Local RAG)
+Build an index of your project's symbols to allow the AI to "look up" function and type definitions referenced in your diff:
+```bash
+# 1. Build the index (only needed once or after large changes)
+diffmind index
+
+# 2. Run your review — context is automatically retrieved
+diffmind --branch develop
+```
+
 ### Custom Diff (Stdin)
 ```bash
 git diff main...HEAD | diffmind --stdin
@@ -104,11 +114,11 @@ git diff main...HEAD | diffmind --stdin
 
 I am committed to making Diffmind the ultimate local-first AI companion for developers. As a developer, I am building the foundation for a privacy-first engineering future, and I am actively looking for contributors to join this mission!
 
-- [ ] **Custom Rule Engine**: Define project-specific review standards using simple YAML.
-- [ ] **VS Code Extension**: Get real-time AI feedback directly in your editor as you code.
-- [ ] **Local RAG Integration**: Context-aware reviews that understand your entire repository's architecture.
-- [ ] **Multi-Language Support**: Expanding beyond TypeScript to Go, Python, and Rust.
-- [ ] **Advanced CI Guards**: Pre-built action templates to block PRs with high-severity findings globally.
+- [ ] **Local RAG Integration**: Context-aware reviews that understand your entire repository's architecture by indexing local files.
+- [ ] **VS Code Extension**: Real-time AI feedback directly in your editor, transforming code reviews into a fluid, pair-programming experience.
+- [ ] **Custom Rule Engine**: Define project-specific review standards and architectural boundaries using simple YAML configurations.
+- [ ] **Advanced CI Guards**: Ready-to-use GitHub Action templates to enforce security baselines and block high-severity PRs automatically.
+- [ ] **Multi-Language Support**: Expanding the deep-reasoning review capabilities to Go, Python, Rust, and Java.
 
 ---
 
