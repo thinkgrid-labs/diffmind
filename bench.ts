@@ -1,3 +1,4 @@
+/// <reference types="node" />
 /**
  * Benchmark file for AI Code Review
  */
