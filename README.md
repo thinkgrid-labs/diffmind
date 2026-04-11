@@ -105,6 +105,19 @@ I am committed to making Diffmind the ultimate local-first AI companion for deve
 
 ---
 
+## ⚙️ Requirements & Limitations
+
+### Hardware Requirements
+- **RAM**: 8GB recommended (4GB minimum). The model itself occupies ~2.2GB.
+- **CPU**: Modern x64 or ARM64 processor. Apple Silicon (M1/M2/M3) provides exceptional performance via Wasm SIMD.
+- **Disk**: ~2.5GB free space for the local model download.
+
+### Current Limitations
+- **Wasm Memory**: Due to the 32-bit architecture of default WebAssembly runtimes, the heap is limited to 4GB. Diffmind automatically chunks large diffs to handle this, but extremely massive changes may see reduced context awareness.
+- **Language Focus**: While the underlying model (Qwen2.5-Coder) is multi-lingual, the current review persona is optimized for **TypeScript, JavaScript, NestJS, and React Native**.
+
+---
+
 ## 🛡️ License
 
 Distributed under the MIT License. See `LICENSE` for more information.
