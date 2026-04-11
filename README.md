@@ -115,4 +115,4 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 If you believe code reviews should be private and fast, consider contributing to the diffmind core.
 
-*Built with ❤️ by Tech Leads, for Tech Leads.*
+*Built with ❤️ by Tech Lead, for Tech Leads.*
