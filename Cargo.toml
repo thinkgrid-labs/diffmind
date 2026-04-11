@@ -1,5 +1,5 @@
 [workspace]
-members = ["packages/core-wasm"]
+members = ["packages/core-wasm", "packages/core-engine", "packages/core-native"]
 resolver = "2"
 
 # Workspace-level dependency versions to keep crates in sync
