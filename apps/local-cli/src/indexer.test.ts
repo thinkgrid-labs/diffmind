@@ -53,6 +53,56 @@ export const VERSION = "1.0.0";
     const indexer = new Indexer(testRoot);
     const index = await indexer.buildIndex();
 
-    expect(index.symbols["add"].snippet).toContain("function add(a: number, b: number)");
+    expect(index.symbols["add"].snippet).toContain("return a + b;");
+    expect(index.symbols["add"].snippet).toContain("}");
+  });
+
+  it("should support Go and Python symbols", async () => {
+    const goPath = path.join(testRoot, "main.go");
+    const pyPath = path.join(testRoot, "lib.py");
+
+    fs.writeFileSync(goPath, "func Calculator(a int) {\n  return a\n}");
+    fs.writeFileSync(pyPath, "def run_analysis(data):\n    print(data)\n    return True");
+
+    const indexer = new Indexer(testRoot);
+    const index = await indexer.buildIndex();
+
+    expect(index.symbols["Calculator"]).toBeDefined();
+    expect(index.symbols["Calculator"].file).toBe("main.go");
+    expect(index.symbols["run_analysis"]).toBeDefined();
+    expect(index.symbols["run_analysis"].file).toBe("lib.py");
+  });
+
+  it("should skip files with unchanged mtimes (incremental)", async () => {
+    const indexer = new Indexer(testRoot);
+    const initialIndex = await indexer.buildIndex();
+    
+    // Spy on parseFile to count calls
+    const parseSpy = jest.spyOn(indexer as any, "parseFile");
+    
+    // Second run with existing index
+    await indexer.buildIndex(initialIndex);
+    
+    // Should NOT have called parseFile because mtimes are the same
+    expect(parseSpy).not.toHaveBeenCalled();
+    parseSpy.mockRestore();
+  });
+
+  it("should ignore braces inside strings during extraction", async () => {
+    const content = `
+export function complex() {
+  const str = "{ fake brace }";
+  return { real: true };
+}
+`;
+    fs.writeFileSync(path.join(testRoot, "complex.ts"), content);
+    const indexer = new Indexer(testRoot);
+    const index = await indexer.buildIndex();
+    
+    const snippet = index.symbols["complex"].snippet;
+    expect(snippet).toContain("return { real: true };");
+    expect(snippet).toContain("}");
+    // Verify it didn't stop early at the string's brace
+    expect(snippet.split("\n").length).toBeGreaterThan(3);
   });
 });
