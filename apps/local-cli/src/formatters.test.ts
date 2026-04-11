@@ -1,4 +1,3 @@
-import chalk from "chalk";
 import {
   formatJson,
   formatMarkdown,
@@ -12,7 +11,7 @@ jest.mock("chalk", () => {
   const createMock = () => {
     const fn = (str: string) => str;
     const proxy = new Proxy(fn, {
-      get: (target, prop) => {
+      get: (_target, prop) => {
         if (prop === "default") return proxy;
         return proxy;
       },

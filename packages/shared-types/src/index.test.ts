@@ -3,7 +3,6 @@ import {
   sortFindings,
   filterBySeverity,
   type ReviewFinding,
-  type Severity,
 } from "./index";
 
 describe("shared-types", () => {

@@ -26,7 +26,6 @@ import {
   sortFindings,
   filterBySeverity,
   type ReviewReport,
-  type ReviewFinding,
   type Severity,
   type Category,
 } from "@diffmind/shared-types";
@@ -78,6 +77,10 @@ const opts = program.opts<{
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+import { Worker } from "worker_threads";
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 async function main(): Promise<void> {
   printBanner();
 
@@ -91,30 +94,20 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // 3. Load the Wasm core and initialize the analyzer
-  const spinner = ora("Initializing diffmind engine...").start();
-  let analyzer: import("@diffmind/core-wasm").ReviewAnalyzer;
+  // 3. Run analysis in a background worker
+  // This keeps the process responsive and the spinner animated.
+  const analyzeSpinner = ora("Initializing engine & analyzing diff...").start();
+  
   try {
-    const { ReviewAnalyzer } = await loadWasm();
-    const modelBytes = fs.readFileSync(path.join(MODEL_DIR, MODEL_FILENAME));
-    const tokenizerBytes = fs.readFileSync(
-      path.join(MODEL_DIR, TOKENIZER_FILENAME)
-    );
-    analyzer = new ReviewAnalyzer(modelBytes, tokenizerBytes);
-    spinner.succeed("Engine ready");
-  } catch (err) {
-    spinner.fail("Failed to initialize engine");
-    console.error(chalk.red(String(err)));
-    process.exit(1);
-  }
+    const reportRaw = await runAnalysisInWorker({
+      modelPath: path.join(MODEL_DIR, MODEL_FILENAME),
+      tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
+      diff,
+      maxTokens: 2048,
+    });
 
-  // 4. Run analysis
-  const analyzeSpinner = ora("Analyzing diff...").start();
-  let report: ReviewReport;
-  try {
-    const rawJson = analyzer.analyze_diff_chunked(diff, 2048);
     report = sortFindings(
-      filterBySeverity(parseReport(rawJson), opts.minSeverity)
+      filterBySeverity(parseReport(reportRaw), opts.minSeverity)
     );
     analyzeSpinner.succeed(`Analysis complete — ${report.length} finding(s)`);
   } catch (err) {
@@ -123,7 +116,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 5. Format and output results
+  // 4. Format and output results
   const output =
     opts.format === "json"
       ? formatJson(report)
@@ -141,6 +134,45 @@ async function main(): Promise<void> {
   process.exit(hasHigh ? 1 : 0);
 }
 
+let report: ReviewReport;
+
+function runAnalysisInWorker(workerData: {
+  modelPath: string;
+  tokenizerPath: string;
+  diff: string;
+  maxTokens: number;
+}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // Determine the worker path. During development with ts-node, we point to the .ts file
+    // In production, we point to the transpiled .js file.
+    const isTsNode = process.argv.some(arg => arg.includes('ts-node'));
+    const workerPath = isTsNode 
+      ? path.join(__dirname, "worker.ts")
+      : path.join(__dirname, "worker.js");
+
+    const worker = new Worker(workerPath, {
+      workerData,
+      // If running via ts-node, we need to register it for the worker thread too
+      execArgv: isTsNode ? ["-r", "ts-node/register"] : [],
+    });
+
+    worker.on("message", (message) => {
+      if (message.success) {
+        resolve(message.data);
+      } else {
+        reject(new Error(message.error));
+      }
+    });
+
+    worker.on("error", reject);
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Worker stopped with exit code ${code}`));
+      }
+    });
+  });
+}
+
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
 
 async function getDiff(): Promise<string> {
@@ -149,12 +181,21 @@ async function getDiff(): Promise<string> {
   }
   const spinner = ora(`Running git diff ${opts.branch}...HEAD`).start();
   try {
-    const diff = child_process
-      .execSync(`git diff ${opts.branch}...HEAD`, {
+    const result = child_process.spawnSync(
+      "git",
+      ["diff", `${opts.branch}...HEAD`],
+      {
         maxBuffer: 10 * 1024 * 1024, // 10MB max diff
         encoding: "utf-8",
-      })
-      .toString();
+        shell: false, // Explicitly disable shell for security
+      }
+    );
+
+    if (result.status !== 0) {
+      throw new Error(result.stderr?.toString() || "Unknown git error");
+    }
+
+    const diff = result.stdout.toString();
     spinner.succeed(`Diff captured (${Math.round(diff.length / 1024)}KB)`);
     return diff;
   } catch (err) {
@@ -162,11 +203,15 @@ async function getDiff(): Promise<string> {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("not a git repository")) {
       console.error(
-        chalk.red("Error: not a git repository. Run diffmind from within a git project.")
+        chalk.red(
+          "Error: not a git repository. Run diffmind from within a git project."
+        )
       );
     } else if (msg.includes("unknown revision")) {
       console.error(
-        chalk.red(`Error: branch "${opts.branch}" not found. Try a different --branch value.`)
+        chalk.red(
+          `Error: branch "${opts.branch}" not found. Try a different --branch value.`
+        )
       );
     } else {
       console.error(chalk.red(msg));
@@ -182,21 +227,6 @@ function readStdin(): Promise<string> {
     process.stdin.on("data", (chunk) => (data += chunk));
     process.stdin.on("end", () => resolve(data));
   });
-}
-
-// ─── Wasm Loading ─────────────────────────────────────────────────────────────
-
-async function loadWasm(): Promise<typeof import("@diffmind/core-wasm")> {
-  // In Phase 1 the wasm package isn't built yet — this will throw if pkg/ is absent.
-  // In production, wasm-pack generates the Node.js bindings in packages/core-wasm/pkg/
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require("@diffmind/core-wasm");
-  } catch {
-    throw new Error(
-      "Wasm core not found. Run: npm run build:wasm from the monorepo root."
-    );
-  }
 }
 
 // ─── Model Management ─────────────────────────────────────────────────────────

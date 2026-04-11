@@ -90,23 +90,9 @@ impl ReviewAnalyzer {
     }
 
     pub fn analyze_diff(&mut self, diff: &str) -> Result<String, JsError> {
-        if diff.trim().is_empty() {
-            return Ok("[]".to_string());
-        }
-
-        let prompt = self.format_prompt(diff);
-        let response = self.generate(&prompt, 1024)?;
-
-        // Extract JSON block
-        let json_start = response.find('[').unwrap_or(0);
-        let json_end = response.rfind(']').unwrap_or(response.len().saturating_sub(1));
-        let json_slice = &response[json_start..=json_end];
-
-        // Validate
-        let _: Vec<ReviewFinding> = serde_json::from_str(json_slice)
-            .map_err(|e| JsError::new(&format!("model returned invalid JSON: {e}\nRaw: {json_slice}")))?;
-
-        Ok(json_slice.to_string())
+        let findings = self.analyze_diff_internal(diff)?;
+        serde_json::to_string(&findings)
+            .map_err(|e| JsError::new(&format!("failed to serialize findings: {e}")))
     }
 
     pub fn analyze_diff_chunked(
@@ -118,14 +104,32 @@ impl ReviewAnalyzer {
         let mut all_findings: Vec<ReviewFinding> = Vec::new();
 
         for chunk in chunks {
-            let chunk_json = self.analyze_diff(&chunk)?;
-            let chunk_findings: Vec<ReviewFinding> =
-                serde_json::from_str(&chunk_json).unwrap_or_default();
+            let chunk_findings = self.analyze_diff_internal(&chunk)?;
             all_findings.extend(chunk_findings);
         }
 
         serde_json::to_string(&all_findings)
             .map_err(|e| JsError::new(&format!("failed to serialize merged findings: {e}")))
+    }
+
+    fn analyze_diff_internal(&mut self, diff: &str) -> Result<Vec<ReviewFinding>, JsError> {
+        if diff.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let prompt = self.format_prompt(diff);
+        let response = self.generate(&prompt, 1024)?;
+
+        // Extract JSON block
+        let json_start = response.find('[').unwrap_or(0);
+        let json_end = response.rfind(']').unwrap_or(response.len().saturating_sub(1));
+        let json_slice = &response[json_start..=json_end];
+
+        // Validate and deserialize
+        let findings: Vec<ReviewFinding> = serde_json::from_str(json_slice)
+            .map_err(|e| JsError::new(&format!("model returned invalid JSON: {e}\nRaw: {json_slice}")))?;
+
+        Ok(findings)
     }
 }
 
@@ -185,12 +189,11 @@ impl ReviewAnalyzer {
 
 fn split_diff_by_file(diff: &str) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let mut current = String::with_capacity(diff.len() / 2);
 
     for line in diff.lines() {
         if line.starts_with("diff --git") && !current.is_empty() {
-            chunks.push(current.clone());
-            current.clear();
+            chunks.push(std::mem::take(&mut current));
         }
         current.push_str(line);
         current.push('\n');
