@@ -93,16 +93,26 @@ impl ReviewAnalyzer {
         context: &str,
         max_tokens_per_chunk: u32,
     ) -> Result<Vec<ReviewFinding>, EngineError> {
-        let chunks = chunk_diff(diff, 150);
+        // chunk_diff already splits on every `diff --git` boundary (one chunk per
+        // file).  The secondary line limit is only hit for very large single-file
+        // diffs.  300 lines is a better default than 150: most files fit in one
+        // inference pass, and the early JSON-complete exit in `generate()` means
+        // processing stops as soon as the answer array is closed.
+        const MAX_CHUNK_LINES: usize = 300;
+        let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
         let mut all_findings: Vec<ReviewFinding> = Vec::new();
 
         for chunk in chunks {
             if chunk.trim().is_empty() {
                 continue;
             }
-            let chunk_findings =
-                self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize)?;
-            all_findings.extend(chunk_findings);
+            match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
+                Ok(findings) => all_findings.extend(findings),
+                // Small models often produce malformed JSON for a single chunk.
+                // Skip the chunk and continue rather than aborting the whole run.
+                Err(EngineError::SerializationError(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(all_findings)
@@ -217,10 +227,51 @@ impl ReviewAnalyzer {
                 .decode(&[next_token], true)
                 .map_err(|e| EngineError::TokenizerError(e.to_string()))?;
             generated_text.push_str(&decoded);
+
+            // Stop as soon as the JSON array is syntactically complete.
+            // The model has produced its answer; continuing only generates
+            // commentary or repeated tokens that are discarded anyway.
+            if json_array_complete(&generated_text) {
+                break;
+            }
         }
 
         Ok(generated_text)
     }
+}
+
+/// Returns `true` once `s` contains a syntactically-complete JSON array
+/// (`[…]` with balanced brackets, respecting string literals and escapes).
+///
+/// This lets `generate()` exit early as soon as the model has closed the
+/// answer array, instead of running until the token cap.
+fn json_array_complete(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    if !trimmed.starts_with('[') {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            '[' if !in_string => depth += 1,
+            ']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Truncates `s` to at most `max_bytes` bytes, stepping back to the nearest

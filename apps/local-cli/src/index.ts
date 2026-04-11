@@ -144,7 +144,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.4")
+  .version("0.4.5")
   .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
@@ -251,14 +251,19 @@ async function runAnalysisWithSpinner(
   }, 3000);
 
   try {
-    const { data: reportRaw, engine } = await runAnalysisInWorker({
-      modelPath: path.join(MODEL_DIR, model.filename),
-      tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
-      diff,
-      context,
-      maxTokens: opts.maxTokens,
-      modelId: model.id,
-    });
+    // Forward worker progress messages to the spinner so the user sees
+    // "Loading model…" vs "Running inference…" instead of a frozen cursor.
+    const { data: reportRaw, engine } = await runAnalysisInWorker(
+      {
+        modelPath: path.join(MODEL_DIR, model.filename),
+        tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
+        diff,
+        context,
+        maxTokens: opts.maxTokens,
+        modelId: model.id,
+      },
+      (text) => { spinner.text = text; },
+    );
     const findings = sortFindings(filterBySeverity(parseReport(reportRaw), opts.minSeverity));
     spinner.succeed(`Analysis complete [engine: ${engine}] — ${findings.length} finding(s)`);
     return findings;
@@ -311,14 +316,17 @@ let report: ReviewReport;
 // Kill the worker and reject if inference stalls (OOM, deadlock, etc.).
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-function runAnalysisInWorker(workerData: {
-  modelPath: string;
-  tokenizerPath: string;
-  diff: string;
-  context: string;
-  maxTokens: number;
-  modelId: string;
-}): Promise<{ data: string; engine: string }> {
+function runAnalysisInWorker(
+  workerData: {
+    modelPath: string;
+    tokenizerPath: string;
+    diff: string;
+    context: string;
+    maxTokens: number;
+    modelId: string;
+  },
+  onProgress?: (text: string) => void,
+): Promise<{ data: string; engine: string }> {
   return new Promise((resolve, reject) => {
     const isTsNode = process.argv.some(arg => arg.includes('ts-node'));
     const workerPath = isTsNode
@@ -327,7 +335,12 @@ function runAnalysisInWorker(workerData: {
 
     const worker = new Worker(workerPath, {
       workerData,
-      execArgv: isTsNode ? ["-r", "ts-node/register"] : [],
+      // --expose-gc allows the Wasm path to release the model Buffer after
+      // it has been copied into Wasm linear memory, halving peak memory usage.
+      execArgv: [
+        ...(isTsNode ? ["-r", "ts-node/register"] : []),
+        "--expose-gc",
+      ],
     });
 
     let settled = false;
@@ -346,6 +359,10 @@ function runAnalysisInWorker(workerData: {
     }, WORKER_TIMEOUT_MS);
 
     worker.on("message", (message) => {
+      if (message.type === "progress") {
+        onProgress?.(message.text);
+        return;
+      }
       settle(() => {
         if (message.success) {
           resolve({ data: message.data, engine: message.engine });
