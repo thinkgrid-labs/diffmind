@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/shared-types",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Shared TypeScript types for diffmind review findings",
   "license": "MIT",
   "author": "Thinkgrid Labs <hello@thinkgrid.com>",

@@ -207,7 +207,15 @@ fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
             chunks.push(std::mem::take(&mut current));
             line_count = 0;
         }
-        current.push_str(line);
+
+        // Truncate extremely long lines (e.g. minified code) to prevent OOM
+        if line.len() > 2048 {
+            current.push_str(&line[..2048]);
+            current.push_str("... [line truncated]");
+        } else {
+            current.push_str(line);
+        }
+        
         current.push('\n');
         line_count += 1;
     }

@@ -68,6 +68,25 @@ const MODELS: Record<string, ModelConfig> = {
 
 const DEFAULT_MODEL = "1.5b";
 
+/**
+ * Common generated or dependency files that should be excluded from the AI review
+ * to prevent massive diffs and memory exhaustion.
+ */
+const DEFAULT_IGNORED_PATHSPECS = [
+  ":!node_modules",
+  ":!*-lock.json",
+  ":!pnpm-lock.yaml",
+  ":!package-lock.json",
+  ":!yarn.lock",
+  ":!dist",
+  ":!build",
+  ":!.next",
+  ":!.cache",
+  ":!*.map",
+  ":!*.min.js",
+  ":!*.min.css",
+];
+
 function getActiveModelId(): string {
   const configPath = path.join(os.homedir(), ".diffmind", "config.json");
   if (fs.existsSync(configPath)) {
@@ -109,7 +128,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.2")
+  .version("0.4.3")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -338,11 +357,11 @@ async function getDiff(): Promise<string> {
   try {
     const result = child_process.spawnSync(
       "git",
-      ["diff", `${opts.branch}...HEAD`],
+      ["diff", `${opts.branch}...HEAD`, "--", ".", ...DEFAULT_IGNORED_PATHSPECS],
       {
-        maxBuffer: 10 * 1024 * 1024, // 10MB max diff
+        maxBuffer: 20 * 1024 * 1024, // 20MB max raw buffer
         encoding: "utf-8",
-        shell: false, // Explicitly disable shell for security
+        shell: false,
       }
     );
 
@@ -353,6 +372,16 @@ async function getDiff(): Promise<string> {
     const diff = result.stdout.toString();
     const sizeKB = Math.round(diff.length / 1024);
     spinner.succeed(`Diff captured (${sizeKB}KB)`);
+
+    // Hard Safety Limit: 1.5MB
+    if (sizeKB > 1500) {
+      spinner.fail(chalk.red(`Diff too large to process (${sizeKB}KB)`));
+      console.log(chalk.yellow(`\n⚠️  The diff exceeds the 1.5MB safety limit for local AI.`));
+      console.log(chalk.dim(`  This is usually caused by large generated files or many changes at once.`));
+      console.log(chalk.dim(`  Try reviewing specific files or smaller branches using:`));
+      console.log(chalk.cyan(`    diffmind --branch ${opts.branch} path/to/folder\n`));
+      process.exit(1);
+    }
 
     if (sizeKB > 500) {
       console.log(chalk.yellow(`\n⚠️  Warning: Large diff detected (${sizeKB}KB).`));
