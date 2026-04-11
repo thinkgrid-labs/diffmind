@@ -10,9 +10,7 @@ if (!existsSync(bindingPath)) {
 
 try {
   const binding = require(bindingPath);
-  console.log('Successfully loaded native binding:', Object.keys(binding));
   module.exports = binding;
 } catch (e) {
-  console.error('Failed to load native binding:', e.message);
-  process.exit(1);
+  throw new Error(`Failed to load native binding: ${e.message}`);
 }
