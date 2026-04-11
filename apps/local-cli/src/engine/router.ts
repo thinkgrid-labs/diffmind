@@ -39,6 +39,11 @@ export class EngineRouter {
       }
 
       // 2. FALLBACK TO WASM ENGINE (for 1.5B/0.5B models)
+      console.warn(
+        `[diffmind] Native engine unavailable, falling back to Wasm. ` +
+        `If this is unexpected, rebuild with: npm run build:native\n` +
+        `  Native error: ${nativeErr}`
+      );
       try {
         const { ReviewAnalyzer: WasmAnalyzer } = require("@diffmind/core-wasm");
         let modelBytes: Buffer | null = fs.readFileSync(modelPath);

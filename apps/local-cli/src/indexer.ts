@@ -1,5 +1,5 @@
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 /**
  * Symbol definition found in the source code.
@@ -27,13 +27,47 @@ const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "pkg", ".diffmind"]
 const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".go", ".py"]);
 
 /**
+ * Returns the net brace delta and whether an open brace was seen on this line,
+ * skipping braces that appear inside string literals so that unbalanced strings
+ * like "only a { here" or template literals don't corrupt snippet boundaries.
+ */
+function countBracesInLine(line: string): { delta: number; hasOpenBrace: boolean } {
+  let delta = 0;
+  let hasOpenBrace = false;
+  let inString = false;
+  let stringChar = "";
+
+  for (let j = 0; j < line.length; j++) {
+    const ch = line[j];
+    if (inString) {
+      if (ch === "\\") { j++; continue; } // skip escaped char
+      if (ch === stringChar) inString = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = true;
+      stringChar = ch;
+      continue;
+    }
+    if (ch === "{") {
+      delta++;
+      hasOpenBrace = true;
+    } else if (ch === "}") {
+      delta--;
+    }
+  }
+
+  return { delta, hasOpenBrace };
+}
+
+/**
  * Symbol Indexer
  * 
  * Crawls the project to find exported definitions. This forms the base
  * of the Local RAG system by providing architectural context to the AI.
  */
 export class Indexer {
-  private projectRoot: string;
+  private readonly projectRoot: string;
   private symbols: Record<string, SymbolDefinition> = {};
 
   constructor(projectRoot: string) {
@@ -145,7 +179,7 @@ export class Indexer {
       },
       {
         type: "class" as const,
-        regex: /^class\s+([a-zA-Z0-9_$]+)(?:\(|\:)/mg,
+        regex: /^class\s+([a-zA-Z0-9_$]+)[(:]/mg,
       },
     ];
 
@@ -162,8 +196,10 @@ export class Indexer {
         
         while ((match = pattern.regex.exec(line)) !== null) {
           const name = match[1];
+          // First-definition-wins: skip if a symbol with this name was already
+          // indexed from another file, so RAG always returns a stable result.
+          if (this.symbols[name]) continue;
           const snippet = this.extractSmartSnippet(lines, i);
-
           this.symbols[name] = {
             name,
             file: relativePath,
@@ -183,24 +219,11 @@ export class Indexer {
     const maxLines = 40;
 
     for (let i = startLine; i < Math.min(startLine + maxLines, lines.length); i++) {
-      const line = lines[i];
-      
-      // Count braces
-      for (const char of line) {
-        if (char === "{") {
-          braceCount++;
-          foundStartBrace = true;
-        } else if (char === "}") {
-          braceCount--;
-        }
-      }
-
+      const { delta, hasOpenBrace } = countBracesInLine(lines[i]);
+      braceCount += delta;
+      if (hasOpenBrace) foundStartBrace = true;
       endLine = i;
-
-      // If we found braces and now they are balanced, we found the end
-      if (foundStartBrace && braceCount <= 0) {
-        break;
-      }
+      if (foundStartBrace && braceCount <= 0) break;
     }
 
     return lines.slice(startLine, endLine + 1).join("\n");

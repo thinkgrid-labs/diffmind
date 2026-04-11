@@ -18,12 +18,12 @@ import {
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
-import * as https from "https";
-import * as http from "http";
-import * as child_process from "child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import * as https from "node:https";
+import * as http from "node:http";
+import * as child_process from "node:child_process";
 import { SingleBar, Presets } from "cli-progress";
 import {
   parseReport,
@@ -87,29 +87,37 @@ const DEFAULT_IGNORED_PATHSPECS = [
   ":!*.min.css",
 ];
 
-function getActiveModelId(): string {
-  const configPath = path.join(os.homedir(), ".diffmind", "config.json");
-  if (fs.existsSync(configPath)) {
-    try {
-      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      return config.model || DEFAULT_MODEL;
-    } catch {
-      return DEFAULT_MODEL;
-    }
-  }
-  return DEFAULT_MODEL;
+interface Config {
+  model?: string;
 }
 
-function setActiveModelId(id: string) {
+const CONFIG_PATH = path.join(os.homedir(), ".diffmind", "config.json");
+
+function readConfig(): Config {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) as Config;
+  } catch {
+    return {};
+  }
+}
+
+/** Writes config atomically (temp file → rename) to avoid torn writes in parallel runs. */
+function writeConfig(config: Config): void {
+  const tmp = CONFIG_PATH + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), "utf-8");
+  fs.renameSync(tmp, CONFIG_PATH);
+}
+
+function getActiveModelId(): string {
+  return readConfig().model ?? DEFAULT_MODEL;
+}
+
+function setActiveModelId(id: string): void {
   const configDir = path.join(os.homedir(), ".diffmind");
   fs.mkdirSync(configDir, { recursive: true });
-  const configPath = path.join(configDir, "config.json");
-  let config = {};
-  if (fs.existsSync(configPath)) {
-    try { config = JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch {}
-  }
-  (config as any).model = id;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  const config = readConfig();
+  config.model = id;
+  writeConfig(config);
 }
 
 // ─── CLI Definition ───────────────────────────────────────────────────────────
@@ -120,27 +128,37 @@ const opts: {
   format: "markdown" | "json";
   output?: string;
   minSeverity: Severity;
+  maxTokens: number;
   stdin: boolean;
   color: boolean;
   context?: string;
-} = {} as any;
+} = {
+  branch: "main",
+  format: "markdown",
+  minSeverity: "low",
+  maxTokens: 1024,
+  stdin: false,
+  color: true,
+};
 
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.3")
+  .version("0.4.4")
+  .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
   .option("-c, --context <text|file>", "Business context (ticket description, acceptance criteria)")
   .option("--min-severity <level>", 'Minimum severity to report: "high", "medium", or "low"', "low")
+  .option("--max-tokens <n>", "Maximum output tokens per diff chunk", (v) => Number.parseInt(v, 10), 1024)
   .option("--stdin", "Read git diff from stdin instead of running git diff")
   .option("--no-color", "Disable colored output")
-  .action(async (options) => {
+  .action(async (files, options) => {
     // Check if we are actually running a subcommand
     // commander names the subcommand as the first element of program.args
     const isSubcommand = program.commands.some(
-      (cmd) => program.args[0] === cmd.name() || cmd.aliases().includes(program.args[0])
+      (cmd) => files[0] === cmd.name() || cmd.aliases().includes(files[0])
     );
 
     if (isSubcommand) {
@@ -148,7 +166,7 @@ program
     }
 
     Object.assign(opts, options);
-    await main().catch((err) => {
+    await main(files).catch((err) => {
       console.error(chalk.red(`Fatal Error: ${err.message}`));
       process.exit(1);
     });
@@ -201,93 +219,97 @@ if (require.main === module) {
 
 // ─── Main Logic ───────────────────────────────────────────────────────────────
 
-import { Worker } from "worker_threads";
+import { Worker } from "node:worker_threads";
 
-async function main(): Promise<void> {
-  const modelId = getActiveModelId();
-  const model = MODELS[modelId];
-  printBanner();
-
-  console.log(chalk.dim(`  Using Model: ${model.name}`));
-
-  // 1. Ensure model files are downloaded
-  await ensureModelFiles(modelId);
-
-  // 2. Get the git diff
-  const diff = await getDiff();
-  if (!diff.trim()) {
-    console.log(chalk.green("✓ No changes detected. Nothing to analyze."));
-    process.exit(0);
-  }
-
-  // 3. Prepare business context
+/** Resolves business context from --context flag and appends any RAG snippets. */
+async function buildContext(diff: string): Promise<string> {
   let context = "";
   if (opts.context) {
-    if (fs.existsSync(opts.context)) {
-      context = fs.readFileSync(opts.context, "utf-8");
-    } else {
-      context = opts.context;
-    }
+    context = fs.existsSync(opts.context)
+      ? fs.readFileSync(opts.context, "utf-8")
+      : opts.context;
   }
-
-  // 4. Retrieve architectural context (Local RAG Phase 1)
   const ragContext = await getRagContext(diff);
   if (ragContext) {
     context = `${context}\n\n### Architectural Reference (Local RAG):\n${ragContext}`;
   }
+  return context;
+}
 
-  // 5. Run analysis in a background worker
-  // This keeps the process responsive and the spinner animated.
-  const analyzeSpinner = ora("Initializing engine & analyzing diff...").start();
-  
+/** Runs the worker with a progress spinner and returns the filtered report. */
+async function runAnalysisWithSpinner(
+  model: ModelConfig,
+  diff: string,
+  context: string,
+): Promise<ReviewReport> {
+  const spinner = ora("Initializing engine & analyzing diff...").start();
+  let pulseCount = 0;
+  const pulseInterval = setInterval(() => {
+    pulseCount++;
+    const dots = ".".repeat((pulseCount % 3) + 1);
+    spinner.text = `Analyzing diff (Local AI is thinking${dots})`;
+  }, 3000);
+
   try {
-    // Pulse the spinner to show activity
-    let pulseCount = 0;
-    const pulseInterval = setInterval(() => {
-      pulseCount++;
-      const dots = ".".repeat((pulseCount % 3) + 1);
-      analyzeSpinner.text = `Analyzing diff (Local AI is thinking${dots})`;
-    }, 3000);
-
     const { data: reportRaw, engine } = await runAnalysisInWorker({
       modelPath: path.join(MODEL_DIR, model.filename),
       tokenizerPath: path.join(MODEL_DIR, TOKENIZER_FILENAME),
       diff,
       context,
-      maxTokens: 512,
+      maxTokens: opts.maxTokens,
       modelId: model.id,
     });
-
-    clearInterval(pulseInterval);
-    report = sortFindings(
-      filterBySeverity(parseReport(reportRaw), opts.minSeverity)
-    );
-    analyzeSpinner.succeed(`Analysis complete [engine: ${engine}] — ${report.length} finding(s)`);
+    const findings = sortFindings(filterBySeverity(parseReport(reportRaw), opts.minSeverity));
+    spinner.succeed(`Analysis complete [engine: ${engine}] — ${findings.length} finding(s)`);
+    return findings;
   } catch (err) {
-    analyzeSpinner.fail("Analysis failed");
+    spinner.fail("Analysis failed");
     console.error(chalk.red(String(err)));
     process.exit(1);
+  } finally {
+    clearInterval(pulseInterval);
   }
+}
 
-  // 6. Format and output results
-  const output =
-    opts.format === "json"
-      ? formatJson(report)
-      : formatMarkdown(report, opts.branch);
-
+/** Writes the formatted report to a file or stdout. */
+function printOutput(output: string): void {
   if (opts.output) {
     fs.writeFileSync(opts.output, output, "utf-8");
     console.log(chalk.green(`✓ Report saved to ${opts.output}`));
   } else {
     console.log("\n" + output);
   }
+}
 
-  // Exit code 1 if any HIGH severity findings (useful for CI)
-  const hasHigh = report.some((f) => f.severity === "high");
-  process.exit(hasHigh ? 1 : 0);
+async function main(files: string[] = []): Promise<void> {
+  const modelId = getActiveModelId();
+  const model = MODELS[modelId];
+  printBanner();
+  console.log(chalk.dim(`  Using Model: ${model.name}`));
+
+  await ensureModelFiles(modelId);
+
+  const diff = await getDiff(files);
+  if (!diff.trim()) {
+    console.log(chalk.green("✓ No changes detected. Nothing to analyze."));
+    process.exit(0);
+  }
+
+  const context = await buildContext(diff);
+  report = await runAnalysisWithSpinner(model, diff, context);
+
+  const output = opts.format === "json"
+    ? formatJson(report)
+    : formatMarkdown(report, opts.branch);
+
+  printOutput(output);
+  process.exit(report.some((f) => f.severity === "high") ? 1 : 0);
 }
 
 let report: ReviewReport;
+
+// Kill the worker and reject if inference stalls (OOM, deadlock, etc.).
+const WORKER_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 function runAnalysisInWorker(workerData: {
   modelPath: string;
@@ -298,32 +320,48 @@ function runAnalysisInWorker(workerData: {
   modelId: string;
 }): Promise<{ data: string; engine: string }> {
   return new Promise((resolve, reject) => {
-    // Determine the worker path. During development with ts-node, we point to the .ts file
-    // In production, we point to the transpiled .js file.
     const isTsNode = process.argv.some(arg => arg.includes('ts-node'));
-    const workerPath = isTsNode 
+    const workerPath = isTsNode
       ? path.join(__dirname, "worker.ts")
       : path.join(__dirname, "worker.js");
 
     const worker = new Worker(workerPath, {
       workerData,
-      // If running via ts-node, we need to register it for the worker thread too
       execArgv: isTsNode ? ["-r", "ts-node/register"] : [],
     });
 
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      worker.terminate();
+      settle(() =>
+        reject(new Error(`Analysis timed out after ${WORKER_TIMEOUT_MS / 60000} minutes`))
+      );
+    }, WORKER_TIMEOUT_MS);
+
     worker.on("message", (message) => {
-      if (message.success) {
-        resolve({ data: message.data, engine: message.engine });
-      } else {
-        reject(new Error(message.error));
-      }
+      settle(() => {
+        if (message.success) {
+          resolve({ data: message.data, engine: message.engine });
+        } else {
+          reject(new Error(message.error));
+        }
+      });
     });
 
-    worker.on("error", reject);
+    worker.on("error", (err) => settle(() => reject(err)));
     worker.on("exit", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Worker stopped with exit code ${code}`));
-      }
+      settle(() => {
+        if (code !== 0) {
+          reject(new Error(`Worker stopped with exit code ${code}`));
+        }
+      });
     });
   });
 }
@@ -349,20 +387,62 @@ async function runIndexer(): Promise<void> {
 
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
 
-async function getDiff(): Promise<string> {
+// Regex captures the b/ path which may contain spaces, up to end of line.
+// git always formats this header as: diff --git a/<path> b/<path>
+const DIFF_HEADER_RE = /^diff --git a\/.+ b\/(.+)$/;
+
+function extractFilesFromDiff(diff: string): string[] {
+  const files = new Set<string>();
+  for (const line of diff.split("\n")) {
+    const match = DIFF_HEADER_RE.exec(line);
+    if (match) files.add(match[1]);
+  }
+  return Array.from(files);
+}
+
+function logDiffFiles(diff: string): void {
+  const capturedFiles = extractFilesFromDiff(diff);
+  if (capturedFiles.length > 0) {
+    const label = capturedFiles.length <= 12
+      ? capturedFiles.join(", ")
+      : `${capturedFiles.length} files detected`;
+    console.log(chalk.dim(`  Files: ${label}`));
+  } else if (diff.trim().length > 0) {
+    console.log(chalk.dim("  Files: Detected changes in diff content"));
+  }
+}
+
+function warnLargeDiff(sizeKB: number): void {
+  if (sizeKB > 500) {
+    console.log(chalk.yellow(`\n⚠️  Warning: Large diff detected (${sizeKB}KB).`));
+    console.log(chalk.dim("  Analyzing very large diffs can be slow on local AI and may impact quality."));
+    console.log(chalk.dim("  Consider reviewing in smaller increments or using --branch to target specific changes.\n"));
+  }
+}
+
+function printGitDiffError(msg: string): never {
+  if (msg.includes("not a git repository")) {
+    console.error(chalk.red("Error: not a git repository. Run diffmind from within a git project."));
+  } else if (msg.includes("unknown revision")) {
+    console.error(chalk.red(`Error: branch "${opts.branch}" not found. Try a different --branch value.`));
+  } else {
+    console.error(chalk.red(msg));
+  }
+  process.exit(1);
+}
+
+async function getDiff(includePaths: string[] = []): Promise<string> {
   if (opts.stdin) {
     return readStdin();
   }
+
+  const targetPaths = includePaths.length > 0 ? includePaths : ["."];
   const spinner = ora(`Running git diff ${opts.branch}...HEAD`).start();
   try {
     const result = child_process.spawnSync(
       "git",
-      ["diff", `${opts.branch}...HEAD`, "--", ".", ...DEFAULT_IGNORED_PATHSPECS],
-      {
-        maxBuffer: 20 * 1024 * 1024, // 20MB max raw buffer
-        encoding: "utf-8",
-        shell: false,
-      }
+      ["diff", `${opts.branch}...HEAD`, "--", ...targetPaths, ...DEFAULT_IGNORED_PATHSPECS],
+      { maxBuffer: 20 * 1024 * 1024, encoding: "utf-8", shell: false },
     );
 
     if (result.status !== 0) {
@@ -372,52 +452,44 @@ async function getDiff(): Promise<string> {
     const diff = result.stdout.toString();
     const sizeKB = Math.round(diff.length / 1024);
     spinner.succeed(`Diff captured (${sizeKB}KB)`);
+    logDiffFiles(diff);
 
-    // Hard Safety Limit: 1.5MB
     if (sizeKB > 1500) {
       spinner.fail(chalk.red(`Diff too large to process (${sizeKB}KB)`));
-      console.log(chalk.yellow(`\n⚠️  The diff exceeds the 1.5MB safety limit for local AI.`));
-      console.log(chalk.dim(`  This is usually caused by large generated files or many changes at once.`));
+      console.log(chalk.yellow("\n⚠️  The diff exceeds the 1.5MB safety limit for local AI."));
+      console.log(chalk.dim("  This is usually caused by large generated files or many changes at once."));
       console.log(chalk.dim(`  Try reviewing specific files or smaller branches using:`));
       console.log(chalk.cyan(`    diffmind --branch ${opts.branch} path/to/folder\n`));
       process.exit(1);
     }
 
-    if (sizeKB > 500) {
-      console.log(chalk.yellow(`\n⚠️  Warning: Large diff detected (${sizeKB}KB).`));
-      console.log(chalk.dim(`  Analyzing very large diffs can be slow on local AI and may impact quality.`));
-      console.log(chalk.dim(`  Consider reviewing in smaller increments or using --branch to target specific changes.\n`));
-    }
-
+    warnLargeDiff(sizeKB);
     return diff;
   } catch (err) {
     spinner.fail("Failed to get git diff");
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("not a git repository")) {
-      console.error(
-        chalk.red(
-          "Error: not a git repository. Run diffmind from within a git project."
-        )
-      );
-    } else if (msg.includes("unknown revision")) {
-      console.error(
-        chalk.red(
-          `Error: branch "${opts.branch}" not found. Try a different --branch value.`
-        )
-      );
-    } else {
-      console.error(chalk.red(msg));
-    }
-    process.exit(1);
+    printGitDiffError(err instanceof Error ? err.message : String(err));
   }
 }
 
+const STDIN_SIZE_LIMIT = 1.5 * 1024 * 1024; // 1.5 MB — same cap as git diff path
+
 function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = "";
+    let totalBytes = 0;
     process.stdin.setEncoding("utf-8");
-    process.stdin.on("data", (chunk) => (data += chunk));
+    process.stdin.on("data", (chunk: string) => {
+      totalBytes += Buffer.byteLength(chunk, "utf-8");
+      if (totalBytes > STDIN_SIZE_LIMIT) {
+        process.stdin.destroy(
+          new Error("stdin input exceeds the 1.5MB safety limit; pipe a smaller diff")
+        );
+        return;
+      }
+      data += chunk;
+    });
     process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
   });
 }
 
@@ -449,116 +521,208 @@ async function ensureModelFiles(modelId: string = getActiveModelId()): Promise<v
   }
 }
 
-function downloadFile(url: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    const get = url.startsWith("https") ? https.get : http.get;
-    get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
-      const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
-      if (isRedirect && res.headers.location) {
-        file.close();
-        fs.unlinkSync(dest);
-        const nextUrl = new URL(res.headers.location, url).href;
-        downloadFile(nextUrl, dest).then(resolve).catch(reject);
-        return;
-      }
-      res.pipe(file);
-      file.on("finish", () => file.close(() => resolve()));
-    }).on("error", (err) => {
-      fs.unlinkSync(dest);
-      reject(err);
+// ─── Download Helpers (kept at module scope to stay within 4-level nesting) ───
+
+function deleteAndReject(dest: string, err: Error, reject: (e: Error) => void): void {
+  fs.unlink(dest, () => reject(err));
+}
+
+function deleteAndContinue(
+  dest: string,
+  nextUrl: string,
+  redirectsLeft: number,
+  resolve: () => void,
+  reject: (e: Error) => void,
+): void {
+  fs.unlink(dest, () => {
+    downloadFile(nextUrl, dest, redirectsLeft - 1).then(resolve).catch(reject);
+  });
+}
+
+function finalizeDownload(
+  dest: string,
+  downloaded: number,
+  resolve: () => void,
+  reject: (e: Error) => void,
+): void {
+  const isModel = dest.endsWith(".gguf");
+  const minSize = isModel ? 1024 * 1024 * 100 : 1024;
+  if (downloaded < minSize) {
+    fs.unlink(dest, () =>
+      reject(
+        new Error(
+          `Download failed: file is too small (${(downloaded / 1024 / 1024).toFixed(2)} MB received). The connection may have been throttled or interrupted.`
+        )
+      )
+    );
+  } else {
+    console.log(chalk.dim(`  Downloaded: ${(downloaded / 1024 / 1024).toFixed(1)} MB`));
+    resolve();
+  }
+}
+
+function closeAndResolve(
+  file: fs.WriteStream,
+  resolve: () => void,
+  reject: (e: Error) => void,
+): void {
+  file.close((err) => (err ? reject(err) : resolve()));
+}
+
+function createProgressBar(total: number): SingleBar {
+  const bar = new SingleBar(
+    {
+      format: `{bar} {percentage}% | {value}${total ? "/{total}" : ""} MB | ETA: {eta}s`,
+      formatValue: (v: number, _: unknown, type: string) => {
+        if (type === "value" || type === "total") return (v / 1024 / 1024).toFixed(1);
+        return String(v);
+      },
+    },
+    Presets.shades_classic,
+  );
+  if (total > 0) {
+    bar.start(total, 0);
+  } else {
+    console.log(chalk.dim("  (Total size unknown, streaming...)"));
+    bar.start(1, 0);
+  }
+  return bar;
+}
+
+function streamResponseToFile(
+  res: http.IncomingMessage,
+  file: fs.WriteStream,
+  bar: SingleBar,
+  total: number,
+  dest: string,
+  resolve: () => void,
+  reject: (e: Error) => void,
+): void {
+  let downloaded = 0;
+  let settled = false;
+
+  const cleanupFile = (err: Error) => {
+    if (settled) return;
+    settled = true;
+    bar.stop();
+    file.destroy();
+    file.once("close", () => deleteAndReject(dest, err, reject));
+  };
+
+  file.on("error", cleanupFile);
+  res.on("error", cleanupFile);
+
+  res.on("data", (chunk: Buffer) => {
+    downloaded += chunk.length;
+    if (total > 0) {
+      bar.update(downloaded);
+    } else {
+      bar.update(1, { value: downloaded });
+    }
+    const canContinue = file.write(chunk);
+    if (!canContinue) {
+      res.pause();
+      file.once("drain", () => res.resume());
+    }
+  });
+
+  res.on("end", () => {
+    if (settled) return;
+    bar.stop();
+    file.close(() => {
+      if (settled) return;
+      settled = true;
+      finalizeDownload(dest, downloaded, resolve, reject);
     });
   });
 }
 
-function downloadFileWithProgress(url: string, dest: string): Promise<void> {
+function handleProgressResponse(
+  res: http.IncomingMessage,
+  url: string,
+  dest: string,
+  redirectsLeft: number,
+  resolve: () => void,
+  reject: (e: Error) => void,
+): void {
+  const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
+  if (isRedirect && res.headers.location) {
+    if (redirectsLeft <= 0) {
+      reject(new Error(`Too many redirects downloading ${url}`));
+      return;
+    }
+    const nextUrl = new URL(res.headers.location, url).href;
+    console.log(chalk.dim(`  Redirecting to: ${nextUrl}`));
+    downloadFileWithProgress(nextUrl, dest, redirectsLeft - 1).then(resolve).catch(reject);
+    return;
+  }
+
+  const statusCode = res.statusCode || 0;
+  if (statusCode < 200 || statusCode >= 300) {
+    reject(new Error(`Server returned status code ${statusCode} for ${url}`));
+    return;
+  }
+
+  const total = res.headers["content-length"]
+    ? Number.parseInt(res.headers["content-length"], 10)
+    : 0;
+
+  const bar = createProgressBar(total);
+  const file = fs.createWriteStream(dest);
+  streamResponseToFile(res, file, bar, total, dest, resolve, reject);
+}
+
+function downloadFile(url: string, dest: string, redirectsLeft = 10): Promise<void> {
   return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    let settled = false;
+
+    // Close the write stream, delete the partial file, then reject.
+    // Using destroy() + once("close") ensures the fd is released before
+    // fs.unlink — otherwise Windows throws EBUSY.
+    const cleanup = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      file.destroy();
+      file.once("close", () => deleteAndReject(dest, err, reject));
+    };
+
+    file.on("error", cleanup);
+
     const get = url.startsWith("https") ? https.get : http.get;
-    get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
+    const req = get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) => {
       const isRedirect = [301, 302, 307, 308].includes(res.statusCode || 0);
       if (isRedirect && res.headers.location) {
-        const nextUrl = new URL(res.headers.location, url).href;
-        console.log(chalk.dim(`  Redirecting to: ${nextUrl}`));
-        downloadFileWithProgress(nextUrl, dest)
-          .then(resolve)
-          .catch(reject);
-        return;
-      }
-
-      const statusCode = res.statusCode || 0;
-      if (statusCode < 200 || statusCode >= 300) {
-        reject(new Error(`Server returned status code ${statusCode} for ${url}`));
-        return;
-      }
-
-      const contentLength = res.headers["content-length"];
-      const total = contentLength ? parseInt(contentLength, 10) : 0;
-      
-      const bar = new SingleBar(
-        {
-          format: `{bar} {percentage}% | {value}${total ? "/{total}" : ""} MB | ETA: {eta}s`,
-          formatValue: (v, _, type) => {
-            if (type === "value" || type === "total")
-              return (v / 1024 / 1024).toFixed(1);
-            return String(v);
-          },
-        },
-        Presets.shades_classic
-      );
-      
-      if (total > 0) {
-        bar.start(total, 0);
-      } else {
-        console.log(chalk.dim("  (Total size unknown, streaming...)"));
-        bar.start(1, 0); // Placeholder start
-      }
-
-      let downloaded = 0;
-      const file = fs.createWriteStream(dest);
-
-      res.on("data", (chunk: Buffer) => {
-        downloaded += chunk.length;
-        if (total > 0) {
-          bar.update(downloaded);
-        } else {
-          // If unknown, just show current progress in MB
-          bar.update(1, { value: downloaded }); 
+        if (redirectsLeft <= 0) {
+          cleanup(new Error(`Too many redirects downloading ${url}`));
+          return;
         }
-        file.write(chunk);
+        const nextUrl = new URL(res.headers.location, url).href;
+        file.destroy();
+        file.once("close", () => deleteAndContinue(dest, nextUrl, redirectsLeft, resolve, reject));
+        return;
+      }
+      res.on("error", cleanup);
+      res.pipe(file);
+      file.on("finish", () => {
+        if (!settled) {
+          settled = true;
+          closeAndResolve(file, resolve, reject);
+        }
       });
+    });
 
-      res.on("end", () => {
-        bar.stop();
-        file.close(() => {
-          const isModel = dest.endsWith(".gguf");
-          const minSize = isModel ? 1024 * 1024 * 100 : 1024; // 100MB for model, 1kb for tokenizer
-          
-          if (downloaded < minSize) {
-            fs.unlinkSync(dest);
-            reject(
-              new Error(
-                `Download failed: file is too small (${(
-                  downloaded / 1024 / 1024
-                ).toFixed(2)} MB received). The connection may have been throttled or interrupted.`
-              )
-            );
-          } else {
-            console.log(
-              chalk.dim(
-                `  Downloaded: ${(downloaded / 1024 / 1024).toFixed(1)} MB`
-              )
-            );
-            resolve();
-          }
-        });
-      });
+    req.on("error", cleanup);
+  });
+}
 
-      res.on("error", (err) => {
-        bar.stop();
-        fs.unlinkSync(dest);
-        reject(err);
-      });
-    }).on("error", reject);
+function downloadFileWithProgress(url: string, dest: string, redirectsLeft = 10): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const get = url.startsWith("https") ? https.get : http.get;
+    const req = get(url, { headers: { "User-Agent": "diffmind/0.1.0" } }, (res) =>
+      handleProgressResponse(res, url, dest, redirectsLeft, resolve, reject),
+    );
+    req.on("error", reject);
   });
 }
 

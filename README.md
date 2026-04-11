@@ -139,11 +139,17 @@ diffmind --branch develop --context ticket.md
 ### Architectural-Aware Reviews (Local RAG)
 Build an index of your project's symbols to allow the AI to "look up" function and type definitions referenced in your diff:
 ```bash
-# 1. Build the index (only needed once or after large changes)
-diffmind index
+### Targeted / Granular Reviews
+Focus the AI on specific files or directories to improve speed and relevance:
+```bash
+# Review only the auth folder
+diffmind src/auth/
 
-# 2. Run your review — context is automatically retrieved
-diffmind --branch develop
+# Review specific files
+diffmind src/main.ts src/utils.ts
+
+# Review against a specific branch for one folder
+diffmind --branch staging apps/api/
 ```
 
 ### Custom Diff (Stdin)
