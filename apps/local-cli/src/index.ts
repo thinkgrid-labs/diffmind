@@ -59,7 +59,7 @@ program
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.1")
+  .version("0.3.2")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option(
     "-f, --format <type>",
