@@ -162,8 +162,10 @@ export class Indexer {
         
         while ((match = pattern.regex.exec(line)) !== null) {
           const name = match[1];
+          // First-definition-wins: skip if a symbol with this name was already
+          // indexed from another file, so RAG always returns a stable result.
+          if (this.symbols[name]) continue;
           const snippet = this.extractSmartSnippet(lines, i);
-
           this.symbols[name] = {
             name,
             file: relativePath,

@@ -61,6 +61,11 @@ pub struct ReviewAnalyzer {
     tokenizer: tokenizers::Tokenizer,
 }
 
+/// Hard upper bound on total tokens (prompt + generated) fed to the model.
+/// Qwen2.5-Coder GGUF variants support 4096 tokens; exceeding this causes a
+/// candle panic or garbage output with no clean error.
+const MAX_CONTEXT_TOKENS: usize = 4096;
+
 impl ReviewAnalyzer {
     pub fn new(model_bytes: &[u8], tokenizer_bytes: &[u8]) -> Result<Self, EngineError> {
         let device = Device::Cpu;
@@ -86,7 +91,7 @@ impl ReviewAnalyzer {
         &mut self,
         diff: &str,
         context: &str,
-        _max_tokens_per_chunk: u32,
+        max_tokens_per_chunk: u32,
     ) -> Result<Vec<ReviewFinding>, EngineError> {
         let chunks = chunk_diff(diff, 150);
         let mut all_findings: Vec<ReviewFinding> = Vec::new();
@@ -95,7 +100,8 @@ impl ReviewAnalyzer {
             if chunk.trim().is_empty() {
                 continue;
             }
-            let chunk_findings = self.analyze_diff_internal(&chunk, context)?;
+            let chunk_findings =
+                self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize)?;
             all_findings.extend(chunk_findings);
         }
 
@@ -106,13 +112,14 @@ impl ReviewAnalyzer {
         &mut self,
         diff: &str,
         context: &str,
+        max_new_tokens: usize,
     ) -> Result<Vec<ReviewFinding>, EngineError> {
         if diff.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         let prompt = self.format_prompt(diff, context);
-        let response = self.generate(&prompt, 512)?;
+        let response = self.generate(&prompt, max_new_tokens)?;
 
         let json_start = response.find('[').unwrap_or(0);
         let json_end = response
@@ -131,6 +138,11 @@ impl ReviewAnalyzer {
     }
 
     fn format_prompt(&self, diff: &str, context: &str) -> String {
+        // Guard against large RAG/business context exhausting the token budget.
+        // ~2 000 bytes ≈ 500 tokens at 4 bytes/token leaves headroom for the diff.
+        const MAX_CONTEXT_BYTES: usize = 2000;
+        let context = truncate_to_char_boundary(context, MAX_CONTEXT_BYTES);
+
         let context_section = if context.is_empty() {
             String::new()
         } else {
@@ -153,13 +165,27 @@ impl ReviewAnalyzer {
             .map_err(|e| EngineError::TokenizerError(e.to_string()))?;
         let mut tokens_ids = tokens.get_ids().to_vec();
 
-        let mut logits_processor = LogitsProcessor::new(1337, Some(0.1), None);
+        if tokens_ids.len() >= MAX_CONTEXT_TOKENS {
+            return Err(EngineError::ForwardError(format!(
+                "prompt is too long ({} tokens, limit {}); reduce diff size or context",
+                tokens_ids.len(),
+                MAX_CONTEXT_TOKENS
+            )));
+        }
+        // Cap output so prompt + generated never exceeds MAX_CONTEXT_TOKENS.
+        let max_new = max_len.min(MAX_CONTEXT_TOKENS - tokens_ids.len());
+
+        let mut logits_processor = LogitsProcessor::new(rand::random::<u64>(), Some(0.1), None);
         let mut generated_text = String::new();
 
         let eos_token_id = self.tokenizer.token_to_id("<|im_end|>");
         let alt_eos_token_id = self.tokenizer.token_to_id("<|endoftext|>");
 
-        for i in 0..max_len {
+        for i in 0..max_new {
+            // Defensive: stop if we somehow reach the limit mid-generation.
+            if tokens_ids.len() >= MAX_CONTEXT_TOKENS {
+                break;
+            }
             let context_size = if i > 0 { 1 } else { tokens_ids.len() };
             let start_pos = tokens_ids.len().saturating_sub(context_size);
             let input = Tensor::new(&tokens_ids[start_pos..], &self.device)
@@ -197,6 +223,19 @@ impl ReviewAnalyzer {
     }
 }
 
+/// Truncates `s` to at most `max_bytes` bytes, stepping back to the nearest
+/// valid UTF-8 character boundary so the result is always valid UTF-8.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::with_capacity(4096);
@@ -215,7 +254,7 @@ fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
         } else {
             current.push_str(line);
         }
-        
+
         current.push('\n');
         line_count += 1;
     }
