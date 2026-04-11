@@ -61,7 +61,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.5")
+  .version("0.3.6")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
   .option("-o, --output <file>", "Write output to a file instead of stdout")
@@ -372,10 +372,12 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
         return;
       }
 
-      const total = parseInt(res.headers["content-length"] ?? "0", 10);
+      const contentLength = res.headers["content-length"];
+      const total = contentLength ? parseInt(contentLength, 10) : 0;
+      
       const bar = new SingleBar(
         {
-          format: `{bar} {percentage}% | {value}/{total} MB | ETA: {eta}s`,
+          format: `{bar} {percentage}% | {value}${total ? "/{total}" : ""} MB | ETA: {eta}s`,
           formatValue: (v, _, type) => {
             if (type === "value" || type === "total")
               return (v / 1024 / 1024).toFixed(1);
@@ -384,20 +386,38 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
         },
         Presets.shades_classic
       );
-      bar.start(total, 0);
+      
+      if (total > 0) {
+        bar.start(total, 0);
+      } else {
+        console.log(chalk.dim("  (Total size unknown, streaming...)"));
+        bar.start(1, 0); // Placeholder start
+      }
 
       let downloaded = 0;
       const file = fs.createWriteStream(dest);
 
       res.on("data", (chunk: Buffer) => {
         downloaded += chunk.length;
-        bar.update(downloaded);
+        if (total > 0) {
+          bar.update(downloaded);
+        } else {
+          // If unknown, just show current progress in MB
+          bar.update(1, { value: downloaded }); 
+        }
         file.write(chunk);
       });
 
       res.on("end", () => {
         bar.stop();
-        file.close(() => resolve());
+        file.close(() => {
+          if (downloaded === 0) {
+            reject(new Error("Download failed: 0 bytes received"));
+          } else {
+            console.log(chalk.dim(`  Downloaded: ${(downloaded / 1024 / 1024).toFixed(1)} MB`));
+            resolve();
+          }
+        });
       });
 
       res.on("error", (err) => {
