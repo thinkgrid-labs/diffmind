@@ -20,10 +20,11 @@ export interface SymbolIndex {
   projectRoot: string;
   updatedAt: string;
   symbols: Record<string, SymbolDefinition>;
+  fileMtimes: Record<string, number>;
 }
 
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "pkg", ".diffmind"]);
-const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
+const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".go", ".py"]);
 
 /**
  * Symbol Indexer
@@ -42,18 +43,37 @@ export class Indexer {
   /**
    * Crawls the project and builds the symbol index.
    */
-  public async buildIndex(): Promise<SymbolIndex> {
-    await this.crawl(this.projectRoot);
+  public async buildIndex(existingIndex?: SymbolIndex | null): Promise<SymbolIndex> {
+    const fileMtimes: Record<string, number> = {};
     
+    // Copy existing symbols from files that haven't changed
+    if (existingIndex) {
+      this.symbols = { ...existingIndex.symbols };
+    }
+
+    await this.crawl(this.projectRoot, fileMtimes, existingIndex?.fileMtimes || {});
+    
+    // Clean up symbols for deleted files
+    for (const symName in this.symbols) {
+      if (!fileMtimes[this.symbols[symName].file]) {
+        delete this.symbols[symName];
+      }
+    }
+
     return {
-      version: "1.0.0",
+      version: "1.1.0",
       projectRoot: this.projectRoot,
-      updatedAt: new Error().stack?.includes("sync") ? new Date().toISOString() : new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       symbols: this.symbols,
+      fileMtimes,
     };
   }
 
-  private async crawl(dir: string): Promise<void> {
+  private async crawl(
+    dir: string, 
+    newMtimes: Record<string, number>, 
+    oldMtimes: Record<string, number>
+  ): Promise<void> {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
 
     for (const entry of entries) {
@@ -62,10 +82,17 @@ export class Indexer {
 
       if (entry.isDirectory()) {
         if (IGNORE_DIRS.has(entry.name)) continue;
-        await this.crawl(fullPath);
+        await this.crawl(fullPath, newMtimes, oldMtimes);
       } else if (entry.isFile()) {
-        if (EXTENSIONS.has(path.extname(entry.name))) {
-          this.parseFile(fullPath, relativePath);
+        const ext = path.extname(entry.name);
+        if (EXTENSIONS.has(ext)) {
+          const stats = fs.statSync(fullPath);
+          newMtimes[relativePath] = stats.mtimeMs;
+
+          // Only parse if the file is new or modified
+          if (stats.mtimeMs !== oldMtimes[relativePath]) {
+            this.parseFile(fullPath, relativePath);
+          }
         }
       }
     }
@@ -98,21 +125,44 @@ export class Indexer {
         type: "const" as const,
         regex: /export\s+(?:const|let|var)\s+([a-zA-Z0-9_$]+)/g,
       },
+      // Go patterns
+      {
+        type: "function" as const,
+        regex: /^func\s+([A-Z][a-zA-Z0-9_$]*)/mg,
+      },
+      {
+        type: "interface" as const,
+        regex: /^type\s+([A-Z][a-zA-Z0-9_$]*)\s+interface/mg,
+      },
+      {
+        type: "class" as const, // Treat structs as classes for AI review similarity
+        regex: /^type\s+([A-Z][a-zA-Z0-9_$]*)\s+struct/mg,
+      },
+      // Python patterns (top-level only)
+      {
+        type: "function" as const,
+        regex: /^def\s+([a-zA-Z0-9_$]+)\(/mg,
+      },
+      {
+        type: "class" as const,
+        regex: /^class\s+([a-zA-Z0-9_$]+)(?:\(|\:)/mg,
+      },
     ];
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      if (!line.includes("export")) continue;
+      // Quick optimization: only scan lines that look like definitions
+      if (!line.includes("export") && !line.startsWith("def ") && !line.startsWith("class ") && !line.startsWith("func ") && !line.startsWith("type ")) {
+        continue;
+      }
 
       for (const pattern of patterns) {
         let match;
-        // Important: Reset lastIndex for global regex
         pattern.regex.lastIndex = 0;
         
         while ((match = pattern.regex.exec(line)) !== null) {
           const name = match[1];
-          // Take 15 lines of context for the snippet
-          const snippet = lines.slice(i, i + 15).join("\n");
+          const snippet = this.extractSmartSnippet(lines, i);
 
           this.symbols[name] = {
             name,
@@ -124,6 +174,36 @@ export class Indexer {
         }
       }
     }
+  }
+
+  private extractSmartSnippet(lines: string[], startLine: number): string {
+    let braceCount = 0;
+    let foundStartBrace = false;
+    let endLine = startLine;
+    const maxLines = 40;
+
+    for (let i = startLine; i < Math.min(startLine + maxLines, lines.length); i++) {
+      const line = lines[i];
+      
+      // Count braces
+      for (const char of line) {
+        if (char === "{") {
+          braceCount++;
+          foundStartBrace = true;
+        } else if (char === "}") {
+          braceCount--;
+        }
+      }
+
+      endLine = i;
+
+      // If we found braces and now they are balanced, we found the end
+      if (foundStartBrace && braceCount <= 0) {
+        break;
+      }
+    }
+
+    return lines.slice(startLine, endLine + 1).join("\n");
   }
 
   /**

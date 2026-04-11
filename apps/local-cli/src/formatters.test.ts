@@ -3,7 +3,7 @@ import {
   formatMarkdown,
   severityBadge,
   categoryBadge,
-} from "./index";
+} from "./formatters";
 import { type ReviewReport } from "@diffmind/shared-types";
 
 // Mock chalk to return plain strings for easier testing
@@ -56,11 +56,11 @@ describe("cli formatters", () => {
 
     it("should return a formatted report when issues are found", () => {
       const output = formatMarkdown(mockReport, "feat-branch");
-      expect(output).toContain("diffmind Code Review Report");
-      expect(output).toContain("Branch: feat-branch");
+      expect(output).toContain("Diffmind Code Review");
+      expect(output).toContain("Analysis for `feat-branch`");
       expect(output).toContain("auth.ts:10");
       expect(output).toContain("Hardcoded secret");
-      expect(output).toContain("Fix: Use env");
+      expect(output).toContain("Use env");
     });
   });
 

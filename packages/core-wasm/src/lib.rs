@@ -10,11 +10,11 @@
 //! # Phase 2 (next)
 //! Real GGUF inference via `candle-core` + `candle-transformers`.
 
-use wasm_bindgen::prelude::*;
-use serde::{Deserialize, Serialize};
+use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
-use candle_core::quantized::gguf_file;
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
 
 // Better panic messages in Node.js / browser console during development
 #[cfg(feature = "console_error_panic_hook")]
@@ -71,14 +71,14 @@ impl ReviewAnalyzer {
         set_panic_hook();
 
         let device = Device::Cpu;
-        
+
         let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| JsError::new(&format!("failed to load tokenizer: {e}")))?;
 
         let mut reader = std::io::Cursor::new(model_bytes);
         let gguf = gguf_file::Content::read(&mut reader)
             .map_err(|e| JsError::new(&format!("failed to read gguf file: {e}")))?;
-        
+
         let model = Qwen2::from_gguf(gguf, &mut reader, &device)
             .map_err(|e| JsError::new(&format!("failed to load model weights: {e}")))?;
 
@@ -113,7 +113,11 @@ impl ReviewAnalyzer {
             .map_err(|e| JsError::new(&format!("failed to serialize merged findings: {e}")))
     }
 
-    fn analyze_diff_internal(&mut self, diff: &str, context: &str) -> Result<Vec<ReviewFinding>, JsError> {
+    fn analyze_diff_internal(
+        &mut self,
+        diff: &str,
+        context: &str,
+    ) -> Result<Vec<ReviewFinding>, JsError> {
         if diff.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -123,12 +127,17 @@ impl ReviewAnalyzer {
 
         // Extract JSON block
         let json_start = response.find('[').unwrap_or(0);
-        let json_end = response.rfind(']').unwrap_or(response.len().saturating_sub(1));
+        let json_end = response
+            .rfind(']')
+            .unwrap_or(response.len().saturating_sub(1));
         let json_slice = &response[json_start..=json_end];
 
         // Validate and deserialize
-        let findings: Vec<ReviewFinding> = serde_json::from_str(json_slice)
-            .map_err(|e| JsError::new(&format!("model returned invalid JSON: {e}\nRaw: {json_slice}")))?;
+        let findings: Vec<ReviewFinding> = serde_json::from_str(json_slice).map_err(|e| {
+            JsError::new(&format!(
+                "model returned invalid JSON: {e}\nRaw: {json_slice}"
+            ))
+        })?;
 
         Ok(findings)
     }
@@ -152,13 +161,15 @@ impl ReviewAnalyzer {
     fn generate(&mut self, prompt: &str, max_len: usize) -> Result<String, JsError> {
         use candle_transformers::generation::LogitsProcessor;
 
-        let tokens = self.tokenizer.encode(prompt, true)
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
             .map_err(|e| JsError::new(&format!("encoding error: {e}")))?;
         let mut tokens_ids = tokens.get_ids().to_vec();
-        
+
         let mut logits_processor = LogitsProcessor::new(1337, Some(0.1), None);
         let mut generated_text = String::new();
-        
+
         let eos_token_id = self.tokenizer.token_to_id("<|im_end|>");
         let alt_eos_token_id = self.tokenizer.token_to_id("<|endoftext|>");
 
@@ -169,24 +180,31 @@ impl ReviewAnalyzer {
                 .map_err(|e| JsError::new(&format!("tensor error: {e}")))?
                 .unsqueeze(0)
                 .map_err(|e| JsError::new(&format!("unsqueeze error: {e}")))?;
-            
-            let logits = self.model.forward(&input, tokens_ids.len() - context_size)
+
+            let logits = self
+                .model
+                .forward(&input, tokens_ids.len() - context_size)
                 .map_err(|e| JsError::new(&format!("forward error: {e}")))?;
-            let logits = logits.squeeze(0)
+            let logits = logits
+                .squeeze(0)
                 .map_err(|e| JsError::new(&format!("squeeze error: {e}")))?;
-            let logits = logits.get(logits.dim(0)? - 1)
+            let logits = logits
+                .get(logits.dim(0)? - 1)
                 .map_err(|e| JsError::new(&format!("get error: {e}")))?;
-            
-            let next_token = logits_processor.sample(&logits)
+
+            let next_token = logits_processor
+                .sample(&logits)
                 .map_err(|e| JsError::new(&format!("sampling error: {e}")))?;
-            
+
             tokens_ids.push(next_token);
 
             if Some(next_token) == eos_token_id || Some(next_token) == alt_eos_token_id {
                 break;
             }
 
-            let decoded = self.tokenizer.decode(&[next_token], true)
+            let decoded = self
+                .tokenizer
+                .decode(&[next_token], true)
                 .map_err(|e| JsError::new(&format!("decoding error: {e}")))?;
             generated_text.push_str(&decoded);
         }
@@ -268,7 +286,7 @@ mod tests {
     #[test]
     fn test_format_prompt_contains_all_categories() {
         // We need a dummy analyzer helper or just test the format_prompt logic if accessible
-        // Since format_prompt is an internal method of ReviewAnalyzer, we can test it 
+        // Since format_prompt is an internal method of ReviewAnalyzer, we can test it
         // by creating a ReviewAnalyzer (though it needs a model, which is heavy).
         // For unit testing logic, it might be better to make format_prompt a standalone pure function,
         // but for now I'll just skip this or mock it if possible.

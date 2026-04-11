@@ -114,9 +114,9 @@ git diff main...HEAD | diffmind --stdin
 
 I am committed to making Diffmind the ultimate local-first AI companion for developers. As a developer, I am building the foundation for a privacy-first engineering future, and I am actively looking for contributors to join this mission!
 
-- [ ] **Local RAG Integration**: Context-aware reviews that understand your entire repository's architecture by indexing local files.
-- [ ] **VS Code Extension**: Real-time AI feedback directly in your editor, transforming code reviews into a fluid, pair-programming experience.
-- [ ] **Custom Rule Engine**: Define project-specific review standards and architectural boundaries using simple YAML configurations.
+- [x] **v0.3.x**: Local RAG Integration (Symbol Indexing & Semantic Context)
+- [ ] **v0.4.0**: VS Code Extension (Real-time IDE feedback)
+- [ ] **v0.5.0**: Custom Rule Engine (Team-specific standards)
 - [ ] **Advanced CI Guards**: Ready-to-use GitHub Action templates to enforce security baselines and block high-severity PRs automatically.
 - [ ] **Multi-Language Support**: Expanding the deep-reasoning review capabilities to Go, Python, Rust, and Java.
 

@@ -9,6 +9,12 @@
  */
 
 import { Indexer } from "./indexer";
+import { getRagContext } from "./rag";
+import {
+  formatJson,
+  formatMarkdown,
+  printBanner,
+} from "./formatters";
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
@@ -25,7 +31,6 @@ import {
   filterBySeverity,
   type ReviewReport,
   type Severity,
-  type Category,
 } from "@diffmind/shared-types";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -54,7 +59,7 @@ program
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.3.0")
+  .version("0.3.1")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option(
     "-f, --format <type>",
@@ -222,50 +227,18 @@ function runAnalysisInWorker(workerData: {
 async function runIndexer(): Promise<void> {
   const spinner = ora("Scanning repository for symbols...").start();
   try {
-    const indexer = new Indexer(process.cwd());
-    const index = await indexer.buildIndex();
+    const cwd = process.cwd();
+    const existingIndex = Indexer.load(cwd);
+    const indexer = new Indexer(cwd);
+    
+    const index = await indexer.buildIndex(existingIndex);
     indexer.save(index);
-    spinner.succeed(`Index built: ${Object.keys(index.symbols).length} symbols found`);
+    spinner.succeed(`Index updated: ${Object.keys(index.symbols).length} symbols found`);
   } catch (err) {
     spinner.fail("Indexing failed");
     console.error(chalk.red(String(err)));
     process.exit(1);
   }
-}
-
-async function getRagContext(diff: string): Promise<string | null> {
-  const index = Indexer.load(process.cwd());
-  if (!index) return null;
-
-  const foundSymbols = new Set<string>();
-  const lines = diff.split("\n");
-
-  // Simple heuristic: find all words that match a known symbol name in added/modified lines
-  for (const line of lines) {
-    if (!line.startsWith("+") || line.startsWith("+++")) continue;
-
-    const words = line.match(/[a-zA-Z0-9_$]+/g);
-    if (!words) continue;
-
-    for (const word of words) {
-      if (index.symbols[word]) {
-        foundSymbols.add(word);
-      }
-    }
-  }
-
-  if (foundSymbols.size === 0) return null;
-
-  let contexts = "";
-  // Pick top 10 symbols to avoid prompt overflow
-  const symbolsToInclude = Array.from(foundSymbols).slice(0, 10);
-  
-  for (const symName of symbolsToInclude) {
-    const def = index.symbols[symName];
-    contexts += `\n--- Symbol: ${symName} (from ${def.file}) ---\n${def.snippet}\n`;
-  }
-
-  return contexts;
 }
 
 // ─── Diff Acquisition ─────────────────────────────────────────────────────────
@@ -413,68 +386,6 @@ function downloadFileWithProgress(url: string, dest: string): Promise<void> {
       });
     }).on("error", reject);
   });
-}
-
-// ─── Formatters ───────────────────────────────────────────────────────────────
-
-export function formatJson(report: ReviewReport): string {
-  return JSON.stringify(report, null, 2);
-}
-
-export function formatMarkdown(report: ReviewReport, branch: string): string {
-  const lines: string[] = [];
-
-  if (report.length === 0) {
-    lines.push(chalk.green("✓ No issues found in this diff.\n"));
-    return lines.join("\n");
-  }
-
-  const high = report.filter((f) => f.severity === "high");
-  const medium = report.filter((f) => f.severity === "medium");
-  const low = report.filter((f) => f.severity === "low");
-
-  lines.push(chalk.bold.white("╔══════════════════════════════════════╗"));
-  lines.push(chalk.bold.white("║      diffmind Code Review Report     ║"));
-  lines.push(chalk.bold.white("╚══════════════════════════════════════╝"));
-  lines.push("");
-  lines.push(`Branch: ${chalk.cyan(branch)}  |  Findings: ${chalk.white(report.length)}  |  ${chalk.red(`High: ${high.length}`)}  ${chalk.yellow(`Medium: ${medium.length}`)}  ${chalk.blue(`Low: ${low.length}`)}`);
-  lines.push("");
-
-  for (const finding of report) {
-    const sBadge = severityBadge(finding.severity);
-    const cBadge = categoryBadge(finding.category);
-    const conf = finding.confidence != null
-      ? chalk.dim(` (confidence: ${Math.round(finding.confidence * 100)}%)`)
-      : "";
-    lines.push(`${sBadge} ${cBadge} ${chalk.bold(finding.file)}:${chalk.cyan(String(finding.line))}${conf}`);
-    lines.push(`  ${chalk.white(finding.issue)}`);
-    lines.push(`  ${chalk.dim("Fix:")} ${chalk.green(finding.suggested_fix)}`);
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-export function severityBadge(severity: Severity): string {
-  switch (severity) {
-    case "high":   return chalk.bgRed.white.bold(" HIGH ");
-    case "medium": return chalk.bgYellow.black.bold(" MED  ");
-    case "low":    return chalk.bgBlue.white.bold(" LOW  ");
-  }
-}
-
-export function categoryBadge(category: Category): string {
-  switch (category) {
-    case "security":        return chalk.bgMagenta.white.bold(" SECURITY ");
-    case "quality":         return chalk.bgCyan.black.bold(" QUALITY  ");
-    case "performance":     return chalk.bgBlackBright.white.bold(" PERF     ");
-    case "maintainability": return chalk.bgBlueBright.white.bold(" MAINT    ");
-  }
-}
-
-function printBanner(): void {
-  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.3.0 — local-first AI code review"));
-  console.log(chalk.dim("  Model: Qwen2.5-Coder-3B-Instruct Q4_K_M | Inference: on-device Wasm\n"));
 }
 
 if (require.main === module) {
