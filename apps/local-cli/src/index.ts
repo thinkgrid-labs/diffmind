@@ -60,7 +60,10 @@ const MODELS: Record<string, ModelConfig> = {
     id: "3b",
     name: "Qwen2.5-Coder-3B-Instruct Q4_K_M",
     filename: "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
-    modelUrl: "https://huggingface.co/bartowski/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+    // Use the official Qwen GGUF (same source as 1.5B). The bartowski GGUF
+    // stores rope metadata in a format candle 0.8 doesn't parse correctly,
+    // resulting in a zero-length RoPE cache and a panic during inference.
+    modelUrl: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
     tokenizerUrl: "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct/resolve/main/tokenizer.json",
     minMemoryGB: 4,
   }
@@ -144,7 +147,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.7")
+  .version("0.4.8")
   .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
