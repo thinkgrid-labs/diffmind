@@ -13,7 +13,7 @@ pub enum OutputFormat {
 #[command(name = "diffmind")]
 #[command(bin_name = "diffmind")]
 #[command(author = "Thinkgrid Labs <dennis@thinkgrid.dev>")]
-#[command(version = "0.5.0")]
+#[command(version)]
 #[command(about = "Local-first AI code review — on-device inference, no cloud required", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]

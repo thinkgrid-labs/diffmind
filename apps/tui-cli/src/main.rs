@@ -221,7 +221,10 @@ async fn run_static(
     let branch_label = if args.stdin {
         "(stdin)".to_string()
     } else {
-        args.branch.clone()
+        match git::current_branch() {
+            Some(current) if current != args.branch => format!("{} → {}", current, args.branch),
+            _ => args.branch.clone(),
+        }
     };
 
     eprintln!();

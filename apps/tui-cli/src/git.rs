@@ -1,6 +1,26 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
+/// Returns the name of the currently checked-out branch, or `None` if git
+/// is unavailable or the repo is in a detached-HEAD state.
+pub fn current_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // "HEAD" means detached state — not useful to show
+        if branch == "HEAD" {
+            None
+        } else {
+            Some(branch)
+        }
+    } else {
+        None
+    }
+}
+
 pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     let branch_arg = format!("{}...HEAD", branch);
     let mut args = vec!["diff", &branch_arg, "--"];
