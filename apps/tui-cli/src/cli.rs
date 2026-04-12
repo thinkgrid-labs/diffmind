@@ -27,6 +27,12 @@ pub struct Cli {
     #[arg(short, long, default_value = "1.5b")]
     pub model: String,
 
+    /// Review only the most recent commit (HEAD~1..HEAD).
+    /// Use this to review just what you last committed rather than
+    /// the entire branch diff against --branch.
+    #[arg(short, long)]
+    pub last: bool,
+
     /// Initial analysis from stdin
     #[arg(long)]
     pub stdin: bool,
@@ -53,6 +59,10 @@ pub struct Cli {
     /// Maximum output tokens per diff chunk
     #[arg(long, default_value_t = 1024)]
     pub max_tokens: u32,
+
+    /// Print raw model output and token counts to stderr (for diagnosing empty results)
+    #[arg(long)]
+    pub debug: bool,
 
     /// Specific files or directories to review (optional)
     pub files: Vec<String>,

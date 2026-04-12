@@ -68,6 +68,8 @@ pub struct ReviewAnalyzer {
     /// User story / acceptance criteria from the feature ticket.
     /// When set the model also checks whether the diff satisfies the requirements.
     requirements: Option<String>,
+    /// When true, print the raw model output and token counts to stderr for each chunk.
+    debug: bool,
 }
 
 /// Hard upper bound on total tokens (prompt + generated) fed to the model.
@@ -95,6 +97,7 @@ impl ReviewAnalyzer {
             tokenizer,
             languages: None,
             requirements: None,
+            debug: false,
         })
     }
 
@@ -123,35 +126,67 @@ impl ReviewAnalyzer {
         self
     }
 
+    /// Print raw model output and token counts to stderr for each chunk.
+    /// Useful for diagnosing why findings are empty or JSON parsing fails.
+    pub fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// Like [`analyze_diff_chunked`] but calls `on_progress(done, total)` after
+    /// each chunk completes so callers can display a live progress indicator.
+    ///
+    /// Returns `(findings, skipped)` where `skipped` is the number of chunks
+    /// the model processed but returned unparseable JSON for — useful for
+    /// surfacing silent failures to the user.
+    pub fn analyze_diff_chunked_with_progress<F>(
+        &mut self,
+        diff: &str,
+        context: &str,
+        max_tokens_per_chunk: u32,
+        on_progress: F,
+    ) -> Result<(Vec<ReviewFinding>, usize), EngineError>
+    where
+        F: Fn(usize, usize),
+    {
+        // Run deterministic rules first — catches patterns the model reliably misses.
+        let mut all_findings = detect_commented_out_code(diff);
+        all_findings.extend(detect_removed_used_variables(diff));
+
+        const MAX_CHUNK_LINES: usize = 300;
+        let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
+        // Pre-count non-empty chunks so callers can show "N/total".
+        let total = chunks.iter().filter(|c| !c.trim().is_empty()).count();
+        let mut done = 0;
+        let mut skipped = 0;
+
+        for chunk in chunks {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            done += 1;
+            on_progress(done, total);
+            match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
+                Ok(findings) => all_findings.extend(findings),
+                // Small models often produce malformed JSON for a single chunk.
+                // Count skips so the caller can warn the user instead of silently
+                // returning "no issues".
+                Err(EngineError::SerializationError(_)) => skipped += 1,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok((all_findings, skipped))
+    }
+
     pub fn analyze_diff_chunked(
         &mut self,
         diff: &str,
         context: &str,
         max_tokens_per_chunk: u32,
     ) -> Result<Vec<ReviewFinding>, EngineError> {
-        // chunk_diff already splits on every `diff --git` boundary (one chunk per
-        // file).  The secondary line limit is only hit for very large single-file
-        // diffs.  300 lines is a better default than 150: most files fit in one
-        // inference pass, and the early JSON-complete exit in `generate()` means
-        // processing stops as soon as the answer array is closed.
-        const MAX_CHUNK_LINES: usize = 300;
-        let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
-        let mut all_findings: Vec<ReviewFinding> = Vec::new();
-
-        for chunk in chunks {
-            if chunk.trim().is_empty() {
-                continue;
-            }
-            match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
-                Ok(findings) => all_findings.extend(findings),
-                // Small models often produce malformed JSON for a single chunk.
-                // Skip the chunk and continue rather than aborting the whole run.
-                Err(EngineError::SerializationError(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(all_findings)
+        self.analyze_diff_chunked_with_progress(diff, context, max_tokens_per_chunk, |_, _| {})
+            .map(|(findings, _)| findings)
     }
 
     fn analyze_diff_internal(
@@ -165,7 +200,29 @@ impl ReviewAnalyzer {
         }
 
         let prompt = self.format_prompt(diff, context);
+
+        if self.debug {
+            let token_count = self
+                .tokenizer
+                .encode(&*prompt, true)
+                .map(|t| t.len())
+                .unwrap_or(0);
+            eprintln!(
+                "\n[debug] prompt tokens: {}  max_new: {}",
+                token_count, max_new_tokens
+            );
+            eprintln!(
+                "[debug] diff being analyzed ({} bytes):\n{}\n",
+                diff.len(),
+                diff
+            );
+        }
+
         let response = self.generate(&prompt, max_new_tokens)?;
+
+        if self.debug {
+            eprintln!("[debug] raw model output:\n{}\n", response);
+        }
 
         let json_start = response.find('[').unwrap_or(0);
         let json_end = response
@@ -173,10 +230,18 @@ impl ReviewAnalyzer {
             .unwrap_or_else(|| response.len().saturating_sub(1));
 
         if json_end <= json_start || json_end >= response.len() {
+            if self.debug {
+                eprintln!("[debug] no valid JSON array found in output");
+            }
             return Ok(Vec::new());
         }
 
         let json_slice = &response[json_start..=json_end];
+
+        if self.debug {
+            eprintln!("[debug] extracted JSON slice:\n{}\n", json_slice);
+        }
+
         let findings: Vec<ReviewFinding> = serde_json::from_str(json_slice)
             .map_err(|e| EngineError::SerializationError(e.to_string()))?;
 
@@ -225,7 +290,7 @@ impl ReviewAnalyzer {
         };
 
         format!(
-            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for {} code.{}{} \n\nFocus on:\n1. **Security**: Vulnerabilities, secrets, insecure handling.\n2. **Quality**: Bugs, anti-patterns, logical errors.\n3. **Performance**: Bottlenecks, inefficient code.\n4. **Maintainability**: Readability, naming, complexity.{}\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": {}, \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf no issues, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for {} code.{}{} \n\nFocus on:\n1. **Security**: Vulnerabilities, exposed secrets, insecure handling, disabled auth or validation.\n2. **Quality**: Bugs, anti-patterns, logical errors, commented-out functions or blocks of code (flag as medium severity), dead code left behind.\n3. **Performance**: Bottlenecks, inefficient algorithms or queries.\n4. **Maintainability**: Hard-to-read code, poor naming, high complexity, TODOs left in production code.{}\n\nIMPORTANT: If a function, method, or block has been commented out in the diff (lines starting with // or /* that previously were code), always flag it — commented-out code is a quality issue even if the change looks small.\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": {}, \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf genuinely no issues exist, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
             stack,
             requirements_section,
             context_section,
@@ -410,6 +475,297 @@ fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
     } else {
         chunks
     }
+}
+
+// ─── Deterministic rule: detect commented-out code blocks ────────────────────
+//
+// The LLM reliably misses this pattern.  We catch it mechanically by walking
+// diff hunks and checking whether removed lines reappear as `// <same code>`.
+// Auth/security files are flagged High; everything else is Medium.
+
+struct Hunk {
+    file: String,
+    start_line: u32,
+    removed: Vec<String>,
+    added: Vec<String>,
+}
+
+pub fn detect_commented_out_code(diff: &str) -> Vec<ReviewFinding> {
+    let mut findings: Vec<ReviewFinding> = Vec::new();
+    let mut current_file = String::new();
+    let mut hunk = Hunk {
+        file: String::new(),
+        start_line: 0,
+        removed: Vec::new(),
+        added: Vec::new(),
+    };
+
+    let flush = |h: &mut Hunk, findings: &mut Vec<ReviewFinding>| {
+        if h.removed.len() < 3 || h.added.is_empty() || h.file.is_empty() {
+            h.removed.clear();
+            h.added.clear();
+            return;
+        }
+        // Count removed lines that appear in added as `// <code>` or `/* <code>`
+        let matches = h
+            .removed
+            .iter()
+            .filter(|code| {
+                let stripped = code.trim();
+                h.added.iter().any(|a| {
+                    let a = a.trim();
+                    a == format!("// {}", stripped)
+                        || a == format!("//{}", stripped)
+                        || a.trim_start_matches('/').trim_start_matches('*').trim() == stripped
+                })
+            })
+            .count();
+
+        // Require ≥60% of removed lines to match as comments
+        if matches * 10 >= h.removed.len() * 6 {
+            let is_sensitive = h.file.contains("auth")
+                || h.file.contains("login")
+                || h.file.contains("token")
+                || h.file.contains("password")
+                || h.file.contains("security")
+                || h.file.contains("middleware")
+                || h.removed.iter().any(|c| {
+                    c.contains("auth")
+                        || c.contains("token")
+                        || c.contains("password")
+                        || c.contains("login")
+                        || c.contains("validate")
+                        || c.contains("sanitize")
+                });
+
+            let (severity, category, issue) = if is_sensitive {
+                (
+                    Severity::High,
+                    Category::Security,
+                    format!(
+                        "Security-sensitive logic has been entirely commented out ({} lines). \
+                         The function body is now dead code and will not execute — \
+                         this may silently break authentication or validation.",
+                        h.removed.len()
+                    ),
+                )
+            } else {
+                (
+                    Severity::Medium,
+                    Category::Quality,
+                    format!(
+                        "A code block of {} lines has been commented out. \
+                         Commented-out code is technical debt — either restore it or delete it.",
+                        h.removed.len()
+                    ),
+                )
+            };
+
+            findings.push(ReviewFinding {
+                file: h.file.clone(),
+                line: h.start_line,
+                severity,
+                category,
+                issue,
+                suggested_fix:
+                    "Restore the logic if it should be active, or remove the commented block \
+                     entirely. Use version control (git revert/branch) instead of commenting out."
+                        .to_string(),
+                confidence: Some(0.95),
+            });
+        }
+
+        h.removed.clear();
+        h.added.clear();
+    };
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            flush(&mut hunk, &mut findings);
+            // Extract the b/ filename
+            if let Some(b_part) = line.split(" b/").nth(1) {
+                current_file = b_part.trim().to_string();
+            }
+            hunk.file = current_file.clone();
+        } else if line.starts_with("@@") {
+            flush(&mut hunk, &mut findings);
+            hunk.file = current_file.clone();
+            // Parse the new-file start line from `@@ -a,b +c,d @@`
+            if let Some(new_part) = line.split('+').nth(1) {
+                if let Some(num) = new_part.split(',').next() {
+                    hunk.start_line = num.trim().parse().unwrap_or(1);
+                }
+            }
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            let code = line[1..].trim().to_string();
+            if !code.is_empty() {
+                hunk.removed.push(code);
+            }
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            let code = line[1..].trim().to_string();
+            if !code.is_empty() {
+                hunk.added.push(code);
+            }
+        }
+    }
+
+    flush(&mut hunk, &mut findings);
+    findings
+}
+
+// ─── Deterministic rule: removed variable still referenced ───────────────────
+//
+// Catches the pattern: a `const`/`let`/`var`/`def`/`var` declaration is on a
+// `-` line but the declared name still appears in unchanged or added context
+// lines — a guaranteed runtime ReferenceError / NameError.
+
+pub fn detect_removed_used_variables(diff: &str) -> Vec<ReviewFinding> {
+    let mut findings: Vec<ReviewFinding> = Vec::new();
+    let mut current_file = String::new();
+    // Collect all lines per file: (is_removed, is_added, text)
+    let mut file_lines: Vec<(bool, bool, String)> = Vec::new();
+    let mut file_start_line: u32 = 1;
+
+    let flush_file = |file: &str,
+                      lines: &[(bool, bool, String)],
+                      start: u32,
+                      findings: &mut Vec<ReviewFinding>| {
+        if file.is_empty() {
+            return;
+        }
+        // Regex-lite: find `const|let|var|def ` declarations on removed lines
+        // and check if the name still appears in context/added lines.
+        for (idx, (removed, _added, text)) in lines.iter().enumerate() {
+            if !removed {
+                continue;
+            }
+            let name = extract_declared_name(text);
+            let name = match name {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            // Check if `name` appears in any non-removed line (context or added)
+            let still_used = lines
+                .iter()
+                .any(|(rem, _, t)| !rem && contains_identifier(t, &name));
+            if still_used {
+                let line_no = start + idx as u32;
+                findings.push(ReviewFinding {
+                        file: file.to_string(),
+                        line: line_no,
+                        severity: Severity::High,
+                        category: Category::Quality,
+                        issue: format!(
+                            "Variable `{}` was removed but is still referenced in the same scope. \
+                             This will cause a ReferenceError (JavaScript) or NameError (Python) at runtime.",
+                            name
+                        ),
+                        suggested_fix: format!(
+                            "Restore the declaration of `{}`, or remove all references to it. \
+                             Do not leave code that uses an undefined variable.",
+                            name
+                        ),
+                        confidence: Some(0.92),
+                    });
+            }
+        }
+    };
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            flush_file(&current_file, &file_lines, file_start_line, &mut findings);
+            file_lines.clear();
+            if let Some(b) = line.split(" b/").nth(1) {
+                current_file = b.trim().to_string();
+            }
+        } else if line.starts_with("@@") {
+            if let Some(new_part) = line.split('+').nth(1) {
+                if let Some(num) = new_part.split(',').next() {
+                    let hunk_start: u32 = num.trim().parse().unwrap_or(1);
+                    if file_lines.is_empty() {
+                        file_start_line = hunk_start;
+                    }
+                }
+            }
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            file_lines.push((true, false, line[1..].to_string()));
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            file_lines.push((false, true, line[1..].to_string()));
+        } else {
+            // Context line
+            file_lines.push((false, false, line.to_string()));
+        }
+    }
+    flush_file(&current_file, &file_lines, file_start_line, &mut findings);
+    findings
+}
+
+/// Extracts the declared identifier from a `const x =`, `let x =`, `var x =`,
+/// `def x(`, `x :=` or `val x =` line.  Returns `None` if no pattern matches.
+fn extract_declared_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    // JavaScript / TypeScript
+    for kw in &["const ", "let ", "var "] {
+        if let Some(rest) = trimmed.strip_prefix(kw) {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    // Python
+    if let Some(rest) = trimmed.strip_prefix("def ") {
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    // Go / Rust short assignment or `let x`
+    if let Some(pos) = trimmed.find(" := ") {
+        let name: String = trimmed[..pos]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Returns true if `text` contains `name` as a whole identifier (not a substring).
+fn contains_identifier(text: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !text
+                .chars()
+                .nth(abs.saturating_sub(1))
+                .map(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                .unwrap_or(false);
+        let after_ok = abs + name.len() >= text.len()
+            || !text
+                .chars()
+                .nth(abs + name.len())
+                .map(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 #[cfg(test)]

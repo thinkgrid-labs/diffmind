@@ -52,6 +52,8 @@ async fn main() -> Result<()> {
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer).ok();
         buffer
+    } else if args.last {
+        git::get_last_commit_diff(&args.files)?
     } else {
         git::get_diff(&args.branch, &args.files)?
     };
@@ -220,6 +222,8 @@ async fn run_static(
     let file_count = count_diff_files(diff);
     let branch_label = if args.stdin {
         "(stdin)".to_string()
+    } else if args.last {
+        "HEAD~1..HEAD  (last commit)".to_string()
     } else {
         match git::current_branch() {
             Some(current) if current != args.branch => format!("{} → {}", current, args.branch),
@@ -267,19 +271,57 @@ async fn run_static(
     // ── Build analyzer ────────────────────────────────────────────────────────
     let mut analyzer = ReviewAnalyzer::new(&model_bytes, &tokenizer_bytes)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .with_languages(langs);
+        .with_languages(langs)
+        .with_debug(args.debug);
 
     if let Some(req) = ticket {
         analyzer = analyzer.with_requirements(req);
     }
 
-    // ── Run inference ─────────────────────────────────────────────────────────
-    spinner.set_message("Analyzing diff  (first run may take a minute)...");
-    let all_findings = analyzer
-        .analyze_diff_chunked(diff, &context, args.max_tokens)
+    // ── Run inference with live elapsed timer + per-chunk progress ────────────
+    spinner.set_message("Analyzing diff...");
+
+    // Background thread ticks elapsed seconds so the spinner stays alive even
+    // during long single-chunk inference (model blocks the main thread).
+    let timer_pb = spinner.clone();
+    let timer_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timer_done_clone = timer_done.clone();
+    let chunk_label = std::sync::Arc::new(std::sync::Mutex::new(String::from("chunk 1/1")));
+    let chunk_label_clone = chunk_label.clone();
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while !timer_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let secs = start.elapsed().as_secs();
+            let elapsed = if secs < 60 {
+                format!("{}s", secs)
+            } else {
+                format!("{}m {}s", secs / 60, secs % 60)
+            };
+            let label = chunk_label_clone.lock().unwrap().clone();
+            timer_pb.set_message(format!("Analyzing {}  ({} elapsed)", label, elapsed));
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    let pb = spinner.clone();
+    let (all_findings, skipped) = analyzer
+        .analyze_diff_chunked_with_progress(diff, &context, args.max_tokens, move |done, total| {
+            *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
+            pb.set_message(format!("Analyzing chunk {}/{}...", done, total));
+        })
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+    timer_done.store(true, std::sync::atomic::Ordering::Relaxed);
     spinner.finish_and_clear();
+
+    // ── Warn about chunks the model failed to parse ───────────────────────────
+    if skipped > 0 {
+        eprintln!(
+            "  !  {} chunk{} returned unparseable output (model may need more tokens or a larger variant).",
+            skipped,
+            if skipped == 1 { "" } else { "s" }
+        );
+    }
 
     // ── Filter to threshold ───────────────────────────────────────────────────
     let findings: Vec<&ReviewFinding> = all_findings
@@ -288,7 +330,11 @@ async fn run_static(
         .collect();
 
     if findings.is_empty() {
-        eprintln!("  ✓  No issues found.");
+        if skipped > 0 {
+            eprintln!("  ?  No parseable findings — try `--model 3b` for better output quality.");
+        } else {
+            eprintln!("  ✓  No issues found.");
+        }
         eprintln!();
         return Ok(false);
     }
@@ -301,22 +347,135 @@ async fn run_static(
             println!("{}", json);
         }
         cli::OutputFormat::Text => {
-            for f in &findings {
-                println!(
-                    "\n[{:?}] {}:{}\nIssue: {}\nFix: {}\n",
-                    f.severity, f.file, f.line, f.issue, f.suggested_fix
-                );
+            println!();
+            for (i, f) in findings.iter().enumerate() {
+                print_finding(f, i + 1, findings.len());
             }
-            eprintln!(
-                "  ⚠  {} finding{}  (exit 1)",
-                findings.len(),
-                if findings.len() == 1 { "" } else { "s" }
-            );
-            eprintln!();
+            print_summary(findings.len(), skipped);
         }
     }
 
     Ok(true)
+}
+
+// ─── Coloured finding renderer ────────────────────────────────────────────────
+
+use core_engine::Category;
+use crossterm::style::Stylize;
+
+fn severity_color(f: &ReviewFinding) -> String {
+    match f.severity {
+        Severity::High => format!("{}", " HIGH ".on_red().white().bold()),
+        Severity::Medium => format!("{}", " MED  ".on_dark_yellow().white().bold()),
+        Severity::Low => format!("{}", " LOW  ".on_dark_cyan().white().bold()),
+    }
+}
+
+fn category_icon(f: &ReviewFinding) -> &'static str {
+    match f.category {
+        Category::Security => "🔒",
+        Category::Quality => "🐛",
+        Category::Performance => "⚡",
+        Category::Maintainability => "📐",
+        Category::Compliance => "📋",
+    }
+}
+
+fn wrap_text(text: &str, indent: usize, width: usize) -> String {
+    let pad = " ".repeat(indent);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(format!("{}{}", pad, current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(format!("{}{}", pad, current));
+    }
+    lines.join("\n")
+}
+
+fn print_finding(f: &ReviewFinding, idx: usize, total: usize) {
+    let sev = severity_color(f);
+    let icon = category_icon(f);
+    let cat = format!("{:?}", f.category).to_lowercase();
+    let loc = format!("{}:{}", f.file, f.line).dark_grey();
+    let counter = format!("[{}/{}]", idx, total).dark_grey();
+
+    // ── Header row ──
+    println!(
+        "  {}  {}  {}  {} {}",
+        sev,
+        icon,
+        cat.dark_grey(),
+        loc,
+        counter
+    );
+
+    // ── Separator ──
+    println!("  {}", "─".repeat(62).dark_grey());
+
+    // ── Issue ──
+    println!(
+        "  {}  {}",
+        "Issue".red().bold(),
+        wrap_text(&f.issue, 10, 68).trim_start()
+    );
+    if f.issue.len() > 58 {
+        println!(
+            "{}",
+            wrap_text(&f.issue, 10, 68)
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ── Fix ──
+    println!(
+        "  {}    {}",
+        "Fix".green().bold(),
+        wrap_text(&f.suggested_fix, 10, 68).trim_start()
+    );
+    if f.suggested_fix.len() > 58 {
+        println!(
+            "{}",
+            wrap_text(&f.suggested_fix, 10, 68)
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    println!();
+}
+
+fn print_summary(count: usize, skipped: usize) {
+    if skipped > 0 {
+        eprintln!(
+            "  {}  {} chunk{} had unparseable output — try --model 3b",
+            "!".yellow(),
+            skipped,
+            if skipped == 1 { "" } else { "s" }
+        );
+    }
+    eprintln!(
+        "  {}  {} finding{}  {}",
+        "⚠".yellow().bold(),
+        count,
+        if count == 1 { "" } else { "s" },
+        "(exit 1)".dark_grey()
+    );
+    eprintln!();
 }
 
 // ─── TUI runner ───────────────────────────────────────────────────────────────
