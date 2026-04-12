@@ -1,5 +1,5 @@
+use anyhow::{Context, Result};
 use std::process::Command;
-use anyhow::{Result, Context};
 
 pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     let branch_arg = format!("{}...HEAD", branch);
@@ -7,7 +7,7 @@ pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     for path in paths {
         args.push(path);
     }
-    
+
     args.extend_from_slice(&[
         ":!node_modules",
         ":!*-lock.json",
@@ -34,12 +34,14 @@ pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     }
 
     let diff = String::from_utf8_lossy(&output.stdout).to_string();
-    
+
     let size_kb = diff.len() / 1024;
     if size_kb > 1500 {
-        return Err(anyhow::anyhow!("Diff too large to process ({}KB). Try reviewing specific files.", size_kb));
+        return Err(anyhow::anyhow!(
+            "Diff too large to process ({}KB). Try reviewing specific files.",
+            size_kb
+        ));
     }
 
     Ok(diff)
 }
-

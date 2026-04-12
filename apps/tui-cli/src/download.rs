@@ -101,8 +101,8 @@ pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
 fn prompt_model_selection() -> Result<&'static ModelInfo> {
     println!("\nAvailable models — Qwen2.5-Coder (coding-optimised, Q4_K_M):\n");
     println!(
-        "  {:<4}  {:<26}  {:>7}  {:>8}  {}",
-        "#", "Model", "Size", "Min RAM", "Description"
+        "  {:<4}  {:<26}  {:>7}  {:>8}  Description",
+        "#", "Model", "Size", "Min RAM"
     );
     println!("  {}", "─".repeat(82));
 
@@ -327,7 +327,10 @@ pub fn ensure_model_files(model_id: Option<&str>, model_dir: &Path, force: bool)
 
     // Model weights
     if !model_path.exists() {
-        println!("Downloading {} ({:.1} GB)...", model.gguf_filename, model.size_gb);
+        println!(
+            "Downloading {} ({:.1} GB)...",
+            model.gguf_filename, model.size_gb
+        );
         download_file(model.gguf_url, &model_path)?;
         println!("\nModel ready: {}", model_path.display());
     } else if !force {

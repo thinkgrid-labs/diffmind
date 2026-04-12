@@ -1,6 +1,11 @@
 use anyhow::Result;
 use core_engine::{ReviewAnalyzer, ReviewFinding, Severity};
-use std::{collections::HashSet, io, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 mod cli;
@@ -58,7 +63,8 @@ async fn main() -> Result<()> {
     let ticket = resolve_ticket(args.ticket.as_deref());
     if let Some(ref t) = ticket {
         let preview: String = t.chars().take(80).collect();
-        eprintln!("Ticket: {}{}",
+        eprintln!(
+            "Ticket: {}{}",
             preview,
             if t.len() > 80 { "..." } else { "" }
         );
@@ -69,7 +75,8 @@ async fn main() -> Result<()> {
         run_tui(diff, model_dir, project_root, args.model.clone(), ticket).await?;
     } else {
         let min_sev = parse_severity(&args.min_severity);
-        let has_findings = run_static(&diff, &model_dir, &project_root, &args, min_sev, ticket).await?;
+        let has_findings =
+            run_static(&diff, &model_dir, &project_root, &args, min_sev, ticket).await?;
 
         // Non-zero exit if any findings at or above --min-severity (CI gate).
         if has_findings {
@@ -174,8 +181,8 @@ fn detect_languages(diff: &str) -> Vec<String> {
 /// which causes `main` to exit with code 1 (CI gate).
 async fn run_static(
     diff: &str,
-    model_dir: &PathBuf,
-    project_root: &PathBuf,
+    model_dir: &Path,
+    project_root: &Path,
     args: &cli::Cli,
     min_severity: Severity,
     ticket: Option<String>,
@@ -317,10 +324,7 @@ async fn run_tui(
     res
 }
 
-async fn tui_loop<B: Backend>(
-    terminal: &mut Terminal<B>,
-    app: Arc<Mutex<App>>,
-) -> Result<()> {
+async fn tui_loop<B: Backend>(terminal: &mut Terminal<B>, app: Arc<Mutex<App>>) -> Result<()> {
     loop {
         {
             let mut app_lock = app.lock().await;
@@ -344,7 +348,11 @@ async fn tui_loop<B: Backend>(
                     KeyCode::Up | KeyCode::Char('k') => {
                         let i = match app_lock.state.selected() {
                             Some(i) if !app_lock.findings.is_empty() => {
-                                if i == 0 { app_lock.findings.len() - 1 } else { i - 1 }
+                                if i == 0 {
+                                    app_lock.findings.len() - 1
+                                } else {
+                                    i - 1
+                                }
                             }
                             _ => 0,
                         };
@@ -384,10 +392,7 @@ async fn background_analysis(app: Arc<Mutex<App>>) -> Result<()> {
         )
     };
 
-    let model_path = model_dir.join(format!(
-        "qwen2.5-coder-{}-instruct-q4_k_m.gguf",
-        model_id
-    ));
+    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
     let tokenizer_path = model_dir.join("tokenizer.json");
 
     let model_bytes = std::fs::read(model_path)?;
@@ -417,7 +422,11 @@ async fn background_analysis(app: Arc<Mutex<App>>) -> Result<()> {
     let mut app_lock = app.lock().await;
     let count = findings.len();
     app_lock.findings = findings;
-    app_lock.status = format!("Done — {} finding{}", count, if count == 1 { "" } else { "s" });
+    app_lock.status = format!(
+        "Done — {} finding{}",
+        count,
+        if count == 1 { "" } else { "s" }
+    );
     app_lock.analyzing = false;
     if count > 0 {
         app_lock.state.select(Some(0));
@@ -469,8 +478,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                         Severity::Low => "[Low]",
                     },
                 };
-                ListItem::new(format!("{} {}", tag, f.file))
-                    .style(Style::default().fg(color))
+                ListItem::new(format!("{} {}", tag, f.file)).style(Style::default().fg(color))
             })
             .collect();
 

@@ -1,9 +1,9 @@
+use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use regex::Regex;
-use chrono::Utc;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,9 +54,12 @@ impl Indexer {
         }
     }
 
-    pub fn build_index(&mut self, existing: Option<SymbolIndex>) -> Result<SymbolIndex, anyhow::Error> {
+    pub fn build_index(
+        &mut self,
+        existing: Option<SymbolIndex>,
+    ) -> Result<SymbolIndex, anyhow::Error> {
         let mut file_mtimes = HashMap::new();
-        
+
         if let Some(ref idx) = existing {
             self.symbols = idx.symbols.clone();
         }
@@ -76,12 +79,23 @@ impl Indexer {
             .filter_map(|e| e.ok())
         {
             if entry.file_type().is_file() {
-                let ext = entry.path().extension().and_then(|s| s.to_str()).unwrap_or("");
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
                 if EXTENSIONS.contains(ext) {
-                    let relative_path = entry.path().strip_prefix(&self.project_root)?.to_string_lossy().to_string();
+                    let relative_path = entry
+                        .path()
+                        .strip_prefix(&self.project_root)?
+                        .to_string_lossy()
+                        .to_string();
                     let metadata = entry.metadata()?;
-                    let mtime = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs_f64();
-                    
+                    let mtime = metadata
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs_f64();
+
                     file_mtimes.insert(relative_path.clone(), mtime);
 
                     if Some(&mtime) != old_mtimes.get(&relative_path) {
@@ -92,7 +106,8 @@ impl Indexer {
         }
 
         // Clean up deleted files
-        self.symbols.retain(|_, v| file_mtimes.contains_key(&v.file));
+        self.symbols
+            .retain(|_, v| file_mtimes.contains_key(&v.file));
 
         Ok(SymbolIndex {
             version: "1.1.0".to_string(),
@@ -103,32 +118,63 @@ impl Indexer {
         })
     }
 
-    fn parse_file(&mut self, absolute_path: &Path, relative_path: &str) -> Result<(), anyhow::Error> {
+    fn parse_file(
+        &mut self,
+        absolute_path: &Path,
+        relative_path: &str,
+    ) -> Result<(), anyhow::Error> {
         let content = fs::read_to_string(absolute_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
         let patterns = vec![
-            ("function", Regex::new(r"export\s+(?:async\s+)?function\s+([a-zA-Z0-9_$]+)")?),
+            (
+                "function",
+                Regex::new(r"export\s+(?:async\s+)?function\s+([a-zA-Z0-9_$]+)")?,
+            ),
             ("class", Regex::new(r"export\s+class\s+([a-zA-Z0-9_$]+)")?),
-            ("interface", Regex::new(r"export\s+interface\s+([a-zA-Z0-9_$]+)")?),
+            (
+                "interface",
+                Regex::new(r"export\s+interface\s+([a-zA-Z0-9_$]+)")?,
+            ),
             ("type", Regex::new(r"export\s+type\s+([a-zA-Z0-9_$]+)")?),
-            ("const", Regex::new(r"export\s+(?:const|let|var)\s+([a-zA-Z0-9_$]+)")?),
+            (
+                "const",
+                Regex::new(r"export\s+(?:const|let|var)\s+([a-zA-Z0-9_$]+)")?,
+            ),
             // Go
-            ("function", Regex::new(r"(?m)^func\s+([A-Z][a-zA-Z0-9_$]*)")?),
-            ("interface", Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_$]*)\s+interface")?),
-            ("class", Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_$]*)\s+struct")?),
+            (
+                "function",
+                Regex::new(r"(?m)^func\s+([A-Z][a-zA-Z0-9_$]*)")?,
+            ),
+            (
+                "interface",
+                Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_$]*)\s+interface")?,
+            ),
+            (
+                "class",
+                Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_$]*)\s+struct")?,
+            ),
             // Python
             ("function", Regex::new(r"(?m)^def\s+([a-zA-Z0-9_$]+)\(")?),
             ("class", Regex::new(r"(?m)^class\s+([a-zA-Z0-9_$]+)[(:]")?),
             // Rust
             ("function", Regex::new(r"pub\s+fn\s+([a-z0-9_]+)")?),
             ("class", Regex::new(r"pub\s+struct\s+([A-Z][a-zA-Z0-9]*)")?),
-            ("interface", Regex::new(r"pub\s+trait\s+([A-Z][a-zA-Z0-9]*)")?),
+            (
+                "interface",
+                Regex::new(r"pub\s+trait\s+([A-Z][a-zA-Z0-9]*)")?,
+            ),
         ];
 
         for (i, line) in lines.iter().enumerate() {
             // Optimization: skip lines that don't look like definitions
-            if !line.contains("export") && !line.contains("pub ") && !line.starts_with("def ") && !line.starts_with("class ") && !line.starts_with("func ") && !line.starts_with("type ") {
+            if !line.contains("export")
+                && !line.contains("pub ")
+                && !line.starts_with("def ")
+                && !line.starts_with("class ")
+                && !line.starts_with("func ")
+                && !line.starts_with("type ")
+            {
                 continue;
             }
 
@@ -140,13 +186,16 @@ impl Indexer {
                     }
 
                     let snippet = self.extract_smart_snippet(&lines, i);
-                    self.symbols.insert(name.to_string(), SymbolDefinition {
-                        name: name.to_string(),
-                        file: relative_path.to_string(),
-                        line: i + 1,
-                        r#type: r#type.to_string(),
-                        snippet,
-                    });
+                    self.symbols.insert(
+                        name.to_string(),
+                        SymbolDefinition {
+                            name: name.to_string(),
+                            file: relative_path.to_string(),
+                            line: i + 1,
+                            r#type: r#type.to_string(),
+                            snippet,
+                        },
+                    );
                 }
             }
         }
@@ -163,9 +212,13 @@ impl Indexer {
         for (i, line) in lines.iter().enumerate().skip(start_line).take(max_lines) {
             let (delta, has_open_brace) = count_braces_in_line(line);
             brace_count += delta;
-            if has_open_brace { found_start_brace = true; }
+            if has_open_brace {
+                found_start_brace = true;
+            }
             end_line = i;
-            if found_start_brace && brace_count <= 0 { break; }
+            if found_start_brace && brace_count <= 0 {
+                break;
+            }
         }
 
         lines[start_line..=end_line].join("\n")
@@ -186,7 +239,8 @@ impl Indexer {
         if !index_path.exists() {
             return None;
         }
-        fs::read_to_string(index_path).ok()
+        fs::read_to_string(index_path)
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     }
 }

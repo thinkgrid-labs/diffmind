@@ -11,7 +11,7 @@ pub fn get_rag_context(diff: &str, index: &SymbolIndex) -> Option<String> {
 
     let mut symbols_list: Vec<String> = found_symbols.into_iter().collect();
     symbols_list.truncate(10);
-    
+
     let context = build_context_string(&symbols_list, index);
     if context.is_empty() {
         None
