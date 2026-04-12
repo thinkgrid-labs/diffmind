@@ -208,8 +208,17 @@ impl ReviewAnalyzer {
                 .forward(&input, tokens_ids.len() - context_size)
                 .map_err(|e| EngineError::ForwardError(e.to_string()))?;
             let logits = logits.squeeze(0).map_err(EngineError::TensorError)?;
+            let n_rows = logits.dim(0)?;
+            if n_rows == 0 {
+                // The model returned empty logits for this step. This can
+                // happen with GQA models (e.g. 3B) when candle's RoPE
+                // computation produces a zero-length intermediate for certain
+                // sequence positions. Skip this token rather than underflowing
+                // to usize::MAX and panicking inside candle ops.
+                break;
+            }
             let logits = logits
-                .get(logits.dim(0)? - 1)
+                .get(n_rows - 1)
                 .map_err(EngineError::TensorError)?;
 
             let next_token = logits_processor

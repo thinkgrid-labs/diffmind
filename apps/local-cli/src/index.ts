@@ -144,7 +144,7 @@ const opts: {
 program
   .name("diffmind")
   .description("Local-first AI code review for your git diffs")
-  .version("0.4.6")
+  .version("0.4.7")
   .argument("[files...]", "Specific files or directories to review (optional)")
   .option("-b, --branch <name>", "Target branch to diff against", "main")
   .option("-f, --format <type>", 'Output format: "markdown" or "json"', "markdown")
