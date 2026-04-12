@@ -41,6 +41,6 @@ export function formatJson(report: ReviewReport): string {
 }
 
 export function printBanner(): void {
-  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.4.8 — local-first AI code review"));
+  console.log(chalk.cyan.bold("\n  diffmind") + chalk.dim(" v0.4.9 — local-first AI code review"));
   console.log(chalk.dim("  Inference: Dual-Engine (Native + Wasm)\n"));
 }
