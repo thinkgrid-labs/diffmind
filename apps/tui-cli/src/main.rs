@@ -1,10 +1,12 @@
 use anyhow::Result;
 use core_engine::{ReviewAnalyzer, ReviewFinding, Severity};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     collections::HashSet,
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
 
@@ -61,14 +63,6 @@ async fn main() -> Result<()> {
 
     // 3. Resolve ticket / user story content (file path or inline text)
     let ticket = resolve_ticket(args.ticket.as_deref());
-    if let Some(ref t) = ticket {
-        let preview: String = t.chars().take(80).collect();
-        eprintln!(
-            "Ticket: {}{}",
-            preview,
-            if t.len() > 80 { "..." } else { "" }
-        );
-    }
 
     // 4. Launch UI (TUI or static)
     if args.tui {
@@ -177,6 +171,23 @@ fn detect_languages(diff: &str) -> Vec<String> {
 
 // ─── Static (non-TUI) runner ─────────────────────────────────────────────────
 
+fn count_diff_files(diff: &str) -> usize {
+    diff.lines().filter(|l| l.starts_with("diff --git")).count()
+}
+
+fn make_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+            .template("  {spinner:.cyan}  {msg}")
+            .unwrap(),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
 /// Returns `true` if any findings at or above `min_severity` were found,
 /// which causes `main` to exit with code 1 (CI gate).
 async fn run_static(
@@ -196,10 +207,52 @@ async fn run_static(
         ));
     }
 
+    // ── Header ────────────────────────────────────────────────────────────────
+    let langs = detect_languages(diff);
+    let model_label = download::find_model(&args.model)
+        .map(|m| format!("{} · Q4_K_M · {:.1} GB", m.name, m.size_gb))
+        .unwrap_or_else(|| format!("Qwen2.5-Coder-{} · Q4_K_M", args.model));
+    let stack_label = if langs.is_empty() {
+        "unknown".to_string()
+    } else {
+        langs.join(", ")
+    };
+    let file_count = count_diff_files(diff);
+    let branch_label = if args.stdin {
+        "(stdin)".to_string()
+    } else {
+        args.branch.clone()
+    };
+
+    eprintln!();
+    eprintln!("  diffmind  code review");
+    eprintln!("  {}", "─".repeat(52));
+    eprintln!("  {:<10} {}", "Model", model_label);
+    eprintln!("  {:<10} {}", "Branch", branch_label);
+    eprintln!(
+        "  {:<10} {} file{}",
+        "Changed",
+        file_count,
+        if file_count == 1 { "" } else { "s" }
+    );
+    eprintln!("  {:<10} {}", "Stack", stack_label);
+    if let Some(ref t) = ticket {
+        let preview: String = t.chars().take(60).collect();
+        eprintln!(
+            "  {:<10} {}{}",
+            "Ticket",
+            preview,
+            if t.len() > 60 { "..." } else { "" }
+        );
+    }
+    eprintln!();
+
+    // ── Load model weights ────────────────────────────────────────────────────
+    let spinner = make_spinner("Loading model into memory...");
     let model_bytes = std::fs::read(&model_path)?;
     let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
 
-    // RAG context
+    // ── RAG context ───────────────────────────────────────────────────────────
     let index = Indexer::load(project_root);
     let mut context = String::new();
     if let Some(idx) = index {
@@ -208,12 +261,7 @@ async fn run_static(
         }
     }
 
-    // Detect languages from diff and build language-aware analyzer
-    let langs = detect_languages(diff);
-    if !langs.is_empty() {
-        eprintln!("Detected: {}", langs.join(", "));
-    }
-
+    // ── Build analyzer ────────────────────────────────────────────────────────
     let mut analyzer = ReviewAnalyzer::new(&model_bytes, &tokenizer_bytes)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .with_languages(langs);
@@ -222,19 +270,23 @@ async fn run_static(
         analyzer = analyzer.with_requirements(req);
     }
 
-    eprintln!("Analyzing diff...");
+    // ── Run inference ─────────────────────────────────────────────────────────
+    spinner.set_message("Analyzing diff  (first run may take a minute)...");
     let all_findings = analyzer
         .analyze_diff_chunked(diff, &context, args.max_tokens)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    // Filter to findings that meet the threshold
+    spinner.finish_and_clear();
+
+    // ── Filter to threshold ───────────────────────────────────────────────────
     let findings: Vec<&ReviewFinding> = all_findings
         .iter()
         .filter(|f| meets_threshold(&f.severity, &min_severity))
         .collect();
 
     if findings.is_empty() {
-        println!("No issues found.");
+        eprintln!("  ✓  No issues found.");
+        eprintln!();
         return Ok(false);
     }
 
@@ -252,6 +304,12 @@ async fn run_static(
                     f.severity, f.file, f.line, f.issue, f.suggested_fix
                 );
             }
+            eprintln!(
+                "  ⚠  {} finding{}  (exit 1)",
+                findings.len(),
+                if findings.len() == 1 { "" } else { "s" }
+            );
+            eprintln!();
         }
     }
 
@@ -272,7 +330,6 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::time::Duration;
 
 struct App {
     findings: Vec<ReviewFinding>,
