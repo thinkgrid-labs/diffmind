@@ -78,29 +78,35 @@ diffmind --tui
 
 ## Model Setup
 
-Diffmind downloads GGUF model weights to `~/.diffmind/models/` on first use.
+Diffmind downloads GGUF model weights to `~/.diffmind/models/`. All models are **Qwen2.5-Coder** — coding-optimised only, no generic chat models.
 
 ```bash
-# Download default model (Qwen2.5-Coder 1.5B, ~1.1 GB)
+# Interactive picker — shows all models with sizes and hardware requirements
 diffmind download
 
-# Download the larger 3B model (~2.1 GB, deeper reasoning)
-diffmind download --model 3b
+# Skip the picker and download a specific model directly
+diffmind download --model 7b
 
 # Force re-download (e.g. after corruption)
-diffmind download --force
+diffmind download --model 1.5b --force
 ```
 
-| Model              | Flag                       | Size    | Best for                     |
-| ------------------ | -------------------------- | ------- | ---------------------------- |
-| Qwen2.5-Coder 1.5B | `--model 1.5b` _(default)_ | ~1.1 GB | Everyday reviews, CI         |
-| Qwen2.5-Coder 3B   | `--model 3b`               | ~2.1 GB | Deep security, complex logic |
+When no `--model` is given, diffmind shows an interactive list and checks your RAM and free disk space against each model's requirements before downloading.
 
-**Hardware requirements:**
+```
+  #    Model                       Size    Min RAM   Description
+  ────────────────────────────────────────────────────────────────────────────────
+  [1]   Qwen2.5-Coder-0.5B         0.4 GB    2 GB   Fastest — lint-style checks, CI / low-end hardware
+  [2] * Qwen2.5-Coder-1.5B         1.1 GB    4 GB   Recommended — balanced quality and speed
+  [3]   Qwen2.5-Coder-3B           2.1 GB    6 GB   Better — deeper reasoning, complex codebases
+  [4]   Qwen2.5-Coder-7B           4.7 GB    8 GB   High quality — strong security & logic analysis
+  [5]   Qwen2.5-Coder-14B          9.0 GB   16 GB   Expert — deep code understanding, workstation
+  [6]   Qwen2.5-Coder-32B         20.0 GB   32 GB   Maximum — near human-level review, server-grade
 
-- RAM: 4 GB minimum, 8 GB recommended (3B model)
-- Disk: 2.5 GB free for both models
-- CPU: x86_64 or ARM64; no GPU required
+  * recommended default
+```
+
+All models use **Q4_K_M quantisation**. CPU only — no GPU required. Inference via [candle](https://github.com/huggingface/candle).
 
 ---
 

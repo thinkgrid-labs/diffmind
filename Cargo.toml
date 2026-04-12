@@ -25,6 +25,7 @@ indicatif = "0.17"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 lazy_static = "1"
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 
 
 # Release profile: Optimize for maximum execution speed.
@@ -32,9 +33,6 @@ lazy_static = "1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-# "abort" is incompatible with NAPI .node binaries: it disables napi-rs's
-# internal catch_unwind, so any panic (including bugs in candle) kills the
-# entire Node.js process instead of returning a JavaScript error.
 panic = "abort"
 strip = true
 

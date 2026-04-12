@@ -62,11 +62,12 @@ pub struct Cli {
 pub enum Commands {
     /// Download or refresh the local AI model files
     Download {
-        /// Model size to download (1.5b, 3b)
-        #[arg(short, long, default_value = "1.5b")]
-        model: String,
+        /// Model to download: 0.5b, 1.5b, 3b, 7b, 14b, 32b.
+        /// Omit to see an interactive list with hardware requirements.
+        #[arg(short, long)]
+        model: Option<String>,
 
-        /// Force a fresh download of the model and tokenizer
+        /// Force a fresh download even if the model already exists
         #[arg(short, long)]
         force: bool,
     },

@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     if let Some(command) = args.command {
         match command {
             cli::Commands::Download { model, force } => {
-                download::ensure_model_files(&model, &model_dir, force)?;
+                download::ensure_model_files(model.as_deref(), &model_dir, force)?;
                 return Ok(());
             }
             cli::Commands::Index => {
