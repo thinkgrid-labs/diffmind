@@ -39,6 +39,9 @@ pub enum Category {
     Quality,
     Performance,
     Maintainability,
+    /// The diff does not satisfy a requirement from the provided user story
+    /// or acceptance criteria.
+    Compliance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +62,12 @@ pub struct ReviewAnalyzer {
     device: Device,
     model: Qwen2,
     tokenizer: tokenizers::Tokenizer,
+    /// Comma-separated language names detected from the diff (e.g. "Rust, TypeScript").
+    /// Injected into the system prompt so the model uses the right idioms.
+    languages: Option<String>,
+    /// User story / acceptance criteria from the feature ticket.
+    /// When set the model also checks whether the diff satisfies the requirements.
+    requirements: Option<String>,
 }
 
 /// Hard upper bound on total tokens (prompt + generated) fed to the model.
@@ -84,7 +93,34 @@ impl ReviewAnalyzer {
             device,
             model,
             tokenizer,
+            languages: None,
+            requirements: None,
         })
+    }
+
+    /// Set the detected languages for this session. The names are injected into
+    /// the system prompt so the model applies language-appropriate review idioms.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let analyzer = ReviewAnalyzer::new(&model, &tok)?
+    ///     .with_languages(vec!["Rust".into(), "TypeScript".into()]);
+    /// ```
+    pub fn with_languages(mut self, langs: Vec<String>) -> Self {
+        if !langs.is_empty() {
+            self.languages = Some(langs.join(", "));
+        }
+        self
+    }
+
+    /// Provide the user story / acceptance criteria from the feature ticket.
+    /// The model will flag any requirements that are missing or incorrectly
+    /// implemented in the diff as `category: "compliance"` findings.
+    pub fn with_requirements(mut self, requirements: String) -> Self {
+        if !requirements.trim().is_empty() {
+            self.requirements = Some(requirements);
+        }
+        self
     }
 
     pub fn analyze_diff_chunked(
@@ -159,9 +195,42 @@ impl ReviewAnalyzer {
             format!("\n\n### Business Context / Requirements:\n{}\n", context)
         };
 
+        let stack = self
+            .languages
+            .as_deref()
+            .unwrap_or("TypeScript, JavaScript, Rust, Go, Python");
+
+        // Requirements section — only present when a ticket was provided
+        let requirements_section = match &self.requirements {
+            Some(req) => {
+                const MAX_REQ_BYTES: usize = 2000;
+                let truncated = truncate_to_char_boundary(req, MAX_REQ_BYTES);
+                format!("\n\n### User Story / Acceptance Criteria:\n{}\n", truncated)
+            }
+            None => String::new(),
+        };
+
+        // Compliance focus line — only added when requirements are present
+        let compliance_focus = if self.requirements.is_some() {
+            "\n5. **Compliance**: Does the diff satisfy every acceptance criterion? Flag missing or incomplete requirements as category \"compliance\"."
+        } else {
+            ""
+        };
+
+        // Extend the category list in the JSON schema hint when compliance is active
+        let category_hint = if self.requirements.is_some() {
+            "\"security\"|\"quality\"|\"performance\"|\"maintainability\"|\"compliance\""
+        } else {
+            "\"security\"|\"quality\"|\"performance\"|\"maintainability\""
+        };
+
         format!(
-            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for TypeScript, NestJS, and React Native code.{} \n\nFocus on:\n1. **Security**: Vulnerabilities, secrets, insecure handling.\n2. **Quality**: Bugs, anti-patterns, logical errors.\n3. **Performance**: Bottlenecks, inefficient code.\n4. **Maintainability**: Readability, naming, complexity.\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": \"security\"|\"quality\"|\"performance\"|\"maintainability\", \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf no issues, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for {} code.{}{} \n\nFocus on:\n1. **Security**: Vulnerabilities, secrets, insecure handling.\n2. **Quality**: Bugs, anti-patterns, logical errors.\n3. **Performance**: Bottlenecks, inefficient code.\n4. **Maintainability**: Readability, naming, complexity.{}\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": {}, \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf no issues, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            stack,
+            requirements_section,
             context_section,
+            compliance_focus,
+            category_hint,
             diff
         )
     }
@@ -207,19 +276,32 @@ impl ReviewAnalyzer {
                 .model
                 .forward(&input, tokens_ids.len() - context_size)
                 .map_err(|e| EngineError::ForwardError(e.to_string()))?;
-            let logits = logits.squeeze(0).map_err(EngineError::TensorError)?;
-            let n_rows = logits.dim(0)?;
-            if n_rows == 0 {
-                // The model returned empty logits for this step. This can
-                // happen with GQA models (e.g. 3B) when candle's RoPE
-                // computation produces a zero-length intermediate for certain
-                // sequence positions. Skip this token rather than underflowing
-                // to usize::MAX and panicking inside candle ops.
+
+            // Defensive check for GQA/RoPE artifacts appearing as empty tensors
+            if logits.elem_count() == 0 {
                 break;
             }
-            let logits = logits
-                .get(n_rows - 1)
-                .map_err(EngineError::TensorError)?;
+
+            let logits = logits.squeeze(0).map_err(EngineError::TensorError)?;
+
+            // The model might return [batch, vocab] (2D) or [batch, seq, vocab] (3D).
+            // After squeeze(0), we expect either [vocab] (1D) or [seq, vocab] (2D).
+            let logits = match logits.dims().len() {
+                1 => logits,
+                2 => {
+                    let n_rows = logits.dim(0)?;
+                    if n_rows == 0 {
+                        break;
+                    }
+                    logits.get(n_rows - 1).map_err(EngineError::TensorError)?
+                }
+                _ => {
+                    return Err(EngineError::ForwardError(format!(
+                        "unexpected logits shape: {:?}",
+                        logits.dims()
+                    )))
+                }
+            };
 
             let next_token = logits_processor
                 .sample(&logits)

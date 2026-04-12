@@ -1,210 +1,301 @@
-**Diffmind** is a high-performance, local-first AI security and code review agent designed specifically for modern engineering teams. It features a state-of-the-art **Dual-Engine Architecture** (Native + Wasm), providing expert-level code reviews with **zero latency**, **total data privacy**, and support for large 3B+ parameter models.
+# diffmind
+
+**Local-first AI code review agent — on-device inference, no cloud required.**
+
+Diffmind runs a quantized [Qwen2.5-Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF) model directly on your machine. Your code never leaves your environment. No API keys. No subscriptions. No network round-trips.
+
+Ships as a **single self-contained Rust binary** with an optional interactive [ratatui](https://ratatui.rs) TUI.
 
 ---
 
-## ⚡ Why Diffmind?
+## Why diffmind?
 
-Standard AI review tools often require sending your proprietary source code to third-party APIs. **Diffmind changed the game.**
-
-- 🔒 **Absolute Privacy**: Your code never leaves your machine. Analysis happens locally via our hybrid inference engine.
-- 🚀 **Zero Latency**: No network round-trips. Get instant feedback on your git diffs as you work.
-- 🛠️ **Expert-Level Insight**: Powered by **Qwen2.5-Coder (1.5B/3B)**, an LLM specifically optimized for deep reasoning in TypeScript, NestJS, and React Native environments.
-- 🏎️ **Native Performance**: Leverages N-API bindings to bypass memory limits and deliver lightning-fast reviews.
-
----
-
-## 🔍 Comprehensive Review Coverage
-
-Diffmind acts as a Senior Software Engineer for your feature branches, analyzing four critical dimensions:
-
-- **🛡️ Security**: Detects hardcoded secrets, injection risks, and insecure data flow.
-- **💎 Quality**: Identifies logical bugs, anti-patterns, and API misuse in NestJS and React Native.
-- **⚡ Performance**: Highlights inefficient loops, memory overhead, and hydration bottlenecks.
-- **📖 Maintainability**: Suggests better naming, enforces readability, and flags architectural complexity.
+|             | diffmind                           | Cloud AI review                  |
+| ----------- | ---------------------------------- | -------------------------------- |
+| **Privacy** | Code stays on your machine         | Code sent to third-party servers |
+| **Latency** | No network — instant diff intake   | API round-trips add seconds      |
+| **Cost**    | Free after one-time model download | Per-token billing                |
+| **Offline** | Works with no internet after setup | Requires connectivity            |
+| **CI**      | Single binary, no runtime deps     | Needs API key management         |
 
 ---
 
----
+## Features
 
-## 🏎️ Dual-Engine Architecture: Why it matters
-
-Diffmind v0.4.0 introduces a state-of-the-art **Hybrid Inference Engine**. Most local AI tools force a choice between portability (Wasm) and performance (Native). **Diffmind gives you both.**
-
-### 1. The Native Engine (N-API)
-For power users and large codebases.
-- **Bypasses the 4GB Limit**: Traditional WebAssembly runtimes are restricted to a 4GB memory heap. Diffmind Native Engine (built with Rust & `napi-rs`) handles models of any size (3B, 7B+) directly on your system RAM.
-- **Direct Hardware Access**: Optimized CPU instructions (AVX, SIMD) are accessed natively for up to 3x faster inference than Wasm.
-- **The 3B Powerhouse**: Enables the **Qwen2.5-Coder-3B** model, which offers significantly deeper security reasoning.
-
-### 2. The Wasm Fallback
-For universal portability and zero-setup environments.
-- **No Binaries Required**: Runs entirely within the Node.js V8 engine using WebAssembly.
-- **Universal**: Perfect for 1.5B and 0.5B models where portability is more important than raw speed.
-
-### 3. The Intelligent Router
-You don't have to choose. The Diffmind CLI features a smart router that:
-1. Attempts to load the **Native Engine** for maximum speed.
-2. If the native binary is missing or incompatible, it **silently falls back to Wasm**.
-3. It intelligently warns you if a chosen model (like 3B) requires Native but only Wasm is available.
+- **Security analysis** — hardcoded secrets, injection vectors, insecure data flow
+- **Quality review** — logical bugs, anti-patterns, API misuse
+- **Performance hints** — inefficient loops, memory overhead, unnecessary allocations
+- **Maintainability** — naming, readability, architectural complexity
+- **Local RAG** — indexes your project's symbols so the model understands function and type definitions referenced in the diff
+- **Interactive TUI** — ratatui-powered terminal UI with navigable findings and detail panel (`--tui`)
+- **CI-friendly** — pipe any diff via stdin, filter by severity, exit-code ready
 
 ---
 
-## 🤖 Supported Models
+## Installation
 
-| Model ID | Name | Size | Optimized For | Engine |
-|----------|------|------|---------------|--------|
-| `1.5b` (Default) | Qwen2.5-Coder-1.5B | ~1.1 GB | General reviews, quick feedback | Wasm / Native |
-| `3b` | Qwen2.5-Coder-3B | ~2.1 GB | Deep security logic, complex refactors | **Native Recommended** |
+### Prebuilt binary (recommended)
 
----
+Download the latest binary for your platform from [GitHub Releases](https://github.com/thinkgrid-labs/diffmind/releases):
 
-## 🏗️ Project Structure
+| Platform            | Asset                                       |
+| ------------------- | ------------------------------------------- |
+| Linux x86_64        | `diffmind-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux ARM64         | `diffmind-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS x86_64        | `diffmind-x86_64-apple-darwin.tar.gz`       |
+| macOS Apple Silicon | `diffmind-aarch64-apple-darwin.tar.gz`      |
+| Windows x86_64      | `diffmind-x86_64-pc-windows-msvc.zip`       |
 
-- **`packages/core-engine`**: The unified Rust inference logic (powered by HuggingFace Candle).
-- **`packages/core-native`**: High-performance Node.js native addon (C++ equivalent speed).
-- **`packages/core-wasm`**: Portable WebAssembly bindings for universal execution.
-- **`apps/local-cli`**: Orchestration, git integration, and the **Intelligent Router**.
-
----
-
-## 🚀 Quick Start
-
-No API keys, no cloud sign-ups. Just run it.
-
-### Via npx (Recommended)
-Analyze your current changes against the `main` branch instantly:
 ```bash
-npx @diffmind/cli --branch main
-```
+# Linux / macOS example
+tar -xzf diffmind-x86_64-unknown-linux-gnu.tar.gz
+sudo mv diffmind /usr/local/bin/
 
-### Global Installation
-```bash
-npm install -g @diffmind/cli
-
-# Run anywhere
-diffmind --branch main
+# Verify
+diffmind --version
 ```
 
 ---
 
-## 🛠️ Commands
+## Quick Start
 
-Diffmind provides a few specialized commands to manage your local AI environment.
-
-### 1. `review` (Default)
-Run the AI code review against your git changes.
 ```bash
-diffmind --branch main
-```
-
-### 2. `index`
-Build a symbol index of your local repository. This enables **Local RAG**, allowing the AI to understand the definitions of functions and types referenced in your diff.
-```bash
-diffmind index
-```
-
-### 3. `download`
-Explicitly manage or refresh your local AI model files.
-```bash
-# Check if model exists and download if missing (defaults to 1.5b)
+# 1. Download the model (one-time setup, ~1.1 GB)
 diffmind download
 
-# Download the high-performance 3B model
+# 2. (Optional) Index your project's symbols for context-aware reviews
+#    Run once per project, then re-run when the codebase changes significantly
+diffmind index
+
+# 3. Review your current branch against main
+diffmind
+
+# 4. Or launch the interactive TUI
+diffmind --tui
+```
+
+---
+
+## Model Setup
+
+Diffmind downloads GGUF model weights to `~/.diffmind/models/` on first use.
+
+```bash
+# Download default model (Qwen2.5-Coder 1.5B, ~1.1 GB)
+diffmind download
+
+# Download the larger 3B model (~2.1 GB, deeper reasoning)
 diffmind download --model 3b
 
-# Force a fresh download
+# Force re-download (e.g. after corruption)
 diffmind download --force
 ```
 
+| Model              | Flag                       | Size    | Best for                     |
+| ------------------ | -------------------------- | ------- | ---------------------------- |
+| Qwen2.5-Coder 1.5B | `--model 1.5b` _(default)_ | ~1.1 GB | Everyday reviews, CI         |
+| Qwen2.5-Coder 3B   | `--model 3b`               | ~2.1 GB | Deep security, complex logic |
+
+**Hardware requirements:**
+
+- RAM: 4 GB minimum, 8 GB recommended (3B model)
+- Disk: 2.5 GB free for both models
+- CPU: x86_64 or ARM64; no GPU required
+
 ---
 
-## 📖 Usage Examples
+## Usage
 
-### Analyze against a specific branch
+### Basic review
+
 ```bash
+# Diff current branch against main (default)
+diffmind
+
+# Diff against a different branch
 diffmind --branch develop
+
+# Review specific files or directories only
+diffmind src/auth/ src/payments/
+
+# Use the 3B model for deeper analysis
+diffmind --model 3b
 ```
 
-### CI/CD Integration (JSON output)
+### Interactive TUI
+
+Launch the ratatui terminal UI for navigable, interactive results:
+
 ```bash
-diffmind --format json --min-severity high
+diffmind --tui
+diffmind --tui --branch staging --model 3b
 ```
 
-### Business-Aware Reviews
-Provide requirements or ticket descriptions to verify that the code actually meets the business criteria:
-```bash
-diffmind --branch develop --context ticket.md
-```
+**TUI keybindings:**
 
-### Architectural-Aware Reviews (Local RAG)
-Build an index of your project's symbols to allow the AI to "look up" function and type definitions referenced in your diff:
-```bash
-### Targeted / Granular Reviews
-Focus the AI on specific files or directories to improve speed and relevance:
-```bash
-# Review only the auth folder
-diffmind src/auth/
+| Key       | Action           |
+| --------- | ---------------- |
+| `a`       | Run analysis     |
+| `j` / `↓` | Next finding     |
+| `k` / `↑` | Previous finding |
+| `q`       | Quit             |
 
-# Review specific files
-diffmind src/main.ts src/utils.ts
+### Stdin mode (CI / pipe)
 
-# Review against a specific branch for one folder
-diffmind --branch staging apps/api/
-```
+Pipe any `git diff` output directly:
 
-### Custom Diff (Stdin)
 ```bash
 git diff main...HEAD | diffmind --stdin
+
+# With a specific model
+git diff main...HEAD | diffmind --stdin --model 3b
+
+# Filter to high-severity only
+git diff main...HEAD | diffmind --stdin --min-severity high
+```
+
+### Ticket-aware review (`--ticket`)
+
+Provide the user story or acceptance criteria from your Jira / Linear / GitHub ticket and diffmind will check whether the diff actually implements what was asked — in addition to its standard security and quality review.
+
+```bash
+# Pass a ticket file
+diffmind --ticket ticket.md
+
+# Or paste inline text directly
+diffmind --ticket "As a user I want password reset emails so that I can recover my account.
+Acceptance criteria:
+- Reset link expires after 1 hour
+- Link is single-use
+- User receives confirmation email after reset"
+
+# Works with all other flags
+diffmind --branch feature/auth --ticket ticket.md --model 3b --format json
+```
+
+Missing or incorrectly implemented requirements appear as **`[Req]`** findings with category `compliance` — distinct from the standard security/quality findings.
+
+### Symbol indexing (Local RAG)
+
+Build a local symbol index so the model understands the definitions of functions and types referenced in your diff. Run once per project, then keep it updated:
+
+```bash
+# Build or refresh the index
+diffmind index
+
+# Index is stored at .diffmind/symbols.json in your project root
+```
+
+The indexer supports: TypeScript, JavaScript, Go, Python, Rust.
+
+---
+
+## All Options
+
+```
+Usage: diffmind [OPTIONS] [FILES]... [COMMAND]
+
+Commands:
+  download  Download or refresh the local AI model files
+  index     Build a symbol index of the local repository for context-aware reviews
+  help      Print help for a subcommand
+
+Arguments:
+  [FILES]...  Specific files or directories to review (optional)
+
+Options:
+  -b, --branch <BRANCH>              Base branch to diff against [default: main]
+  -m, --model <MODEL>                Model size: 1.5b or 3b [default: 1.5b]
+  -t, --tui                          Launch interactive ratatui TUI
+      --stdin                        Read diff from stdin instead of running git diff
+      --ticket <FILE_OR_TEXT>        User story / acceptance criteria to validate against (file path or inline text)
+      --min-severity <MIN_SEVERITY>  Minimum severity to report — also sets the CI exit-code threshold [default: low]
+  -f, --format <FORMAT>              Output format: text or json [default: text]
+      --max-tokens <MAX_TOKENS>      Max output tokens per diff chunk [default: 1024]
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 ---
 
-## 📊 Output Options
+## CI / CD Integration
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--branch, -b` | Base branch to compare against | `main` |
-| `--format, -f` | Output format (`markdown` or `json`) | `markdown` |
-| `--context, -c` | Business context (ticket text or file path) | `""` |
-| `--min-severity` | Minimum severity level (`high`, `medium`, `low`) | `low` |
-| `--stdin` | Read diff from stdin | `false` |
-| `--output, -o` | Write report to a specific file | `stdout` |
+diffmind works well in CI pipelines. No API keys or network access needed after the model is cached.
 
----
+### GitHub Actions example
 
-## 🗺️ Roadmap
+```yaml
+- name: Cache diffmind model
+  uses: actions/cache@v4
+  with:
+    path: ~/.diffmind/models
+    key: diffmind-models-1.5b
 
-I am committed to making Diffmind the ultimate local-first AI companion for developers. As a developer, I am building the foundation for a privacy-first engineering future, and I am actively looking for contributors to join this mission!
+- name: Install diffmind
+  run: |
+    curl -sSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/diffmind-x86_64-unknown-linux-gnu.tar.gz \
+      | tar -xz -C /usr/local/bin
 
-- [x] **v0.3.x**: Local RAG Integration (Symbol Indexing & Semantic Context)
-- [x] **v0.4.0**: Dual-Engine Stabilization (Native + Wasm, 3B Model Support)
-- [ ] **v0.5.0**: VS Code Extension (Real-time IDE feedback)
-- [ ] **Custom Rule Engine**: Team-specific standards and security baselines.
-- [ ] **Multi-Language Support**: Expanding deep-reasoning capabilities to Go, Python, Rust, and Java.
+- name: Download model (if not cached)
+  run: diffmind download
 
----
+- name: Review PR diff
+  run: git diff origin/main...HEAD | diffmind --stdin --min-severity high
+```
 
-## ⚙️ Requirements & Limitations
+### Pre-commit hook
 
-### Hardware Requirements
-- **RAM**: 8GB recommended (4GB minimum). The model itself occupies ~2.2GB.
-- **CPU**: Modern x64 or ARM64 processor. Apple Silicon (M1/M2/M3) provides exceptional performance via Wasm SIMD.
-- **Disk**: ~2.5GB free space for the local model download. You can pre-fetch this using `diffmind download`.
-
-### Current Limitations
-- **Large Models (3B+)**: While WebAssembly runtimes are often limited to 4GB of RAM, Diffmind's **Native Engine** bypasses this limit, enabling high-quality reviews with the 3B parameter model on machines with 8GB+ RAM.
-- **Language Focus**: While the underlying model (Qwen2.5-Coder) is multi-lingual, the current review persona is optimized for **TypeScript, JavaScript, NestJS, and React Native**.
+```bash
+#!/bin/sh
+# .git/hooks/pre-push
+git diff origin/main...HEAD | diffmind --stdin --min-severity high
+```
 
 ---
 
-## 🛡️ License
+## Project Structure
 
-Distributed under the MIT License. See `LICENSE` for more information.
+```
+diffmind/
+├── Cargo.toml                  # Workspace root
+├── packages/
+│   └── core-engine/            # Rust inference library (candle + GGUF)
+│       └── src/lib.rs          # ReviewAnalyzer, chunking, JSON parsing
+└── apps/
+    └── tui-cli/                # diffmind binary
+        └── src/
+            ├── main.rs         # Entry point, TUI + static dispatch
+            ├── cli.rs          # Clap argument definitions
+            ├── download.rs     # Model download with progress bar
+            ├── git.rs          # git diff integration
+            ├── indexer.rs      # Symbol indexer (Local RAG)
+            └── rag.rs          # RAG context builder
+```
 
 ---
 
-## ✨ Support the Local-First Movement
+## How It Works
 
-If you believe code reviews should be private and fast, consider contributing to the diffmind core.
+1. **Diff capture** — runs `git diff <branch>...HEAD` (or reads stdin) and splits output per file
+2. **Symbol context** — if an index exists, relevant function/type definitions are prepended as context
+3. **Chunked inference** — each file diff is independently passed to the local GGUF model via [candle](https://github.com/huggingface/candle); the model generates a JSON array of findings
+4. **Early exit** — generation stops as soon as the JSON array is syntactically complete (no wasted tokens)
+5. **Output** — findings are printed to stdout (static mode) or rendered in the ratatui TUI
 
-*Built with ❤️ by Tech Lead, for Tech Leads.*
+---
+
+## Roadmap
+
+- [ ] `--output <file>` to write Markdown or JSON report to disk
+- [ ] Incremental model updates (version-check against HuggingFace before re-download)
+- [ ] Custom rule file (`.diffmind/rules.toml`) for team-specific review baselines
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+_Built by [Thinkgrid Labs](https://github.com/thinkgrid-labs). Code review should be private and fast._

@@ -1,0 +1,26 @@
+[package]
+name = "diffmind"
+version = "0.5.0"
+edition = "2021"
+description = "Local-first AI code review agent — powered by on-device inference"
+
+[[bin]]
+name = "diffmind"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+core-engine = { path = "../../packages/core-engine" }
+rand = { workspace = true }
+clap = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+indicatif = { workspace = true }
+walkdir = { workspace = true }
+chrono = { workspace = true }
+lazy_static = { workspace = true }

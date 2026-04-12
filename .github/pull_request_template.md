@@ -1,27 +1,28 @@
 ## Description
-Please include a summary of the changes and the related issue. Please also include relevant motivation and context.
+Summary of the changes and the problem they solve.
 
-Fixes # (issue)
+Closes # (issue)
 
 ## Type of change
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Breaking change
 - [ ] Documentation update
-- [ ] Refactoring
+- [ ] Refactoring / cleanup
 
-## How Has This Been Tested?
-Please describe the tests that you ran to verify your changes.
+## Requirements addressed
+<!-- Link to the REQUIREMENTS.md section or GitHub issue this satisfies -->
+- Implements / closes: 
 
-- [ ] Unit Tests (`pnpm test`)
-- [ ] Wasm Tests (`wasm-pack test`)
-- [ ] Manual CLI testing
+## Testing
+- [ ] `cargo test --workspace` passes
+- [ ] `cargo clippy --all-targets -- -D warnings` passes
+- [ ] `cargo fmt --check` passes
+- [ ] Manual CLI test: `diffmind --branch main` runs without error
+- [ ] Manual CLI test: `diffmind --stdin --format json` produces valid JSON
 
 ## Checklist
-- [ ] My code follows the style guidelines of this project
-- [ ] I have performed a self-review of my code
-- [ ] I have commented my code, particularly in hard-to-understand areas
-- [ ] I have made corresponding changes to the documentation
-- [ ] My changes generate no new warnings
-- [ ] I have added tests that prove my fix is effective or that my feature works
-- [ ] New and existing unit tests pass locally with my changes
+- [ ] Code compiles with zero warnings (`cargo build`)
+- [ ] Logic is covered by a unit test where feasible
+- [ ] Public API or CLI flags documented in README if changed
+- [ ] REQUIREMENTS.md acceptance criteria checked off if applicable

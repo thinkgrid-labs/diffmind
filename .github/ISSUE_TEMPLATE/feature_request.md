@@ -1,19 +1,29 @@
 ---
-name: "🚀 Feature Request"
-about: Suggest an idea for Diffmind
+name: "Feature Request"
+about: Propose a new feature or improvement
 title: "[FEATURE] "
 labels: enhancement
 assignees: ""
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**User story**
+Complete the sentence:
+> As a **[developer / CI engineer / tech lead]**, I want **[action]** so that **[benefit]**.
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**Problem it solves**
+What friction or limitation does this address?
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**Proposed solution**
+How should it work? CLI flags, output format, behaviour changes.
+
+**Acceptance criteria**
+List the conditions that must be true for this to be considered done:
+- [ ] Criterion 1
+- [ ] Criterion 2
+- [ ] Criterion 3
+
+**Alternatives considered**
+Other approaches you thought about and why you ruled them out.
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Screenshots, related issues, links to prior art.
