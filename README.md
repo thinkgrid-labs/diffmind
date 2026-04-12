@@ -304,4 +304,7 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-_Built by [Thinkgrid Labs](https://github.com/thinkgrid-labs). Code review should be private and fast._
+✨ Support the Local-First Movement
+If you believe code reviews should be private and fast, consider contributing to the diffmind core.
+
+Built with ❤️ by Tech Lead, for Tech Leads.
