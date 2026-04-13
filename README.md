@@ -54,7 +54,7 @@ Auto-detects your OS and CPU architecture (Intel or Apple Silicon), downloads th
 Pin a specific version:
 
 ```bash
-VERSION=v0.6.0 curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
+VERSION=v.x.x curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
 ```
 
 ### Windows

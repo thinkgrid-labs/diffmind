@@ -64,6 +64,12 @@ pub struct Cli {
     #[arg(long)]
     pub debug: bool,
 
+    /// Inference device: auto (default), cpu, metal.
+    /// `auto` tries Metal on Apple Silicon and falls back to CPU.
+    /// `metal` forces GPU inference (macOS only).
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
     /// Specific files or directories to review (optional)
     pub files: Vec<String>,
 }

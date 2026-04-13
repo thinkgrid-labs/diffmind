@@ -1,4 +1,4 @@
-use crate::indexer::{SymbolIndex, COMMON_KEYWORDS};
+use crate::indexer::{COMMON_KEYWORDS, SymbolIndex};
 use regex::Regex;
 
 const MAX_CONTEXT_BYTES: usize = 3000;
