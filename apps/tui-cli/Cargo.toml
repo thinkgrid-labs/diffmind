@@ -1,6 +1,6 @@
 [package]
 name = "diffmind"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Local-first AI code review agent — powered by on-device inference"
 
