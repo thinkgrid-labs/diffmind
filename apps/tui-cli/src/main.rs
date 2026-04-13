@@ -1,5 +1,7 @@
 use anyhow::Result;
-use core_engine::{DevicePreference, ReviewAnalyzer, ReviewFinding, Severity};
+use core_engine::{
+    CommitSuggestion, DevicePreference, PrDescription, ReviewAnalyzer, ReviewFinding, Severity,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     collections::HashSet,
@@ -41,6 +43,41 @@ async fn main() -> Result<()> {
                 let new_index = indexer.build_index(existing)?;
                 indexer.save(&new_index)?;
                 println!("Index updated: {} symbols found", new_index.symbols.len());
+                return Ok(());
+            }
+            cli::Commands::Describe {
+                branch,
+                last,
+                stdin,
+                ticket,
+                model,
+                device,
+            } => {
+                let diff = if stdin {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    io::stdin().read_to_string(&mut buf).ok();
+                    buf
+                } else if last {
+                    git::get_last_commit_diff(&[])?
+                } else {
+                    git::get_diff(&branch, &[])?
+                };
+                if diff.trim().is_empty() {
+                    println!("No changes detected. Nothing to describe.");
+                    return Ok(());
+                }
+                let ticket_text = resolve_ticket(ticket.as_deref());
+                run_describe(&diff, &model_dir, ticket_text.as_deref(), &model, &device).await?;
+                return Ok(());
+            }
+            cli::Commands::Commit {
+                model,
+                device,
+                apply,
+            } => {
+                let diff = git::get_staged_diff()?;
+                run_commit(&diff, &model_dir, &model, &device, apply).await?;
                 return Ok(());
             }
         }
@@ -397,6 +434,188 @@ async fn run_static(
     }
 
     Ok(!findings.is_empty())
+}
+
+// ─── PR description runner ───────────────────────────────────────────────────
+
+async fn run_describe(
+    diff: &str,
+    model_dir: &Path,
+    ticket: Option<&str>,
+    model_id: &str,
+    device: &str,
+) -> Result<()> {
+    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Model files not found. Run `diffmind download` first."
+        ));
+    }
+
+    eprintln!();
+    eprintln!("  diffmind  PR description");
+    eprintln!("  {}", "─".repeat(52));
+    eprintln!(
+        "  {:<10} {} file{}",
+        "Changed",
+        count_diff_files(diff),
+        if count_diff_files(diff) == 1 { "" } else { "s" }
+    );
+    eprintln!();
+
+    let spinner = make_spinner("Loading model...");
+    let model_bytes = std::fs::read(&model_path)?;
+    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
+
+    let device_pref = parse_device(device);
+    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.set_message("Generating PR description...");
+
+    let desc = analyzer
+        .generate_pr_description(diff, ticket, 768)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.finish_and_clear();
+
+    print_pr_description(&desc);
+    Ok(())
+}
+
+fn print_pr_description(desc: &PrDescription) {
+    use crossterm::style::Stylize;
+
+    eprintln!();
+    eprintln!("  {}  Title", "─".repeat(62).dark_grey());
+    eprintln!();
+    eprintln!("    {}", desc.title.clone().bold());
+    eprintln!();
+
+    if !desc.summary.is_empty() {
+        eprintln!("  {}  Summary", "─".repeat(62).dark_grey());
+        eprintln!();
+        for item in &desc.summary {
+            eprintln!("    {}  {}", "·".cyan(), item);
+        }
+        eprintln!();
+    }
+
+    if !desc.test_plan.is_empty() {
+        eprintln!("  {}  Test plan", "─".repeat(62).dark_grey());
+        eprintln!();
+        for item in &desc.test_plan {
+            eprintln!("    {}  {}", "☐".dark_grey(), item);
+        }
+        eprintln!();
+    }
+
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!(
+        "  {}  Copy the above to your PR description.",
+        "·".dark_grey()
+    );
+    eprintln!();
+}
+
+// ─── Commit message runner ────────────────────────────────────────────────────
+
+async fn run_commit(
+    diff: &str,
+    model_dir: &Path,
+    model_id: &str,
+    device: &str,
+    apply: bool,
+) -> Result<()> {
+    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Model files not found. Run `diffmind download` first."
+        ));
+    }
+
+    eprintln!();
+    eprintln!("  diffmind  commit message");
+    eprintln!("  {}", "─".repeat(52));
+    eprintln!(
+        "  {:<10} {} file{}",
+        "Staged",
+        count_diff_files(diff),
+        if count_diff_files(diff) == 1 { "" } else { "s" }
+    );
+    eprintln!();
+
+    let spinner = make_spinner("Loading model...");
+    let model_bytes = std::fs::read(&model_path)?;
+    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
+
+    let device_pref = parse_device(device);
+    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.set_message("Generating commit message...");
+
+    let suggestion = analyzer
+        .generate_commit_message(diff, 512)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.finish_and_clear();
+
+    print_commit_suggestion(&suggestion);
+
+    if apply {
+        run_git_commit(&suggestion)?;
+    }
+
+    Ok(())
+}
+
+fn print_commit_suggestion(s: &CommitSuggestion) {
+    use crossterm::style::Stylize;
+
+    eprintln!();
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!();
+    eprintln!("  {}", s.message.clone().bold());
+    if !s.body.trim().is_empty() {
+        eprintln!();
+        for line in s.body.lines() {
+            eprintln!("  {}", line.dark_grey());
+        }
+    }
+    eprintln!();
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!(
+        "  {}  Run:  git commit -m \"{}\"",
+        "·".dark_grey(),
+        s.message
+    );
+    eprintln!("  {}  Or:   diffmind commit --apply", "·".dark_grey());
+    eprintln!();
+}
+
+fn run_git_commit(s: &CommitSuggestion) -> Result<()> {
+    use crossterm::style::Stylize;
+    use std::process::Command;
+
+    let mut cmd = Command::new("git");
+    cmd.args(["commit", "-m", &s.message]);
+    if !s.body.trim().is_empty() {
+        cmd.args(["-m", s.body.trim()]);
+    }
+
+    eprintln!("  {}  Running git commit...", "·".dark_grey());
+    let status = cmd.status()?;
+    if status.success() {
+        eprintln!("  {}  Committed.", "✓".green().bold());
+    } else {
+        return Err(anyhow::anyhow!("git commit failed"));
+    }
+    Ok(())
 }
 
 // ─── Coloured finding renderer ────────────────────────────────────────────────

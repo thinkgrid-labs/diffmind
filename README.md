@@ -210,6 +210,74 @@ git diff main...HEAD | diffmind --stdin --min-severity high
 git diff main...HEAD | diffmind --stdin --format json | jq '.[] | select(.severity == "high")'
 ```
 
+### PR description (`diffmind describe`)
+
+Generate a structured PR title, summary, and test plan from your branch diff:
+
+```bash
+# Generate PR description from current branch vs main
+diffmind describe
+
+# Use last commit only
+diffmind describe --last
+
+# Provide ticket context so the description reflects requirements
+diffmind describe --branch staging --ticket ticket.md
+
+# Pipe in any diff
+git diff main...HEAD | diffmind describe --stdin
+```
+
+Output:
+
+```
+  diffmind  PR description
+  ────────────────────────────────────────────────────────────────
+
+  Title
+    Add streaming output and Metal GPU support for Apple Silicon
+
+  Summary
+    ·  Stream findings to the terminal as each diff chunk completes
+    ·  Enable Metal + Accelerate inference on Apple Silicon Macs
+    ·  Reviewer now always returns positive highlights alongside issues
+
+  Test plan
+    ☐  Run diffmind --last on an M-series Mac and verify "Metal" in header
+    ☐  Confirm findings appear per chunk rather than all at once
+    ☐  Verify --format json output is unchanged
+```
+
+### Commit message (`diffmind commit`)
+
+Suggest a conventional commit message for your staged changes:
+
+```bash
+# Stage your changes first
+git add src/auth.rs
+
+# Get a suggested commit message
+diffmind commit
+
+# Run git commit automatically with the suggestion
+diffmind commit --apply
+```
+
+Output:
+
+```
+  diffmind  commit message
+  ────────────────────────────────────────────────────────────────
+
+  feat(auth): add JWT token refresh with sliding expiry window
+
+  Replaces the fixed 1-hour expiry with a sliding window that resets
+  on each authenticated request, reducing unnecessary logouts.
+
+  ─  Run:  git commit -m "feat(auth): add JWT token refresh..."
+  ─  Or:   diffmind commit --apply
+```
+
 ### Local symbol indexing (RAG)
 
 Build a symbol index so the model understands definitions of functions and types referenced in your diff:
@@ -233,6 +301,8 @@ Usage: diffmind [OPTIONS] [FILES]... [COMMAND]
 Commands:
   download  Download or refresh the local AI model files
   index     Build a symbol index for context-aware reviews
+  describe  Generate a PR title and description from the current branch diff
+  commit    Suggest a conventional commit message for staged changes
 
 Arguments:
   [FILES]...  Specific files or directories to review (optional)
@@ -336,11 +406,8 @@ The items below are planned or under consideration. Contributions welcome — op
 ### Medium-term
 
 - [ ] **Daemon / server mode** (`diffmind serve`) — keep the model loaded in memory between invocations so subsequent reviews are near-instant. Uses an idle timeout (configurable, default 10 min) — the model is automatically unloaded when not in use so it does not consume RAM while you are away from your desk. Same pattern as `rust-analyzer` or `ssh-agent`.
-- [x] **Streaming output** — print findings as each chunk completes rather than waiting for the full diff to finish
 - [ ] **SARIF output** (`--format sarif`) — upload to GitHub Code Scanning and get inline PR annotations in the GitHub UI, no extra tooling required
 - [ ] **Auto-fix patches** (`diffmind fix`) — convert `suggested_fix` fields into `.patch` files and apply them interactively with `git apply`
-- [ ] **PR description generator** (`diffmind describe`) — generate a structured PR title + body from the diff using the same local model
-- [ ] **Commit message suggester** (`diffmind commit`) — review staged changes and suggest a conventional commit message
 
 ### Concepts & Future Ideas
 

@@ -89,6 +89,46 @@ pub enum Commands {
     },
     /// Build a symbol index of the local repository for context-aware reviews
     Index,
+    /// Generate a PR title and description from the current branch diff
+    Describe {
+        /// Base branch to diff against
+        #[arg(short, long, default_value = "main")]
+        branch: String,
+
+        /// Use only the most recent commit instead of the full branch diff
+        #[arg(short, long)]
+        last: bool,
+
+        /// Read diff from stdin
+        #[arg(long)]
+        stdin: bool,
+
+        /// User story / ticket for additional context (file path or inline text)
+        #[arg(long, value_name = "FILE_OR_TEXT")]
+        ticket: Option<String>,
+
+        /// Model size to use (1.5b, 3b, …)
+        #[arg(short, long, default_value = "1.5b")]
+        model: String,
+
+        /// Inference device: auto, cpu, metal
+        #[arg(long, default_value = "auto")]
+        device: String,
+    },
+    /// Suggest a conventional commit message for staged changes
+    Commit {
+        /// Model size to use (1.5b, 3b, …)
+        #[arg(short, long, default_value = "1.5b")]
+        model: String,
+
+        /// Inference device: auto, cpu, metal
+        #[arg(long, default_value = "auto")]
+        device: String,
+
+        /// Run `git commit` automatically with the suggested message
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 pub fn parse() -> Cli {

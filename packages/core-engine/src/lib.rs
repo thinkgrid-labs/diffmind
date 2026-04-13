@@ -72,6 +72,32 @@ pub struct ReviewSummary {
     pub suggestions: Vec<String>,
 }
 
+/// Output of `generate_pr_description` — ready to paste into GitHub / GitLab.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PrDescription {
+    /// Imperative title under 72 characters.
+    #[serde(default)]
+    pub title: String,
+    /// Two to four bullet points summarising what changed and why.
+    #[serde(default)]
+    pub summary: Vec<String>,
+    /// Checklist of steps a reviewer should take to verify the change.
+    #[serde(default)]
+    pub test_plan: Vec<String>,
+}
+
+/// Output of `generate_commit_message` — conventional commit format.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommitSuggestion {
+    /// Single-line conventional commit message (under 72 chars).
+    #[serde(default)]
+    pub message: String,
+    /// Optional multi-line body explaining *why* the change was made.
+    /// Empty string when a one-liner is sufficient.
+    #[serde(default)]
+    pub body: String,
+}
+
 // ─── ReviewAnalyzer ──────────────────────────────────────────────────────────
 
 pub struct ReviewAnalyzer {
@@ -519,6 +545,115 @@ impl ReviewAnalyzer {
         }
 
         Ok(generated_text)
+    }
+
+    // ── PR description ────────────────────────────────────────────────────────
+
+    /// Generate a structured PR title, summary, and test plan from a diff.
+    /// The diff is truncated if it exceeds the context budget.
+    pub fn generate_pr_description(
+        &mut self,
+        diff: &str,
+        ticket: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<PrDescription, EngineError> {
+        // ~10 KB ≈ 2 500 tokens — leaves room for the prompt and output.
+        const MAX_DIFF_BYTES: usize = 10_000;
+        let diff = truncate_to_char_boundary(diff, MAX_DIFF_BYTES);
+
+        let ticket_section = match ticket {
+            Some(t) => format!(
+                "\n\nTicket / user story:\n{}",
+                truncate_to_char_boundary(t, 1500)
+            ),
+            None => String::new(),
+        };
+
+        let prompt = format!(
+            "<|im_start|>system\n\
+             You are a senior software engineer writing a GitHub pull request description.\n\
+             Given a git diff, produce a concise and informative PR description.\n\n\
+             Return a JSON object ONLY with this structure:\n\
+             {{\"title\": \"imperative title under 72 chars\", \
+             \"summary\": [\"what changed and why — one sentence per bullet\"], \
+             \"test_plan\": [\"how to verify each change\"]}}\n\n\
+             Rules:\n\
+             - title: imperative mood, under 72 chars, no period (e.g. \"Add JWT token refresh\")\n\
+             - summary: 2–4 bullets, each one sentence, focus on what and why\n\
+             - test_plan: 2–4 actionable steps a reviewer can follow to verify the change\
+             <|im_end|>\n\
+             <|im_start|>user\n\
+             Diff:{}\n{}\
+             <|im_end|>\n\
+             <|im_start|>assistant\n",
+            diff, ticket_section
+        );
+
+        let response = self.generate(&prompt, max_new_tokens)?;
+
+        if let Some(start) = response.find('{')
+            && let Some(end) = response.rfind('}')
+            && end > start
+        {
+            let slice = &response[start..=end];
+            if let Ok(desc) = serde_json::from_str::<PrDescription>(slice) {
+                return Ok(desc);
+            }
+        }
+
+        Err(EngineError::SerializationError(
+            "model did not return a valid PR description JSON object".into(),
+        ))
+    }
+
+    // ── Commit message ────────────────────────────────────────────────────────
+
+    /// Suggest a conventional commit message for a staged diff.
+    pub fn generate_commit_message(
+        &mut self,
+        diff: &str,
+        max_new_tokens: usize,
+    ) -> Result<CommitSuggestion, EngineError> {
+        const MAX_DIFF_BYTES: usize = 10_000;
+        let diff = truncate_to_char_boundary(diff, MAX_DIFF_BYTES);
+
+        let prompt = format!(
+            "<|im_start|>system\n\
+             You are a senior software engineer writing a git commit message.\n\
+             Given a staged diff, produce a conventional commit message.\n\n\
+             Conventional commit format: <type>(<optional scope>): <short description>\n\
+             Types: feat, fix, docs, style, refactor, test, chore, perf\n\n\
+             Return a JSON object ONLY:\n\
+             {{\"message\": \"feat(scope): short description\", \
+             \"body\": \"optional multi-line body explaining WHY (empty string if a one-liner is enough)\"}}\n\n\
+             Rules:\n\
+             - message must be under 72 characters\n\
+             - Use imperative mood (\"add\" not \"added\", \"fix\" not \"fixed\")\n\
+             - scope is optional — use it when it meaningfully narrows the context\n\
+             - body explains motivation and context, not what the diff shows\
+             <|im_end|>\n\
+             <|im_start|>user\n\
+             Staged diff:\n{}\
+             <|im_end|>\n\
+             <|im_start|>assistant\n",
+            diff
+        );
+
+        let response = self.generate(&prompt, max_new_tokens)?;
+
+        if let Some(start) = response.find('{')
+            && let Some(end) = response.rfind('}')
+            && end > start
+        {
+            let slice = &response[start..=end];
+            if let Ok(msg) = serde_json::from_str::<CommitSuggestion>(slice) {
+                return Ok(msg);
+            }
+        }
+
+        Err(EngineError::SerializationError(
+            "model did not return a valid commit message JSON object".into(),
+        ))
     }
 }
 
