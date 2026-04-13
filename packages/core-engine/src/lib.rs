@@ -72,6 +72,34 @@ pub struct ReviewSummary {
     pub suggestions: Vec<String>,
 }
 
+/// A single user-defined rule loaded from `.diffmind/rules.toml`.
+/// Matched against every added line in the diff before the AI model runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRule {
+    /// Regex pattern matched against added lines (`+` lines) in the diff.
+    pub pattern: String,
+    /// Human-readable description shown as the finding's issue text.
+    pub message: String,
+    /// Severity: `"high"`, `"medium"`, or `"low"`. Defaults to `"medium"`.
+    #[serde(default = "default_rule_severity")]
+    pub severity: String,
+    /// Category: `"security"`, `"quality"`, `"performance"`, `"maintainability"`.
+    /// Defaults to `"quality"`.
+    #[serde(default = "default_rule_category")]
+    pub category: String,
+    /// Optional file glob filters (e.g. `["*.ts", "*.tsx"]`).
+    /// When empty the rule applies to every file in the diff.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+fn default_rule_severity() -> String {
+    "medium".into()
+}
+fn default_rule_category() -> String {
+    "quality".into()
+}
+
 /// Output of `generate_pr_description` — ready to paste into GitHub / GitLab.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PrDescription {
@@ -112,6 +140,8 @@ pub struct ReviewAnalyzer {
     requirements: Option<String>,
     /// When true, print the raw model output and token counts to stderr for each chunk.
     debug: bool,
+    /// User-defined rules loaded from `.diffmind/rules.toml`.
+    custom_rules: Vec<CustomRule>,
 }
 
 /// Hard upper bound on total tokens (prompt + generated) fed to the model.
@@ -199,6 +229,7 @@ impl ReviewAnalyzer {
             languages: None,
             requirements: None,
             debug: false,
+            custom_rules: Vec::new(),
         })
     }
 
@@ -234,6 +265,14 @@ impl ReviewAnalyzer {
         self
     }
 
+    /// Load team-defined rules from `.diffmind/rules.toml`.
+    /// Rules are matched against added lines in the diff before the AI model runs —
+    /// zero inference cost, instant results.
+    pub fn with_custom_rules(mut self, rules: Vec<CustomRule>) -> Self {
+        self.custom_rules = rules;
+        self
+    }
+
     /// Like [`analyze_diff_chunked`] but calls `on_progress(done, total)` after
     /// each chunk completes so callers can display a live progress indicator.
     ///
@@ -260,6 +299,7 @@ impl ReviewAnalyzer {
         let det_findings: Vec<ReviewFinding> = detect_commented_out_code(diff)
             .into_iter()
             .chain(detect_removed_used_variables(diff))
+            .chain(detect_custom_rule_violations(diff, &self.custom_rules))
             .collect();
 
         // Stream deterministic findings immediately — no need to wait for the LLM.
@@ -1030,6 +1070,104 @@ fn contains_identifier(text: &str, name: &str) -> bool {
         start = abs + 1;
     }
     false
+}
+
+// ─── Deterministic rule: user-defined patterns from .diffmind/rules.toml ─────
+
+fn parse_severity_str(s: &str) -> Severity {
+    match s.to_lowercase().as_str() {
+        "high" => Severity::High,
+        "medium" | "med" => Severity::Medium,
+        _ => Severity::Low,
+    }
+}
+
+fn parse_category_str(s: &str) -> Category {
+    match s.to_lowercase().as_str() {
+        "security" => Category::Security,
+        "performance" => Category::Performance,
+        "maintainability" => Category::Maintainability,
+        "compliance" => Category::Compliance,
+        _ => Category::Quality,
+    }
+}
+
+/// Returns true when `file_path` matches the simple glob `pattern`.
+/// Supported: `*` (any), `*.ext` (extension), exact filename, path suffix.
+fn file_matches_glob(file_path: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        return file_path.ends_with(&format!(".{ext}"));
+    }
+    file_path == pattern || file_path.ends_with(&format!("/{pattern}"))
+}
+
+/// Run user-defined rules from `.diffmind/rules.toml` against all added lines
+/// in the diff. Returns one finding per matched line per rule.
+fn detect_custom_rule_violations(diff: &str, rules: &[CustomRule]) -> Vec<ReviewFinding> {
+    use regex::Regex;
+
+    if rules.is_empty() {
+        return vec![];
+    }
+
+    // Pre-compile patterns; silently skip rules with invalid regex.
+    let compiled: Vec<(usize, Regex)> = rules
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Regex::new(&r.pattern).ok().map(|re| (i, re)))
+        .collect();
+
+    let mut findings = Vec::new();
+    let mut current_file = String::new();
+    let mut line_num: u32 = 1;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(b_path) = line.split(" b/").nth(1) {
+                current_file = b_path.trim().to_string();
+            }
+        } else if line.starts_with("@@ ")
+            && let Some(new_part) = line.split('+').nth(1)
+            && let Some(num_str) = new_part.split([',', ' ']).next()
+        {
+            line_num = num_str.parse().unwrap_or(1);
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            let content = &line[1..];
+            for (idx, re) in &compiled {
+                let rule = &rules[*idx];
+                // Apply file filter if present.
+                if !rule.files.is_empty()
+                    && !rule
+                        .files
+                        .iter()
+                        .any(|g| file_matches_glob(&current_file, g))
+                {
+                    continue;
+                }
+                if re.is_match(content) {
+                    findings.push(ReviewFinding {
+                        file: current_file.clone(),
+                        line: line_num,
+                        severity: parse_severity_str(&rule.severity),
+                        category: parse_category_str(&rule.category),
+                        issue: rule.message.clone(),
+                        suggested_fix: String::new(),
+                        confidence: Some(1.0),
+                    });
+                }
+            }
+            line_num += 1;
+        } else if line.starts_with(' ') {
+            // Context line — exists in both old and new file.
+            line_num += 1;
+        }
+        // '-' removed lines do not increment the new-file line counter.
+    }
+
+    findings
 }
 
 #[cfg(test)]

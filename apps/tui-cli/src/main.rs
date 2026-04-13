@@ -17,6 +17,7 @@ mod download;
 mod git;
 mod indexer;
 mod rag;
+mod rules;
 
 use crate::indexer::Indexer;
 
@@ -103,13 +104,24 @@ async fn main() -> Result<()> {
     // 3. Resolve ticket / user story content (file path or inline text)
     let ticket = resolve_ticket(args.ticket.as_deref());
 
-    // 4. Launch UI (TUI or static)
+    // 4. Load custom rules (zero cost — runs before the model)
+    let custom_rules = rules::load_custom_rules(&project_root);
+
+    // 5. Launch UI (TUI or static)
     if args.tui {
         run_tui(diff, model_dir, project_root, args.model.clone(), ticket).await?;
     } else {
         let min_sev = parse_severity(&args.min_severity);
-        let has_findings =
-            run_static(&diff, &model_dir, &project_root, &args, min_sev, ticket).await?;
+        let has_findings = run_static(
+            &diff,
+            &model_dir,
+            &project_root,
+            &args,
+            min_sev,
+            ticket,
+            custom_rules,
+        )
+        .await?;
 
         // Non-zero exit if any findings at or above --min-severity (CI gate).
         if has_findings {
@@ -246,6 +258,7 @@ async fn run_static(
     args: &cli::Cli,
     min_severity: Severity,
     ticket: Option<String>,
+    custom_rules: Vec<core_engine::CustomRule>,
 ) -> Result<bool> {
     let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", args.model));
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -320,6 +333,7 @@ async fn run_static(
     let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .with_languages(langs)
+        .with_custom_rules(custom_rules)
         .with_debug(args.debug);
 
     if let Some(req) = ticket {

@@ -278,6 +278,74 @@ Output:
   ─  Or:   diffmind commit --apply
 ```
 
+### Team rules (`.diffmind/rules.toml`)
+
+Encode your coding standards as regex patterns. Rules run **before the AI model** — instant, zero inference cost — and produce findings just like model findings (colored output, severity, CI gate).
+
+Create `.diffmind/rules.toml` in your project root:
+
+```toml
+# ── Debug & logging ───────────────────────────────────────────────────────────
+[[rule]]
+pattern = "console\\.log"
+message = "Remove debug logging before merging to production"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.js", "*.tsx", "*.jsx"]
+
+# ── TypeScript standards ──────────────────────────────────────────────────────
+[[rule]]
+pattern = ":\\s*any\\b"
+message = "Avoid TypeScript 'any' — use an explicit type or 'unknown'"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.tsx"]
+
+[[rule]]
+pattern = "@ts-ignore"
+message = "Do not suppress TypeScript errors — fix the underlying type issue"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.tsx"]
+
+# ── Security ──────────────────────────────────────────────────────────────────
+[[rule]]
+pattern = "password\\s*=\\s*[\"'][^\"']+[\"']"
+message = "Hardcoded password — use environment variables or a secrets manager"
+severity = "high"
+category = "security"
+
+[[rule]]
+pattern = "SECRET|API_KEY|PRIVATE_KEY"
+message = "Possible hardcoded secret in added code — verify this is not sensitive"
+severity = "high"
+category = "security"
+
+# ── Code hygiene ──────────────────────────────────────────────────────────────
+[[rule]]
+pattern = "TODO|FIXME|HACK"
+message = "Resolve TODO/FIXME/HACK before merging"
+severity = "low"
+category = "maintainability"
+
+[[rule]]
+pattern = "debugger;"
+message = "Remove debugger statement"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.js", "*.tsx", "*.jsx"]
+```
+
+Each rule supports:
+
+| Field      | Required | Description                                                                  |
+| ---------- | -------- | ---------------------------------------------------------------------------- |
+| `pattern`  | ✓        | Regular expression matched against added lines                               |
+| `message`  | ✓        | Finding description shown in output                                          |
+| `severity` |          | `high`, `medium`, or `low` (default: `medium`)                               |
+| `category` |          | `security`, `quality`, `performance`, `maintainability` (default: `quality`) |
+| `files`    |          | File glob filter, e.g. `["*.ts", "*.tsx"]`. Omit to match all files          |
+
 ### Local symbol indexing (RAG)
 
 Build a symbol index so the model understands definitions of functions and types referenced in your diff:
@@ -401,7 +469,6 @@ The items below are planned or under consideration. Contributions welcome — op
 - [ ] Incremental model updates — version-check HuggingFace before re-download
 - [ ] `diffmind install-hooks` — one command to install a `pre-push` git hook that blocks on High severity findings
 - [ ] **Watch mode** (`diffmind watch`) — re-review staged files automatically on each `git add`, no manual invocation needed
-- [ ] **Custom rule file** (`.diffmind/rules.toml`) — team-defined regex patterns that run before the model, zero inference cost
 
 ### Medium-term
 

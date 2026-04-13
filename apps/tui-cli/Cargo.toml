@@ -25,3 +25,4 @@ walkdir = { workspace = true }
 chrono = { workspace = true }
 lazy_static = { workspace = true }
 sysinfo = { workspace = true }
+toml = { workspace = true }
