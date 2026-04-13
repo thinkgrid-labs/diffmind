@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
-**diffmind** is a free, open-source AI code review tool that runs entirely on your machine — no cloud, no API keys, no subscription. It analyzes your `git diff` using a local [Qwen2.5-Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF) model and reports security issues, bugs, and code quality problems directly in your terminal.
+**Diffmind** is a free, open-source AI code review tool that runs entirely on your machine — no cloud, no API keys, no subscription. It analyzes your `git diff` using a local [Qwen2.5-Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF) model and reports security issues, bugs, and code quality problems directly in your terminal.
 
 Your source code never leaves your environment. Works offline. Ships as a **single self-contained binary** for Linux, macOS, and Windows.
 
@@ -341,4 +341,9 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-> **diffmind** — AI-powered local code review. Security analysis, bug detection, and code quality feedback in your terminal. Private by design. Free forever.
+> **Diffmind** — AI-powered local code review. Security analysis, bug detection, and code quality feedback in your terminal. Private by design. Free forever.
+
+✨ Support the Local-First Movement
+If you believe code reviews should be private and fast, consider contributing to the diffmind core.
+
+Built with ❤️ by Tech Lead, for Tech Leads.
