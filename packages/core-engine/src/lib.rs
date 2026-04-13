@@ -214,21 +214,32 @@ impl ReviewAnalyzer {
     /// Returns `(summary, skipped)` where `skipped` is the number of chunks
     /// the model processed but returned unparseable JSON for — useful for
     /// surfacing silent failures to the user.
-    pub fn analyze_diff_chunked_with_progress<F>(
+    /// Like [`analyze_diff_chunked`] but fires two callbacks as work progresses:
+    /// - `on_progress(done, total)` — called when a chunk starts (for spinner label updates)
+    /// - `on_chunk_result(findings)` — called immediately with each chunk's findings as
+    ///   they complete, enabling streaming output before the full diff is processed
+    pub fn analyze_diff_chunked_with_progress<F, G>(
         &mut self,
         diff: &str,
         context: &str,
         max_tokens_per_chunk: u32,
         on_progress: F,
+        on_chunk_result: G,
     ) -> Result<(ReviewSummary, usize), EngineError>
     where
         F: Fn(usize, usize),
+        G: Fn(&[ReviewFinding]),
     {
         // Run deterministic rules first — catches patterns the model reliably misses.
         let det_findings: Vec<ReviewFinding> = detect_commented_out_code(diff)
             .into_iter()
             .chain(detect_removed_used_variables(diff))
             .collect();
+
+        // Stream deterministic findings immediately — no need to wait for the LLM.
+        if !det_findings.is_empty() {
+            on_chunk_result(&det_findings);
+        }
 
         const MAX_CHUNK_LINES: usize = 300;
         let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
@@ -249,6 +260,10 @@ impl ReviewAnalyzer {
             on_progress(done, total);
             match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
                 Ok(summary) => {
+                    // Stream this chunk's findings immediately.
+                    if !summary.findings.is_empty() {
+                        on_chunk_result(&summary.findings);
+                    }
                     all_findings.extend(summary.findings);
                     all_positives.extend(summary.positives);
                     all_suggestions.extend(summary.suggestions);
@@ -281,8 +296,14 @@ impl ReviewAnalyzer {
         context: &str,
         max_tokens_per_chunk: u32,
     ) -> Result<ReviewSummary, EngineError> {
-        self.analyze_diff_chunked_with_progress(diff, context, max_tokens_per_chunk, |_, _| {})
-            .map(|(summary, _)| summary)
+        self.analyze_diff_chunked_with_progress(
+            diff,
+            context,
+            max_tokens_per_chunk,
+            |_, _| {},
+            |_| {},
+        )
+        .map(|(summary, _)| summary)
     }
 
     fn analyze_diff_internal(

@@ -1,8 +1,8 @@
 [package]
 name = "core-engine"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
-description = "diffmind shared AI engine core"
+description = "Diffmind shared AI engine core"
 
 [dependencies]
 candle-core = { workspace = true }

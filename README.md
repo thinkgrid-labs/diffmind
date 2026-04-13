@@ -33,7 +33,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **Quality review** — anti-patterns, dead code, API misuse
 - **Performance hints** — inefficient algorithms, memory overhead, unnecessary allocations
 - **Maintainability** — naming, readability, complexity
-- **Ticket-aware review** — provide a Jira/Linear/GitHub ticket and diffmind checks if the diff actually implements the requirements (`--ticket`)
+- **Ticket-aware review** — provide a Jira/Linear/GitHub ticket and Diffmind checks if the diff actually implements the requirements (`--ticket`)
 - **Local RAG** — indexes your project's symbols so the model understands function and type definitions referenced in the diff (`diffmind index`)
 - **Interactive TUI** — ratatui terminal UI with navigable findings and detail panel (`--tui`)
 - **CI/CD gate** — pipe any `git diff` via stdin, filter by severity, exits with code 1 on findings
@@ -323,9 +323,32 @@ diffmind/
 
 ## Roadmap
 
+The items below are planned or under consideration. Contributions welcome — open an issue to discuss before starting anything large.
+
+### Near-term
+
 - [ ] `--output <file>` — write Markdown or HTML report to disk
 - [ ] Incremental model updates — version-check HuggingFace before re-download
-- [ ] Custom rule file (`.diffmind/rules.toml`) — team-specific review baselines
+- [ ] `diffmind install-hooks` — one command to install a `pre-push` git hook that blocks on High severity findings
+- [ ] **Watch mode** (`diffmind watch`) — re-review staged files automatically on each `git add`, no manual invocation needed
+- [ ] **Custom rule file** (`.diffmind/rules.toml`) — team-defined regex patterns that run before the model, zero inference cost
+
+### Medium-term
+
+- [ ] **Daemon / server mode** (`diffmind serve`) — keep the model loaded in memory between invocations so subsequent reviews are near-instant. Uses an idle timeout (configurable, default 10 min) — the model is automatically unloaded when not in use so it does not consume RAM while you are away from your desk. Same pattern as `rust-analyzer` or `ssh-agent`.
+- [x] **Streaming output** — print findings as each chunk completes rather than waiting for the full diff to finish
+- [ ] **SARIF output** (`--format sarif`) — upload to GitHub Code Scanning and get inline PR annotations in the GitHub UI, no extra tooling required
+- [ ] **Auto-fix patches** (`diffmind fix`) — convert `suggested_fix` fields into `.patch` files and apply them interactively with `git apply`
+- [ ] **PR description generator** (`diffmind describe`) — generate a structured PR title + body from the diff using the same local model
+- [ ] **Commit message suggester** (`diffmind commit`) — review staged changes and suggest a conventional commit message
+
+### Concepts & Future Ideas
+
+- [ ] **Hotspot awareness** — inject `git log` change frequency per file into the prompt so the model flags instability patterns in high-churn areas
+- [ ] **Cross-file impact analysis** — extend the RAG symbol index to detect callers of deleted or renamed functions across the entire project
+- [ ] **Review history & trends** (`diffmind stats`) — store findings in `.diffmind/history/` and surface patterns over time ("60% of High findings are in `auth/`")
+- [ ] **VS Code / JetBrains extension** — call the daemon, display findings in the Problems panel with squiggles on diff lines
+- [ ] **Fine-tuned review model** — a smaller model trained specifically on code review tasks, trading general capability for faster, more accurate review output
 
 ---
 

@@ -314,12 +314,38 @@ async fn run_static(
         }
     });
 
-    let pb = spinner.clone();
+    // ── Streaming: print findings as each chunk completes (text mode only) ──────
+    // indicatif's .println() draws above the spinner without disturbing it.
+    let pb_progress = spinner.clone();
+    let pb_stream = spinner.clone();
+    let stream_min_sev = min_severity.clone();
+    let stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream_count_clone = stream_count.clone();
+    let is_text = matches!(args.format, cli::OutputFormat::Text);
+
     let (summary, skipped) = analyzer
-        .analyze_diff_chunked_with_progress(diff, &context, args.max_tokens, move |done, total| {
-            *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
-            pb.set_message(format!("Analyzing chunk {}/{}...", done, total));
-        })
+        .analyze_diff_chunked_with_progress(
+            diff,
+            &context,
+            args.max_tokens,
+            move |done, total| {
+                *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
+                pb_progress.set_message(format!("Analyzing chunk {}/{}...", done, total));
+            },
+            move |chunk_findings| {
+                if !is_text {
+                    return;
+                }
+                for f in chunk_findings {
+                    if meets_threshold(&f.severity, &stream_min_sev) {
+                        let n = stream_count_clone
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        pb_stream.println(format_finding(f, &format!("#{}", n)));
+                    }
+                }
+            },
+        )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     timer_done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -354,20 +380,16 @@ async fn run_static(
             println!("{}", json);
         }
         cli::OutputFormat::Text => {
-            println!();
+            // Findings were already streamed above — just print the footer.
             if findings.is_empty() {
                 if skipped > 0 {
                     eprintln!(
                         "  ?  No parseable findings — try `--model 3b` for better output quality."
                     );
                 } else {
-                    use crossterm::style::Stylize;
                     eprintln!("  {}  No issues found.", "✓".green().bold());
                 }
             } else {
-                for (i, f) in findings.iter().enumerate() {
-                    print_finding(f, i + 1, findings.len());
-                }
                 print_summary(findings.len(), skipped);
             }
             print_positives_and_suggestions(&summary.positives, &summary.suggestions);
@@ -421,61 +443,55 @@ fn wrap_text(text: &str, indent: usize, width: usize) -> String {
     lines.join("\n")
 }
 
-fn print_finding(f: &ReviewFinding, idx: usize, total: usize) {
+/// Build a fully-formatted, ANSI-coloured string for one finding.
+/// `counter` is a short label shown on the header row, e.g. `"#1"` or `"2/5"`.
+fn format_finding(f: &ReviewFinding, counter: &str) -> String {
     let sev = severity_color(f);
     let icon = category_icon(f);
     let cat = format!("{:?}", f.category).to_lowercase();
     let loc = format!("{}:{}", f.file, f.line).dark_grey();
-    let counter = format!("[{}/{}]", idx, total).dark_grey();
+    let counter_label = format!("[{}]", counter).dark_grey();
+
+    let mut out = String::new();
 
     // ── Header row ──
-    println!(
-        "  {}  {}  {}  {} {}",
+    out.push_str(&format!(
+        "\n  {}  {}  {}  {} {}\n",
         sev,
         icon,
         cat.dark_grey(),
         loc,
-        counter
-    );
+        counter_label
+    ));
 
     // ── Separator ──
-    println!("  {}", "─".repeat(62).dark_grey());
+    out.push_str(&format!("  {}\n", "─".repeat(62).dark_grey()));
 
     // ── Issue ──
-    println!(
-        "  {}  {}",
+    let issue_wrapped = wrap_text(&f.issue, 10, 68);
+    let mut issue_lines = issue_wrapped.lines();
+    out.push_str(&format!(
+        "  {}  {}\n",
         "Issue".red().bold(),
-        wrap_text(&f.issue, 10, 68).trim_start()
-    );
-    if f.issue.len() > 58 {
-        println!(
-            "{}",
-            wrap_text(&f.issue, 10, 68)
-                .lines()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        issue_lines.next().unwrap_or("").trim_start()
+    ));
+    for line in issue_lines {
+        out.push_str(&format!("{}\n", line));
     }
 
     // ── Fix ──
-    println!(
-        "  {}    {}",
+    let fix_wrapped = wrap_text(&f.suggested_fix, 10, 68);
+    let mut fix_lines = fix_wrapped.lines();
+    out.push_str(&format!(
+        "  {}    {}\n",
         "Fix".green().bold(),
-        wrap_text(&f.suggested_fix, 10, 68).trim_start()
-    );
-    if f.suggested_fix.len() > 58 {
-        println!(
-            "{}",
-            wrap_text(&f.suggested_fix, 10, 68)
-                .lines()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        fix_lines.next().unwrap_or("").trim_start()
+    ));
+    for line in fix_lines {
+        out.push_str(&format!("{}\n", line));
     }
 
-    println!();
+    out
 }
 
 fn print_summary(count: usize, skipped: usize) {
