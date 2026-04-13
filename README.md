@@ -34,24 +34,35 @@ Ships as a **single self-contained Rust binary** with an optional interactive [r
 
 ## Installation
 
-### Prebuilt binary (recommended)
+### One-line installer — Linux & macOS
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/thinkgrid-labs/diffmind/releases):
+```bash
+curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
+```
+
+Auto-detects your OS and CPU (Intel or Apple Silicon), downloads the right binary, and installs to `/usr/local/bin`. Pin a specific version:
+
+```bash
+VERSION=v0.6.0 curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
+```
+
+### Windows
+
+Download `diffmind-x86_64-pc-windows-msvc.zip` from [GitHub Releases](https://github.com/thinkgrid-labs/diffmind/releases), extract it, and place `diffmind.exe` on your `PATH`.
+
+### Manual download
 
 | Platform            | Asset                                       |
 | ------------------- | ------------------------------------------- |
+| macOS Apple Silicon | `diffmind-aarch64-apple-darwin.tar.gz`      |
+| macOS Intel         | `diffmind-x86_64-apple-darwin.tar.gz`       |
 | Linux x86_64        | `diffmind-x86_64-unknown-linux-gnu.tar.gz`  |
 | Linux ARM64         | `diffmind-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS x86_64        | `diffmind-x86_64-apple-darwin.tar.gz`       |
-| macOS Apple Silicon | `diffmind-aarch64-apple-darwin.tar.gz`      |
 | Windows x86_64      | `diffmind-x86_64-pc-windows-msvc.zip`       |
 
 ```bash
-# Linux / macOS example
-tar -xzf diffmind-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf diffmind-<target>.tar.gz
 sudo mv diffmind /usr/local/bin/
-
-# Verify
 diffmind --version
 ```
 
@@ -304,4 +315,7 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-_Built by [Thinkgrid Labs](https://github.com/thinkgrid-labs). Code review should be private and fast._
+✨ Support the Local-First Movement
+If you believe code reviews should be private and fast, consider contributing to the diffmind core.
+
+Built with ❤️ by Tech Lead, for Tech Leads.
