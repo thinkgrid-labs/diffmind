@@ -114,9 +114,8 @@ pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
         DevicePreference::Metal => {
             #[cfg(target_os = "macos")]
             {
-                Device::new_metal(0).map_err(|e| {
-                    EngineError::ModelLoadError(format!("Metal unavailable: {e}"))
-                })
+                Device::new_metal(0)
+                    .map_err(|e| EngineError::ModelLoadError(format!("Metal unavailable: {e}")))
             }
             #[cfg(not(target_os = "macos"))]
             Err(EngineError::ModelLoadError(
@@ -133,9 +132,7 @@ pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
                         return Ok(d);
                     }
                     Err(_) => {
-                        eprintln!(
-                            "  Device     CPU  (Metal unavailable, using Accelerate BLAS)"
-                        );
+                        eprintln!("  Device     CPU  (Metal unavailable, using Accelerate BLAS)");
                     }
                 }
             }

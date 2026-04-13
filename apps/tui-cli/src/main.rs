@@ -349,15 +349,17 @@ async fn run_static(
                 "positives": summary.positives,
                 "suggestions": summary.suggestions,
             });
-            let json = serde_json::to_string_pretty(&out)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let json =
+                serde_json::to_string_pretty(&out).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             println!("{}", json);
         }
         cli::OutputFormat::Text => {
             println!();
             if findings.is_empty() {
                 if skipped > 0 {
-                    eprintln!("  ?  No parseable findings — try `--model 3b` for better output quality.");
+                    eprintln!(
+                        "  ?  No parseable findings — try `--model 3b` for better output quality."
+                    );
                 } else {
                     use crossterm::style::Stylize;
                     eprintln!("  {}  No issues found.", "✓".green().bold());
