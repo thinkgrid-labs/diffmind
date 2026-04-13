@@ -11,11 +11,7 @@ pub fn current_branch() -> Option<String> {
     if output.status.success() {
         let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // "HEAD" means detached state — not useful to show
-        if branch == "HEAD" {
-            None
-        } else {
-            Some(branch)
-        }
+        if branch == "HEAD" { None } else { Some(branch) }
     } else {
         None
     }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use core_engine::{ReviewAnalyzer, ReviewFinding, Severity};
+use core_engine::{DevicePreference, ReviewAnalyzer, ReviewFinding, Severity};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     collections::HashSet,
@@ -81,6 +81,16 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─── Device helpers ──────────────────────────────────────────────────────────
+
+fn parse_device(s: &str) -> DevicePreference {
+    match s.to_lowercase().as_str() {
+        "metal" => DevicePreference::Metal,
+        "cpu" => DevicePreference::Cpu,
+        _ => DevicePreference::Auto,
+    }
 }
 
 // ─── Severity helpers ────────────────────────────────────────────────────────
@@ -262,14 +272,15 @@ async fn run_static(
     // ── RAG context ───────────────────────────────────────────────────────────
     let index = Indexer::load(project_root);
     let mut context = String::new();
-    if let Some(idx) = index {
-        if let Some(rag_text) = rag::get_rag_context(diff, &idx) {
-            context = rag_text;
-        }
+    if let Some(idx) = index
+        && let Some(rag_text) = rag::get_rag_context(diff, &idx)
+    {
+        context = rag_text;
     }
 
     // ── Build analyzer ────────────────────────────────────────────────────────
-    let mut analyzer = ReviewAnalyzer::new(&model_bytes, &tokenizer_bytes)
+    let device_pref = parse_device(&args.device);
+    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .with_languages(langs)
         .with_debug(args.debug);
@@ -304,7 +315,7 @@ async fn run_static(
     });
 
     let pb = spinner.clone();
-    let (all_findings, skipped) = analyzer
+    let (summary, skipped) = analyzer
         .analyze_diff_chunked_with_progress(diff, &context, args.max_tokens, move |done, total| {
             *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
             pb.set_message(format!("Analyzing chunk {}/{}...", done, total));
@@ -323,39 +334,45 @@ async fn run_static(
         );
     }
 
-    // ── Filter to threshold ───────────────────────────────────────────────────
-    let findings: Vec<&ReviewFinding> = all_findings
+    // ── Filter findings to threshold ──────────────────────────────────────────
+    let findings: Vec<&ReviewFinding> = summary
+        .findings
         .iter()
         .filter(|f| meets_threshold(&f.severity, &min_severity))
         .collect();
 
-    if findings.is_empty() {
-        if skipped > 0 {
-            eprintln!("  ?  No parseable findings — try `--model 3b` for better output quality.");
-        } else {
-            eprintln!("  ✓  No issues found.");
-        }
-        eprintln!();
-        return Ok(false);
-    }
-
     match args.format {
         cli::OutputFormat::Json => {
-            // Emit a clean JSON array — pipe-friendly for CI dashboards
-            let json = serde_json::to_string_pretty(&findings)
+            // Emit the full summary as JSON — pipe-friendly for CI dashboards
+            let out = serde_json::json!({
+                "findings": findings,
+                "positives": summary.positives,
+                "suggestions": summary.suggestions,
+            });
+            let json = serde_json::to_string_pretty(&out)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             println!("{}", json);
         }
         cli::OutputFormat::Text => {
             println!();
-            for (i, f) in findings.iter().enumerate() {
-                print_finding(f, i + 1, findings.len());
+            if findings.is_empty() {
+                if skipped > 0 {
+                    eprintln!("  ?  No parseable findings — try `--model 3b` for better output quality.");
+                } else {
+                    use crossterm::style::Stylize;
+                    eprintln!("  {}  No issues found.", "✓".green().bold());
+                }
+            } else {
+                for (i, f) in findings.iter().enumerate() {
+                    print_finding(f, i + 1, findings.len());
+                }
+                print_summary(findings.len(), skipped);
             }
-            print_summary(findings.len(), skipped);
+            print_positives_and_suggestions(&summary.positives, &summary.suggestions);
         }
     }
 
-    Ok(true)
+    Ok(!findings.is_empty())
 }
 
 // ─── Coloured finding renderer ────────────────────────────────────────────────
@@ -478,19 +495,45 @@ fn print_summary(count: usize, skipped: usize) {
     eprintln!();
 }
 
+fn print_positives_and_suggestions(positives: &[String], suggestions: &[String]) {
+    if positives.is_empty() && suggestions.is_empty() {
+        return;
+    }
+
+    if !positives.is_empty() {
+        eprintln!("  {}", "─".repeat(62).dark_grey());
+        eprintln!("  {}  What looks good", "✓".green().bold());
+        for p in positives {
+            eprintln!("     {}  {}", "·".green(), p);
+        }
+        eprintln!();
+    }
+
+    if !suggestions.is_empty() {
+        if positives.is_empty() {
+            eprintln!("  {}", "─".repeat(62).dark_grey());
+        }
+        eprintln!("  💡  Suggestions");
+        for s in suggestions {
+            eprintln!("     {}  {}", "·".dark_yellow(), s);
+        }
+        eprintln!();
+    }
+}
+
 // ─── TUI runner ───────────────────────────────────────────────────────────────
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
 
 struct App {
@@ -543,57 +586,60 @@ async fn run_tui(
     res
 }
 
-async fn tui_loop<B: Backend>(terminal: &mut Terminal<B>, app: Arc<Mutex<App>>) -> Result<()> {
+async fn tui_loop<B: Backend>(terminal: &mut Terminal<B>, app: Arc<Mutex<App>>) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     loop {
         {
             let mut app_lock = app.lock().await;
             terminal.draw(|f| ui(f, &mut app_lock))?;
         }
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                let mut app_lock = app.lock().await;
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let i = match app_lock.state.selected() {
-                            Some(i) if !app_lock.findings.is_empty() => {
-                                (i + 1) % app_lock.findings.len()
-                            }
-                            _ => 0,
-                        };
-                        app_lock.state.select(Some(i));
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        let i = match app_lock.state.selected() {
-                            Some(i) if !app_lock.findings.is_empty() => {
-                                if i == 0 {
-                                    app_lock.findings.len() - 1
-                                } else {
-                                    i - 1
-                                }
-                            }
-                            _ => 0,
-                        };
-                        app_lock.state.select(Some(i));
-                    }
-                    KeyCode::Char('a') => {
-                        if !app_lock.analyzing {
-                            app_lock.analyzing = true;
-                            app_lock.status = "Analyzing...".to_string();
-                            let app_clone = Arc::clone(&app);
-                            tokio::spawn(async move {
-                                let app_err = Arc::clone(&app_clone);
-                                if let Err(e) = background_analysis(app_clone).await {
-                                    let mut app = app_err.lock().await;
-                                    app.status = format!("Error: {}", e);
-                                    app.analyzing = false;
-                                }
-                            });
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            let mut app_lock = app.lock().await;
+            match key.code {
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let i = match app_lock.state.selected() {
+                        Some(i) if !app_lock.findings.is_empty() => {
+                            (i + 1) % app_lock.findings.len()
                         }
-                    }
-                    _ => {}
+                        _ => 0,
+                    };
+                    app_lock.state.select(Some(i));
                 }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let i = match app_lock.state.selected() {
+                        Some(i) if !app_lock.findings.is_empty() => {
+                            if i == 0 {
+                                app_lock.findings.len() - 1
+                            } else {
+                                i - 1
+                            }
+                        }
+                        _ => 0,
+                    };
+                    app_lock.state.select(Some(i));
+                }
+                KeyCode::Char('a') => {
+                    if !app_lock.analyzing {
+                        app_lock.analyzing = true;
+                        app_lock.status = "Analyzing...".to_string();
+                        let app_clone = Arc::clone(&app);
+                        tokio::spawn(async move {
+                            let app_err = Arc::clone(&app_clone);
+                            if let Err(e) = background_analysis(app_clone).await {
+                                let mut app = app_err.lock().await;
+                                app.status = format!("Error: {}", e);
+                                app.analyzing = false;
+                            }
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -619,28 +665,29 @@ async fn background_analysis(app: Arc<Mutex<App>>) -> Result<()> {
 
     let index = Indexer::load(&project_root);
     let mut context = String::new();
-    if let Some(idx) = index {
-        if let Some(rag_text) = rag::get_rag_context(&diff, &idx) {
-            context = rag_text;
-        }
+    if let Some(idx) = index
+        && let Some(rag_text) = rag::get_rag_context(&diff, &idx)
+    {
+        context = rag_text;
     }
 
     let langs = detect_languages(&diff);
-    let mut analyzer = ReviewAnalyzer::new(&model_bytes, &tokenizer_bytes)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .with_languages(langs);
+    let mut analyzer =
+        ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, DevicePreference::Auto)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .with_languages(langs);
 
     if let Some(req) = ticket {
         analyzer = analyzer.with_requirements(req);
     }
 
-    let findings = analyzer
+    let summary = analyzer
         .analyze_diff_chunked(&diff, &context, 1024)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let mut app_lock = app.lock().await;
-    let count = findings.len();
-    app_lock.findings = findings;
+    let count = summary.findings.len();
+    app_lock.findings = summary.findings;
     app_lock.status = format!(
         "Done — {} finding{}",
         count,

@@ -56,6 +56,22 @@ pub struct ReviewFinding {
     pub confidence: Option<f32>,
 }
 
+/// The complete result of analyzing one or more diff chunks.
+/// Always populated — even when there are no bug findings, `positives` and
+/// `suggestions` let the reviewer know what looks good and what could improve.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReviewSummary {
+    /// Bugs, vulnerabilities, and code quality issues (may be empty).
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
+    /// Things done well in this diff — at least one entry when the code is reasonable.
+    #[serde(default)]
+    pub positives: Vec<String>,
+    /// Low-priority optional improvements that are not bugs.
+    #[serde(default)]
+    pub suggestions: Vec<String>,
+}
+
 // ─── ReviewAnalyzer ──────────────────────────────────────────────────────────
 
 pub struct ReviewAnalyzer {
@@ -77,9 +93,71 @@ pub struct ReviewAnalyzer {
 /// candle panic or garbage output with no clean error.
 const MAX_CONTEXT_TOKENS: usize = 4096;
 
+/// Which compute device to use for inference.
+#[derive(Debug, Clone, Default)]
+pub enum DevicePreference {
+    /// Try Metal on macOS, fall back to CPU everywhere else.
+    #[default]
+    Auto,
+    /// Force CPU inference on all platforms.
+    Cpu,
+    /// Force Metal (macOS / Apple Silicon). Returns an error on other platforms.
+    Metal,
+}
+
+/// Select the best available device according to the caller's preference.
+/// Prints a one-line status to stderr so the user knows what's being used.
+pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
+    match pref {
+        DevicePreference::Cpu => Ok(Device::Cpu),
+
+        DevicePreference::Metal => {
+            #[cfg(target_os = "macos")]
+            {
+                Device::new_metal(0).map_err(|e| {
+                    EngineError::ModelLoadError(format!("Metal unavailable: {e}"))
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(EngineError::ModelLoadError(
+                "Metal is only available on macOS".into(),
+            ))
+        }
+
+        DevicePreference::Auto => {
+            #[cfg(target_os = "macos")]
+            {
+                match Device::new_metal(0) {
+                    Ok(d) => {
+                        eprintln!("  Device     Metal (Apple Silicon GPU)");
+                        return Ok(d);
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "  Device     CPU  (Metal unavailable, using Accelerate BLAS)"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            eprintln!("  Device     CPU");
+
+            Ok(Device::Cpu)
+        }
+    }
+}
+
 impl ReviewAnalyzer {
     pub fn new(model_bytes: &[u8], tokenizer_bytes: &[u8]) -> Result<Self, EngineError> {
-        let device = Device::Cpu;
+        Self::new_with_device(model_bytes, tokenizer_bytes, DevicePreference::Auto)
+    }
+
+    pub fn new_with_device(
+        model_bytes: &[u8],
+        tokenizer_bytes: &[u8],
+        device_pref: DevicePreference,
+    ) -> Result<Self, EngineError> {
+        let device = resolve_device(&device_pref)?;
 
         let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| EngineError::TokenizerError(e.to_string()))?;
@@ -136,7 +214,7 @@ impl ReviewAnalyzer {
     /// Like [`analyze_diff_chunked`] but calls `on_progress(done, total)` after
     /// each chunk completes so callers can display a live progress indicator.
     ///
-    /// Returns `(findings, skipped)` where `skipped` is the number of chunks
+    /// Returns `(summary, skipped)` where `skipped` is the number of chunks
     /// the model processed but returned unparseable JSON for — useful for
     /// surfacing silent failures to the user.
     pub fn analyze_diff_chunked_with_progress<F>(
@@ -145,13 +223,15 @@ impl ReviewAnalyzer {
         context: &str,
         max_tokens_per_chunk: u32,
         on_progress: F,
-    ) -> Result<(Vec<ReviewFinding>, usize), EngineError>
+    ) -> Result<(ReviewSummary, usize), EngineError>
     where
         F: Fn(usize, usize),
     {
         // Run deterministic rules first — catches patterns the model reliably misses.
-        let mut all_findings = detect_commented_out_code(diff);
-        all_findings.extend(detect_removed_used_variables(diff));
+        let det_findings: Vec<ReviewFinding> = detect_commented_out_code(diff)
+            .into_iter()
+            .chain(detect_removed_used_variables(diff))
+            .collect();
 
         const MAX_CHUNK_LINES: usize = 300;
         let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
@@ -160,6 +240,10 @@ impl ReviewAnalyzer {
         let mut done = 0;
         let mut skipped = 0;
 
+        let mut all_findings = det_findings;
+        let mut all_positives: Vec<String> = Vec::new();
+        let mut all_suggestions: Vec<String> = Vec::new();
+
         for chunk in chunks {
             if chunk.trim().is_empty() {
                 continue;
@@ -167,7 +251,11 @@ impl ReviewAnalyzer {
             done += 1;
             on_progress(done, total);
             match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
-                Ok(findings) => all_findings.extend(findings),
+                Ok(summary) => {
+                    all_findings.extend(summary.findings);
+                    all_positives.extend(summary.positives);
+                    all_suggestions.extend(summary.suggestions);
+                }
                 // Small models often produce malformed JSON for a single chunk.
                 // Count skips so the caller can warn the user instead of silently
                 // returning "no issues".
@@ -176,7 +264,18 @@ impl ReviewAnalyzer {
             }
         }
 
-        Ok((all_findings, skipped))
+        // Deduplicate positives/suggestions that repeat across chunks.
+        all_positives.dedup();
+        all_suggestions.dedup();
+
+        Ok((
+            ReviewSummary {
+                findings: all_findings,
+                positives: all_positives,
+                suggestions: all_suggestions,
+            },
+            skipped,
+        ))
     }
 
     pub fn analyze_diff_chunked(
@@ -184,9 +283,9 @@ impl ReviewAnalyzer {
         diff: &str,
         context: &str,
         max_tokens_per_chunk: u32,
-    ) -> Result<Vec<ReviewFinding>, EngineError> {
+    ) -> Result<ReviewSummary, EngineError> {
         self.analyze_diff_chunked_with_progress(diff, context, max_tokens_per_chunk, |_, _| {})
-            .map(|(findings, _)| findings)
+            .map(|(summary, _)| summary)
     }
 
     fn analyze_diff_internal(
@@ -194,9 +293,9 @@ impl ReviewAnalyzer {
         diff: &str,
         context: &str,
         max_new_tokens: usize,
-    ) -> Result<Vec<ReviewFinding>, EngineError> {
+    ) -> Result<ReviewSummary, EngineError> {
         if diff.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(ReviewSummary::default());
         }
 
         let prompt = self.format_prompt(diff, context);
@@ -224,28 +323,42 @@ impl ReviewAnalyzer {
             eprintln!("[debug] raw model output:\n{}\n", response);
         }
 
-        let json_start = response.find('[').unwrap_or(0);
-        let json_end = response
-            .rfind(']')
-            .unwrap_or_else(|| response.len().saturating_sub(1));
-
-        if json_end <= json_start || json_end >= response.len() {
+        // Try the primary format: {"findings": [...], "positives": [...], "suggestions": [...]}
+        if let Some(start) = response.find('{')
+            && let Some(end) = response.rfind('}')
+            && end > start
+        {
+            let slice = &response[start..=end];
             if self.debug {
-                eprintln!("[debug] no valid JSON array found in output");
+                eprintln!("[debug] extracted JSON object slice:\n{}\n", slice);
             }
-            return Ok(Vec::new());
+            if let Ok(summary) = serde_json::from_str::<ReviewSummary>(slice) {
+                return Ok(summary);
+            }
         }
 
-        let json_slice = &response[json_start..=json_end];
+        // Fallback: bare array (old format / model didn't follow new schema)
+        if let Some(start) = response.find('[')
+            && let Some(end) = response.rfind(']')
+            && end > start
+        {
+            let slice = &response[start..=end];
+            if self.debug {
+                eprintln!("[debug] fallback: extracted JSON array slice:\n{}\n", slice);
+            }
+            let findings: Vec<ReviewFinding> = serde_json::from_str(slice)
+                .map_err(|e| EngineError::SerializationError(e.to_string()))?;
+            return Ok(ReviewSummary {
+                findings,
+                positives: Vec::new(),
+                suggestions: Vec::new(),
+            });
+        }
 
         if self.debug {
-            eprintln!("[debug] extracted JSON slice:\n{}\n", json_slice);
+            eprintln!("[debug] no valid JSON found in output");
         }
-
-        let findings: Vec<ReviewFinding> = serde_json::from_str(json_slice)
-            .map_err(|e| EngineError::SerializationError(e.to_string()))?;
-
-        Ok(findings)
+        Ok(ReviewSummary::default())
     }
 
     fn format_prompt(&self, diff: &str, context: &str) -> String {
@@ -290,13 +403,8 @@ impl ReviewAnalyzer {
         };
 
         format!(
-            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a comprehensive code review for {} code.{}{} \n\nFocus on:\n1. **Security**: Vulnerabilities, exposed secrets, insecure handling, disabled auth or validation.\n2. **Quality**: Bugs, anti-patterns, logical errors, commented-out functions or blocks of code (flag as medium severity), dead code left behind.\n3. **Performance**: Bottlenecks, inefficient algorithms or queries.\n4. **Maintainability**: Hard-to-read code, poor naming, high complexity, TODOs left in production code.{}\n\nIMPORTANT: If a function, method, or block has been commented out in the diff (lines starting with // or /* that previously were code), always flag it — commented-out code is a quality issue even if the change looks small.\n\nReturn a JSON array ONLY. Format: [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": {}, \"issue\": \"description\", \"suggested_fix\": \"code\" }}]\nIf genuinely no issues exist, return [].<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
-            stack,
-            requirements_section,
-            context_section,
-            compliance_focus,
-            category_hint,
-            diff
+            "<|im_start|>system\nYou are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and provide a thorough code review for {} code.{}{}\n\nFocus on:\n1. **Security**: Vulnerabilities, exposed secrets, insecure handling, disabled auth or validation.\n2. **Quality**: Bugs, anti-patterns, logical errors, commented-out functions or blocks of code (flag as medium severity), dead code left behind.\n3. **Performance**: Bottlenecks, inefficient algorithms or queries.\n4. **Maintainability**: Hard-to-read code, poor naming, high complexity, TODOs left in production code.{}\n\nIMPORTANT: If a function, method, or block has been commented out in the diff (lines starting with // or /* that previously were code), always flag it — commented-out code is a quality issue even if the change looks small.\n\nReturn a JSON object ONLY with exactly this structure:\n{{\n  \"findings\": [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \"category\": {}, \"issue\": \"description\", \"suggested_fix\": \"fix\" }}],\n  \"positives\": [\"one sentence describing something done well\"],\n  \"suggestions\": [\"one sentence optional improvement that is not a bug\"]\n}}\n\nRules:\n- findings: real issues only. Use [] if there are none.\n- positives: always include 1-3 things done well (clean logic, good naming, proper error handling, etc.). Never leave this empty.\n- suggestions: nice-to-have improvements (tests, docs, refactors). Use [] if nothing comes to mind.\n- Keep each positive/suggestion to one concise sentence.<|im_end|>\n<|im_start|>user\nAnalyze this diff:\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            stack, requirements_section, context_section, compliance_focus, category_hint, diff
         )
     }
 
@@ -364,7 +472,7 @@ impl ReviewAnalyzer {
                     return Err(EngineError::ForwardError(format!(
                         "unexpected logits shape: {:?}",
                         logits.dims()
-                    )))
+                    )));
                 }
             };
 
@@ -396,16 +504,19 @@ impl ReviewAnalyzer {
     }
 }
 
-/// Returns `true` once `s` contains a syntactically-complete JSON array
-/// (`[…]` with balanced brackets, respecting string literals and escapes).
+/// Returns `true` once `s` contains a syntactically-complete JSON value
+/// (object `{…}` or array `[…]`) with balanced brackets, respecting string
+/// literals and escapes.
 ///
-/// This lets `generate()` exit early as soon as the model has closed the
-/// answer array, instead of running until the token cap.
+/// This lets `generate()` exit early as soon as the model has closed its
+/// answer, instead of running until the token cap.
 fn json_array_complete(s: &str) -> bool {
     let trimmed = s.trim_start();
-    if !trimmed.starts_with('[') {
-        return false;
-    }
+    let (open, close) = match trimmed.chars().next() {
+        Some('{') => ('{', '}'),
+        Some('[') => ('[', ']'),
+        _ => return false,
+    };
     let mut depth: i32 = 0;
     let mut in_string = false;
     let mut escape = false;
@@ -417,8 +528,8 @@ fn json_array_complete(s: &str) -> bool {
         match ch {
             '\\' if in_string => escape = true,
             '"' => in_string = !in_string,
-            '[' if !in_string => depth += 1,
-            ']' if !in_string => {
+            c if c == open && !in_string => depth += 1,
+            c if c == close && !in_string => {
                 depth -= 1;
                 if depth == 0 {
                     return true;
@@ -591,10 +702,10 @@ pub fn detect_commented_out_code(diff: &str) -> Vec<ReviewFinding> {
             flush(&mut hunk, &mut findings);
             hunk.file = current_file.clone();
             // Parse the new-file start line from `@@ -a,b +c,d @@`
-            if let Some(new_part) = line.split('+').nth(1) {
-                if let Some(num) = new_part.split(',').next() {
-                    hunk.start_line = num.trim().parse().unwrap_or(1);
-                }
+            if let Some(new_part) = line.split('+').nth(1)
+                && let Some(num) = new_part.split(',').next()
+            {
+                hunk.start_line = num.trim().parse().unwrap_or(1);
             }
         } else if line.starts_with('-') && !line.starts_with("---") {
             let code = line[1..].trim().to_string();
@@ -679,12 +790,12 @@ pub fn detect_removed_used_variables(diff: &str) -> Vec<ReviewFinding> {
                 current_file = b.trim().to_string();
             }
         } else if line.starts_with("@@") {
-            if let Some(new_part) = line.split('+').nth(1) {
-                if let Some(num) = new_part.split(',').next() {
-                    let hunk_start: u32 = num.trim().parse().unwrap_or(1);
-                    if file_lines.is_empty() {
-                        file_start_line = hunk_start;
-                    }
+            if let Some(new_part) = line.split('+').nth(1)
+                && let Some(num) = new_part.split(',').next()
+            {
+                let hunk_start: u32 = num.trim().parse().unwrap_or(1);
+                if file_lines.is_empty() {
+                    file_start_line = hunk_start;
                 }
             }
         } else if line.starts_with('-') && !line.starts_with("---") {
