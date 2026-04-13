@@ -33,7 +33,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **Quality review** — anti-patterns, dead code, API misuse
 - **Performance hints** — inefficient algorithms, memory overhead, unnecessary allocations
 - **Maintainability** — naming, readability, complexity
-- **Ticket-aware review** — provide a Jira/Linear/GitHub ticket and diffmind checks if the diff actually implements the requirements (`--ticket`)
+- **Ticket-aware review** — provide a Jira/Linear/GitHub ticket and Diffmind checks if the diff actually implements the requirements (`--ticket`)
 - **Local RAG** — indexes your project's symbols so the model understands function and type definitions referenced in the diff (`diffmind index`)
 - **Interactive TUI** — ratatui terminal UI with navigable findings and detail panel (`--tui`)
 - **CI/CD gate** — pipe any `git diff` via stdin, filter by severity, exits with code 1 on findings
@@ -210,6 +210,142 @@ git diff main...HEAD | diffmind --stdin --min-severity high
 git diff main...HEAD | diffmind --stdin --format json | jq '.[] | select(.severity == "high")'
 ```
 
+### PR description (`diffmind describe`)
+
+Generate a structured PR title, summary, and test plan from your branch diff:
+
+```bash
+# Generate PR description from current branch vs main
+diffmind describe
+
+# Use last commit only
+diffmind describe --last
+
+# Provide ticket context so the description reflects requirements
+diffmind describe --branch staging --ticket ticket.md
+
+# Pipe in any diff
+git diff main...HEAD | diffmind describe --stdin
+```
+
+Output:
+
+```
+  diffmind  PR description
+  ────────────────────────────────────────────────────────────────
+
+  Title
+    Add streaming output and Metal GPU support for Apple Silicon
+
+  Summary
+    ·  Stream findings to the terminal as each diff chunk completes
+    ·  Enable Metal + Accelerate inference on Apple Silicon Macs
+    ·  Reviewer now always returns positive highlights alongside issues
+
+  Test plan
+    ☐  Run diffmind --last on an M-series Mac and verify "Metal" in header
+    ☐  Confirm findings appear per chunk rather than all at once
+    ☐  Verify --format json output is unchanged
+```
+
+### Commit message (`diffmind commit`)
+
+Suggest a conventional commit message for your staged changes:
+
+```bash
+# Stage your changes first
+git add src/auth.rs
+
+# Get a suggested commit message
+diffmind commit
+
+# Run git commit automatically with the suggestion
+diffmind commit --apply
+```
+
+Output:
+
+```
+  diffmind  commit message
+  ────────────────────────────────────────────────────────────────
+
+  feat(auth): add JWT token refresh with sliding expiry window
+
+  Replaces the fixed 1-hour expiry with a sliding window that resets
+  on each authenticated request, reducing unnecessary logouts.
+
+  ─  Run:  git commit -m "feat(auth): add JWT token refresh..."
+  ─  Or:   diffmind commit --apply
+```
+
+### Team rules (`.diffmind/rules.toml`)
+
+Encode your coding standards as regex patterns. Rules run **before the AI model** — instant, zero inference cost — and produce findings just like model findings (colored output, severity, CI gate).
+
+Create `.diffmind/rules.toml` in your project root:
+
+```toml
+# ── Debug & logging ───────────────────────────────────────────────────────────
+[[rule]]
+pattern = "console\\.log"
+message = "Remove debug logging before merging to production"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.js", "*.tsx", "*.jsx"]
+
+# ── TypeScript standards ──────────────────────────────────────────────────────
+[[rule]]
+pattern = ":\\s*any\\b"
+message = "Avoid TypeScript 'any' — use an explicit type or 'unknown'"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.tsx"]
+
+[[rule]]
+pattern = "@ts-ignore"
+message = "Do not suppress TypeScript errors — fix the underlying type issue"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.tsx"]
+
+# ── Security ──────────────────────────────────────────────────────────────────
+[[rule]]
+pattern = "password\\s*=\\s*[\"'][^\"']+[\"']"
+message = "Hardcoded password — use environment variables or a secrets manager"
+severity = "high"
+category = "security"
+
+[[rule]]
+pattern = "SECRET|API_KEY|PRIVATE_KEY"
+message = "Possible hardcoded secret in added code — verify this is not sensitive"
+severity = "high"
+category = "security"
+
+# ── Code hygiene ──────────────────────────────────────────────────────────────
+[[rule]]
+pattern = "TODO|FIXME|HACK"
+message = "Resolve TODO/FIXME/HACK before merging"
+severity = "low"
+category = "maintainability"
+
+[[rule]]
+pattern = "debugger;"
+message = "Remove debugger statement"
+severity = "medium"
+category = "quality"
+files = ["*.ts", "*.js", "*.tsx", "*.jsx"]
+```
+
+Each rule supports:
+
+| Field      | Required | Description                                                                  |
+| ---------- | -------- | ---------------------------------------------------------------------------- |
+| `pattern`  | ✓        | Regular expression matched against added lines                               |
+| `message`  | ✓        | Finding description shown in output                                          |
+| `severity` |          | `high`, `medium`, or `low` (default: `medium`)                               |
+| `category` |          | `security`, `quality`, `performance`, `maintainability` (default: `quality`) |
+| `files`    |          | File glob filter, e.g. `["*.ts", "*.tsx"]`. Omit to match all files          |
+
 ### Local symbol indexing (RAG)
 
 Build a symbol index so the model understands definitions of functions and types referenced in your diff:
@@ -233,6 +369,8 @@ Usage: diffmind [OPTIONS] [FILES]... [COMMAND]
 Commands:
   download  Download or refresh the local AI model files
   index     Build a symbol index for context-aware reviews
+  describe  Generate a PR title and description from the current branch diff
+  commit    Suggest a conventional commit message for staged changes
 
 Arguments:
   [FILES]...  Specific files or directories to review (optional)
@@ -323,9 +461,28 @@ diffmind/
 
 ## Roadmap
 
+The items below are planned or under consideration. Contributions welcome — open an issue to discuss before starting anything large.
+
+### Near-term
+
 - [ ] `--output <file>` — write Markdown or HTML report to disk
 - [ ] Incremental model updates — version-check HuggingFace before re-download
-- [ ] Custom rule file (`.diffmind/rules.toml`) — team-specific review baselines
+- [ ] `diffmind install-hooks` — one command to install a `pre-push` git hook that blocks on High severity findings
+- [ ] **Watch mode** (`diffmind watch`) — re-review staged files automatically on each `git add`, no manual invocation needed
+
+### Medium-term
+
+- [ ] **Daemon / server mode** (`diffmind serve`) — keep the model loaded in memory between invocations so subsequent reviews are near-instant. Uses an idle timeout (configurable, default 10 min) — the model is automatically unloaded when not in use so it does not consume RAM while you are away from your desk. Same pattern as `rust-analyzer` or `ssh-agent`.
+- [ ] **SARIF output** (`--format sarif`) — upload to GitHub Code Scanning and get inline PR annotations in the GitHub UI, no extra tooling required
+- [ ] **Auto-fix patches** (`diffmind fix`) — convert `suggested_fix` fields into `.patch` files and apply them interactively with `git apply`
+
+### Concepts & Future Ideas
+
+- [ ] **Hotspot awareness** — inject `git log` change frequency per file into the prompt so the model flags instability patterns in high-churn areas
+- [ ] **Cross-file impact analysis** — extend the RAG symbol index to detect callers of deleted or renamed functions across the entire project
+- [ ] **Review history & trends** (`diffmind stats`) — store findings in `.diffmind/history/` and surface patterns over time ("60% of High findings are in `auth/`")
+- [ ] **VS Code / JetBrains extension** — call the daemon, display findings in the Problems panel with squiggles on diff lines
+- [ ] **Fine-tuned review model** — a smaller model trained specifically on code review tasks, trading general capability for faster, more accurate review output
 
 ---
 

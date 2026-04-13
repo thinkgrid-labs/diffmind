@@ -59,6 +59,44 @@ pub fn get_last_commit_diff(paths: &[String]) -> Result<String> {
     Ok(diff)
 }
 
+/// Returns the diff of currently staged changes (`git diff --cached`).
+/// Returns an error if nothing is staged.
+pub fn get_staged_diff() -> Result<String> {
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--cached",
+            "--",
+            ":!node_modules",
+            ":!*-lock.json",
+            ":!pnpm-lock.yaml",
+            ":!package-lock.json",
+            ":!yarn.lock",
+            ":!dist",
+            ":!build",
+            ":!.next",
+            ":!.cache",
+            ":!*.map",
+            ":!*.min.js",
+            ":!*.min.css",
+        ])
+        .output()
+        .context("Failed to execute git command")?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Git error: {}", err));
+    }
+
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    if diff.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "No staged changes found. Run `git add <files>` first."
+        ));
+    }
+    Ok(diff)
+}
+
 pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     let branch_arg = format!("{}...HEAD", branch);
     let mut args = vec!["diff", &branch_arg, "--"];

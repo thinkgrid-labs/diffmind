@@ -1,5 +1,7 @@
 use anyhow::Result;
-use core_engine::{DevicePreference, ReviewAnalyzer, ReviewFinding, Severity};
+use core_engine::{
+    CommitSuggestion, DevicePreference, PrDescription, ReviewAnalyzer, ReviewFinding, Severity,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     collections::HashSet,
@@ -15,6 +17,7 @@ mod download;
 mod git;
 mod indexer;
 mod rag;
+mod rules;
 
 use crate::indexer::Indexer;
 
@@ -43,6 +46,41 @@ async fn main() -> Result<()> {
                 println!("Index updated: {} symbols found", new_index.symbols.len());
                 return Ok(());
             }
+            cli::Commands::Describe {
+                branch,
+                last,
+                stdin,
+                ticket,
+                model,
+                device,
+            } => {
+                let diff = if stdin {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    io::stdin().read_to_string(&mut buf).ok();
+                    buf
+                } else if last {
+                    git::get_last_commit_diff(&[])?
+                } else {
+                    git::get_diff(&branch, &[])?
+                };
+                if diff.trim().is_empty() {
+                    println!("No changes detected. Nothing to describe.");
+                    return Ok(());
+                }
+                let ticket_text = resolve_ticket(ticket.as_deref());
+                run_describe(&diff, &model_dir, ticket_text.as_deref(), &model, &device).await?;
+                return Ok(());
+            }
+            cli::Commands::Commit {
+                model,
+                device,
+                apply,
+            } => {
+                let diff = git::get_staged_diff()?;
+                run_commit(&diff, &model_dir, &model, &device, apply).await?;
+                return Ok(());
+            }
         }
     }
 
@@ -66,13 +104,24 @@ async fn main() -> Result<()> {
     // 3. Resolve ticket / user story content (file path or inline text)
     let ticket = resolve_ticket(args.ticket.as_deref());
 
-    // 4. Launch UI (TUI or static)
+    // 4. Load custom rules (zero cost — runs before the model)
+    let custom_rules = rules::load_custom_rules(&project_root);
+
+    // 5. Launch UI (TUI or static)
     if args.tui {
         run_tui(diff, model_dir, project_root, args.model.clone(), ticket).await?;
     } else {
         let min_sev = parse_severity(&args.min_severity);
-        let has_findings =
-            run_static(&diff, &model_dir, &project_root, &args, min_sev, ticket).await?;
+        let has_findings = run_static(
+            &diff,
+            &model_dir,
+            &project_root,
+            &args,
+            min_sev,
+            ticket,
+            custom_rules,
+        )
+        .await?;
 
         // Non-zero exit if any findings at or above --min-severity (CI gate).
         if has_findings {
@@ -209,6 +258,7 @@ async fn run_static(
     args: &cli::Cli,
     min_severity: Severity,
     ticket: Option<String>,
+    custom_rules: Vec<core_engine::CustomRule>,
 ) -> Result<bool> {
     let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", args.model));
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -283,6 +333,7 @@ async fn run_static(
     let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .with_languages(langs)
+        .with_custom_rules(custom_rules)
         .with_debug(args.debug);
 
     if let Some(req) = ticket {
@@ -314,12 +365,38 @@ async fn run_static(
         }
     });
 
-    let pb = spinner.clone();
+    // ── Streaming: print findings as each chunk completes (text mode only) ──────
+    // indicatif's .println() draws above the spinner without disturbing it.
+    let pb_progress = spinner.clone();
+    let pb_stream = spinner.clone();
+    let stream_min_sev = min_severity.clone();
+    let stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream_count_clone = stream_count.clone();
+    let is_text = matches!(args.format, cli::OutputFormat::Text);
+
     let (summary, skipped) = analyzer
-        .analyze_diff_chunked_with_progress(diff, &context, args.max_tokens, move |done, total| {
-            *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
-            pb.set_message(format!("Analyzing chunk {}/{}...", done, total));
-        })
+        .analyze_diff_chunked_with_progress(
+            diff,
+            &context,
+            args.max_tokens,
+            move |done, total| {
+                *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
+                pb_progress.set_message(format!("Analyzing chunk {}/{}...", done, total));
+            },
+            move |chunk_findings| {
+                if !is_text {
+                    return;
+                }
+                for f in chunk_findings {
+                    if meets_threshold(&f.severity, &stream_min_sev) {
+                        let n = stream_count_clone
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        pb_stream.println(format_finding(f, &format!("#{}", n)));
+                    }
+                }
+            },
+        )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     timer_done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -354,20 +431,16 @@ async fn run_static(
             println!("{}", json);
         }
         cli::OutputFormat::Text => {
-            println!();
+            // Findings were already streamed above — just print the footer.
             if findings.is_empty() {
                 if skipped > 0 {
                     eprintln!(
                         "  ?  No parseable findings — try `--model 3b` for better output quality."
                     );
                 } else {
-                    use crossterm::style::Stylize;
                     eprintln!("  {}  No issues found.", "✓".green().bold());
                 }
             } else {
-                for (i, f) in findings.iter().enumerate() {
-                    print_finding(f, i + 1, findings.len());
-                }
                 print_summary(findings.len(), skipped);
             }
             print_positives_and_suggestions(&summary.positives, &summary.suggestions);
@@ -375,6 +448,188 @@ async fn run_static(
     }
 
     Ok(!findings.is_empty())
+}
+
+// ─── PR description runner ───────────────────────────────────────────────────
+
+async fn run_describe(
+    diff: &str,
+    model_dir: &Path,
+    ticket: Option<&str>,
+    model_id: &str,
+    device: &str,
+) -> Result<()> {
+    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Model files not found. Run `diffmind download` first."
+        ));
+    }
+
+    eprintln!();
+    eprintln!("  diffmind  PR description");
+    eprintln!("  {}", "─".repeat(52));
+    eprintln!(
+        "  {:<10} {} file{}",
+        "Changed",
+        count_diff_files(diff),
+        if count_diff_files(diff) == 1 { "" } else { "s" }
+    );
+    eprintln!();
+
+    let spinner = make_spinner("Loading model...");
+    let model_bytes = std::fs::read(&model_path)?;
+    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
+
+    let device_pref = parse_device(device);
+    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.set_message("Generating PR description...");
+
+    let desc = analyzer
+        .generate_pr_description(diff, ticket, 768)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.finish_and_clear();
+
+    print_pr_description(&desc);
+    Ok(())
+}
+
+fn print_pr_description(desc: &PrDescription) {
+    use crossterm::style::Stylize;
+
+    eprintln!();
+    eprintln!("  {}  Title", "─".repeat(62).dark_grey());
+    eprintln!();
+    eprintln!("    {}", desc.title.clone().bold());
+    eprintln!();
+
+    if !desc.summary.is_empty() {
+        eprintln!("  {}  Summary", "─".repeat(62).dark_grey());
+        eprintln!();
+        for item in &desc.summary {
+            eprintln!("    {}  {}", "·".cyan(), item);
+        }
+        eprintln!();
+    }
+
+    if !desc.test_plan.is_empty() {
+        eprintln!("  {}  Test plan", "─".repeat(62).dark_grey());
+        eprintln!();
+        for item in &desc.test_plan {
+            eprintln!("    {}  {}", "☐".dark_grey(), item);
+        }
+        eprintln!();
+    }
+
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!(
+        "  {}  Copy the above to your PR description.",
+        "·".dark_grey()
+    );
+    eprintln!();
+}
+
+// ─── Commit message runner ────────────────────────────────────────────────────
+
+async fn run_commit(
+    diff: &str,
+    model_dir: &Path,
+    model_id: &str,
+    device: &str,
+    apply: bool,
+) -> Result<()> {
+    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Model files not found. Run `diffmind download` first."
+        ));
+    }
+
+    eprintln!();
+    eprintln!("  diffmind  commit message");
+    eprintln!("  {}", "─".repeat(52));
+    eprintln!(
+        "  {:<10} {} file{}",
+        "Staged",
+        count_diff_files(diff),
+        if count_diff_files(diff) == 1 { "" } else { "s" }
+    );
+    eprintln!();
+
+    let spinner = make_spinner("Loading model...");
+    let model_bytes = std::fs::read(&model_path)?;
+    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
+
+    let device_pref = parse_device(device);
+    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.set_message("Generating commit message...");
+
+    let suggestion = analyzer
+        .generate_commit_message(diff, 512)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    spinner.finish_and_clear();
+
+    print_commit_suggestion(&suggestion);
+
+    if apply {
+        run_git_commit(&suggestion)?;
+    }
+
+    Ok(())
+}
+
+fn print_commit_suggestion(s: &CommitSuggestion) {
+    use crossterm::style::Stylize;
+
+    eprintln!();
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!();
+    eprintln!("  {}", s.message.clone().bold());
+    if !s.body.trim().is_empty() {
+        eprintln!();
+        for line in s.body.lines() {
+            eprintln!("  {}", line.dark_grey());
+        }
+    }
+    eprintln!();
+    eprintln!("  {}", "─".repeat(62).dark_grey());
+    eprintln!(
+        "  {}  Run:  git commit -m \"{}\"",
+        "·".dark_grey(),
+        s.message
+    );
+    eprintln!("  {}  Or:   diffmind commit --apply", "·".dark_grey());
+    eprintln!();
+}
+
+fn run_git_commit(s: &CommitSuggestion) -> Result<()> {
+    use crossterm::style::Stylize;
+    use std::process::Command;
+
+    let mut cmd = Command::new("git");
+    cmd.args(["commit", "-m", &s.message]);
+    if !s.body.trim().is_empty() {
+        cmd.args(["-m", s.body.trim()]);
+    }
+
+    eprintln!("  {}  Running git commit...", "·".dark_grey());
+    let status = cmd.status()?;
+    if status.success() {
+        eprintln!("  {}  Committed.", "✓".green().bold());
+    } else {
+        return Err(anyhow::anyhow!("git commit failed"));
+    }
+    Ok(())
 }
 
 // ─── Coloured finding renderer ────────────────────────────────────────────────
@@ -421,61 +676,55 @@ fn wrap_text(text: &str, indent: usize, width: usize) -> String {
     lines.join("\n")
 }
 
-fn print_finding(f: &ReviewFinding, idx: usize, total: usize) {
+/// Build a fully-formatted, ANSI-coloured string for one finding.
+/// `counter` is a short label shown on the header row, e.g. `"#1"` or `"2/5"`.
+fn format_finding(f: &ReviewFinding, counter: &str) -> String {
     let sev = severity_color(f);
     let icon = category_icon(f);
     let cat = format!("{:?}", f.category).to_lowercase();
     let loc = format!("{}:{}", f.file, f.line).dark_grey();
-    let counter = format!("[{}/{}]", idx, total).dark_grey();
+    let counter_label = format!("[{}]", counter).dark_grey();
+
+    let mut out = String::new();
 
     // ── Header row ──
-    println!(
-        "  {}  {}  {}  {} {}",
+    out.push_str(&format!(
+        "\n  {}  {}  {}  {} {}\n",
         sev,
         icon,
         cat.dark_grey(),
         loc,
-        counter
-    );
+        counter_label
+    ));
 
     // ── Separator ──
-    println!("  {}", "─".repeat(62).dark_grey());
+    out.push_str(&format!("  {}\n", "─".repeat(62).dark_grey()));
 
     // ── Issue ──
-    println!(
-        "  {}  {}",
+    let issue_wrapped = wrap_text(&f.issue, 10, 68);
+    let mut issue_lines = issue_wrapped.lines();
+    out.push_str(&format!(
+        "  {}  {}\n",
         "Issue".red().bold(),
-        wrap_text(&f.issue, 10, 68).trim_start()
-    );
-    if f.issue.len() > 58 {
-        println!(
-            "{}",
-            wrap_text(&f.issue, 10, 68)
-                .lines()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        issue_lines.next().unwrap_or("").trim_start()
+    ));
+    for line in issue_lines {
+        out.push_str(&format!("{}\n", line));
     }
 
     // ── Fix ──
-    println!(
-        "  {}    {}",
+    let fix_wrapped = wrap_text(&f.suggested_fix, 10, 68);
+    let mut fix_lines = fix_wrapped.lines();
+    out.push_str(&format!(
+        "  {}    {}\n",
         "Fix".green().bold(),
-        wrap_text(&f.suggested_fix, 10, 68).trim_start()
-    );
-    if f.suggested_fix.len() > 58 {
-        println!(
-            "{}",
-            wrap_text(&f.suggested_fix, 10, 68)
-                .lines()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        fix_lines.next().unwrap_or("").trim_start()
+    ));
+    for line in fix_lines {
+        out.push_str(&format!("{}\n", line));
     }
 
-    println!();
+    out
 }
 
 fn print_summary(count: usize, skipped: usize) {

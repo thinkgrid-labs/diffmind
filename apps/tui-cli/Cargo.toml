@@ -1,6 +1,6 @@
 [package]
 name = "diffmind"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 description = "Local-first AI code review agent — powered by on-device inference"
 
@@ -25,3 +25,4 @@ walkdir = { workspace = true }
 chrono = { workspace = true }
 lazy_static = { workspace = true }
 sysinfo = { workspace = true }
+toml = { workspace = true }

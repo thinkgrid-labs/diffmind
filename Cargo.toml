@@ -26,6 +26,7 @@ walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 lazy_static = "1"
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+toml = "0.8"
 
 
 # Release profile: Optimize for maximum execution speed.

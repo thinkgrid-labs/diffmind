@@ -72,6 +72,60 @@ pub struct ReviewSummary {
     pub suggestions: Vec<String>,
 }
 
+/// A single user-defined rule loaded from `.diffmind/rules.toml`.
+/// Matched against every added line in the diff before the AI model runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRule {
+    /// Regex pattern matched against added lines (`+` lines) in the diff.
+    pub pattern: String,
+    /// Human-readable description shown as the finding's issue text.
+    pub message: String,
+    /// Severity: `"high"`, `"medium"`, or `"low"`. Defaults to `"medium"`.
+    #[serde(default = "default_rule_severity")]
+    pub severity: String,
+    /// Category: `"security"`, `"quality"`, `"performance"`, `"maintainability"`.
+    /// Defaults to `"quality"`.
+    #[serde(default = "default_rule_category")]
+    pub category: String,
+    /// Optional file glob filters (e.g. `["*.ts", "*.tsx"]`).
+    /// When empty the rule applies to every file in the diff.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+fn default_rule_severity() -> String {
+    "medium".into()
+}
+fn default_rule_category() -> String {
+    "quality".into()
+}
+
+/// Output of `generate_pr_description` — ready to paste into GitHub / GitLab.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PrDescription {
+    /// Imperative title under 72 characters.
+    #[serde(default)]
+    pub title: String,
+    /// Two to four bullet points summarising what changed and why.
+    #[serde(default)]
+    pub summary: Vec<String>,
+    /// Checklist of steps a reviewer should take to verify the change.
+    #[serde(default)]
+    pub test_plan: Vec<String>,
+}
+
+/// Output of `generate_commit_message` — conventional commit format.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommitSuggestion {
+    /// Single-line conventional commit message (under 72 chars).
+    #[serde(default)]
+    pub message: String,
+    /// Optional multi-line body explaining *why* the change was made.
+    /// Empty string when a one-liner is sufficient.
+    #[serde(default)]
+    pub body: String,
+}
+
 // ─── ReviewAnalyzer ──────────────────────────────────────────────────────────
 
 pub struct ReviewAnalyzer {
@@ -86,6 +140,8 @@ pub struct ReviewAnalyzer {
     requirements: Option<String>,
     /// When true, print the raw model output and token counts to stderr for each chunk.
     debug: bool,
+    /// User-defined rules loaded from `.diffmind/rules.toml`.
+    custom_rules: Vec<CustomRule>,
 }
 
 /// Hard upper bound on total tokens (prompt + generated) fed to the model.
@@ -173,6 +229,7 @@ impl ReviewAnalyzer {
             languages: None,
             requirements: None,
             debug: false,
+            custom_rules: Vec::new(),
         })
     }
 
@@ -208,27 +265,47 @@ impl ReviewAnalyzer {
         self
     }
 
+    /// Load team-defined rules from `.diffmind/rules.toml`.
+    /// Rules are matched against added lines in the diff before the AI model runs —
+    /// zero inference cost, instant results.
+    pub fn with_custom_rules(mut self, rules: Vec<CustomRule>) -> Self {
+        self.custom_rules = rules;
+        self
+    }
+
     /// Like [`analyze_diff_chunked`] but calls `on_progress(done, total)` after
     /// each chunk completes so callers can display a live progress indicator.
     ///
     /// Returns `(summary, skipped)` where `skipped` is the number of chunks
     /// the model processed but returned unparseable JSON for — useful for
     /// surfacing silent failures to the user.
-    pub fn analyze_diff_chunked_with_progress<F>(
+    /// Like [`analyze_diff_chunked`] but fires two callbacks as work progresses:
+    /// - `on_progress(done, total)` — called when a chunk starts (for spinner label updates)
+    /// - `on_chunk_result(findings)` — called immediately with each chunk's findings as
+    ///   they complete, enabling streaming output before the full diff is processed
+    pub fn analyze_diff_chunked_with_progress<F, G>(
         &mut self,
         diff: &str,
         context: &str,
         max_tokens_per_chunk: u32,
         on_progress: F,
+        on_chunk_result: G,
     ) -> Result<(ReviewSummary, usize), EngineError>
     where
         F: Fn(usize, usize),
+        G: Fn(&[ReviewFinding]),
     {
         // Run deterministic rules first — catches patterns the model reliably misses.
         let det_findings: Vec<ReviewFinding> = detect_commented_out_code(diff)
             .into_iter()
             .chain(detect_removed_used_variables(diff))
+            .chain(detect_custom_rule_violations(diff, &self.custom_rules))
             .collect();
+
+        // Stream deterministic findings immediately — no need to wait for the LLM.
+        if !det_findings.is_empty() {
+            on_chunk_result(&det_findings);
+        }
 
         const MAX_CHUNK_LINES: usize = 300;
         let chunks = chunk_diff(diff, MAX_CHUNK_LINES);
@@ -249,6 +326,10 @@ impl ReviewAnalyzer {
             on_progress(done, total);
             match self.analyze_diff_internal(&chunk, context, max_tokens_per_chunk as usize) {
                 Ok(summary) => {
+                    // Stream this chunk's findings immediately.
+                    if !summary.findings.is_empty() {
+                        on_chunk_result(&summary.findings);
+                    }
                     all_findings.extend(summary.findings);
                     all_positives.extend(summary.positives);
                     all_suggestions.extend(summary.suggestions);
@@ -281,8 +362,14 @@ impl ReviewAnalyzer {
         context: &str,
         max_tokens_per_chunk: u32,
     ) -> Result<ReviewSummary, EngineError> {
-        self.analyze_diff_chunked_with_progress(diff, context, max_tokens_per_chunk, |_, _| {})
-            .map(|(summary, _)| summary)
+        self.analyze_diff_chunked_with_progress(
+            diff,
+            context,
+            max_tokens_per_chunk,
+            |_, _| {},
+            |_| {},
+        )
+        .map(|(summary, _)| summary)
     }
 
     fn analyze_diff_internal(
@@ -498,6 +585,115 @@ impl ReviewAnalyzer {
         }
 
         Ok(generated_text)
+    }
+
+    // ── PR description ────────────────────────────────────────────────────────
+
+    /// Generate a structured PR title, summary, and test plan from a diff.
+    /// The diff is truncated if it exceeds the context budget.
+    pub fn generate_pr_description(
+        &mut self,
+        diff: &str,
+        ticket: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<PrDescription, EngineError> {
+        // ~10 KB ≈ 2 500 tokens — leaves room for the prompt and output.
+        const MAX_DIFF_BYTES: usize = 10_000;
+        let diff = truncate_to_char_boundary(diff, MAX_DIFF_BYTES);
+
+        let ticket_section = match ticket {
+            Some(t) => format!(
+                "\n\nTicket / user story:\n{}",
+                truncate_to_char_boundary(t, 1500)
+            ),
+            None => String::new(),
+        };
+
+        let prompt = format!(
+            "<|im_start|>system\n\
+             You are a senior software engineer writing a GitHub pull request description.\n\
+             Given a git diff, produce a concise and informative PR description.\n\n\
+             Return a JSON object ONLY with this structure:\n\
+             {{\"title\": \"imperative title under 72 chars\", \
+             \"summary\": [\"what changed and why — one sentence per bullet\"], \
+             \"test_plan\": [\"how to verify each change\"]}}\n\n\
+             Rules:\n\
+             - title: imperative mood, under 72 chars, no period (e.g. \"Add JWT token refresh\")\n\
+             - summary: 2–4 bullets, each one sentence, focus on what and why\n\
+             - test_plan: 2–4 actionable steps a reviewer can follow to verify the change\
+             <|im_end|>\n\
+             <|im_start|>user\n\
+             Diff:{}\n{}\
+             <|im_end|>\n\
+             <|im_start|>assistant\n",
+            diff, ticket_section
+        );
+
+        let response = self.generate(&prompt, max_new_tokens)?;
+
+        if let Some(start) = response.find('{')
+            && let Some(end) = response.rfind('}')
+            && end > start
+        {
+            let slice = &response[start..=end];
+            if let Ok(desc) = serde_json::from_str::<PrDescription>(slice) {
+                return Ok(desc);
+            }
+        }
+
+        Err(EngineError::SerializationError(
+            "model did not return a valid PR description JSON object".into(),
+        ))
+    }
+
+    // ── Commit message ────────────────────────────────────────────────────────
+
+    /// Suggest a conventional commit message for a staged diff.
+    pub fn generate_commit_message(
+        &mut self,
+        diff: &str,
+        max_new_tokens: usize,
+    ) -> Result<CommitSuggestion, EngineError> {
+        const MAX_DIFF_BYTES: usize = 10_000;
+        let diff = truncate_to_char_boundary(diff, MAX_DIFF_BYTES);
+
+        let prompt = format!(
+            "<|im_start|>system\n\
+             You are a senior software engineer writing a git commit message.\n\
+             Given a staged diff, produce a conventional commit message.\n\n\
+             Conventional commit format: <type>(<optional scope>): <short description>\n\
+             Types: feat, fix, docs, style, refactor, test, chore, perf\n\n\
+             Return a JSON object ONLY:\n\
+             {{\"message\": \"feat(scope): short description\", \
+             \"body\": \"optional multi-line body explaining WHY (empty string if a one-liner is enough)\"}}\n\n\
+             Rules:\n\
+             - message must be under 72 characters\n\
+             - Use imperative mood (\"add\" not \"added\", \"fix\" not \"fixed\")\n\
+             - scope is optional — use it when it meaningfully narrows the context\n\
+             - body explains motivation and context, not what the diff shows\
+             <|im_end|>\n\
+             <|im_start|>user\n\
+             Staged diff:\n{}\
+             <|im_end|>\n\
+             <|im_start|>assistant\n",
+            diff
+        );
+
+        let response = self.generate(&prompt, max_new_tokens)?;
+
+        if let Some(start) = response.find('{')
+            && let Some(end) = response.rfind('}')
+            && end > start
+        {
+            let slice = &response[start..=end];
+            if let Ok(msg) = serde_json::from_str::<CommitSuggestion>(slice) {
+                return Ok(msg);
+            }
+        }
+
+        Err(EngineError::SerializationError(
+            "model did not return a valid commit message JSON object".into(),
+        ))
     }
 }
 
@@ -874,6 +1070,104 @@ fn contains_identifier(text: &str, name: &str) -> bool {
         start = abs + 1;
     }
     false
+}
+
+// ─── Deterministic rule: user-defined patterns from .diffmind/rules.toml ─────
+
+fn parse_severity_str(s: &str) -> Severity {
+    match s.to_lowercase().as_str() {
+        "high" => Severity::High,
+        "medium" | "med" => Severity::Medium,
+        _ => Severity::Low,
+    }
+}
+
+fn parse_category_str(s: &str) -> Category {
+    match s.to_lowercase().as_str() {
+        "security" => Category::Security,
+        "performance" => Category::Performance,
+        "maintainability" => Category::Maintainability,
+        "compliance" => Category::Compliance,
+        _ => Category::Quality,
+    }
+}
+
+/// Returns true when `file_path` matches the simple glob `pattern`.
+/// Supported: `*` (any), `*.ext` (extension), exact filename, path suffix.
+fn file_matches_glob(file_path: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        return file_path.ends_with(&format!(".{ext}"));
+    }
+    file_path == pattern || file_path.ends_with(&format!("/{pattern}"))
+}
+
+/// Run user-defined rules from `.diffmind/rules.toml` against all added lines
+/// in the diff. Returns one finding per matched line per rule.
+fn detect_custom_rule_violations(diff: &str, rules: &[CustomRule]) -> Vec<ReviewFinding> {
+    use regex::Regex;
+
+    if rules.is_empty() {
+        return vec![];
+    }
+
+    // Pre-compile patterns; silently skip rules with invalid regex.
+    let compiled: Vec<(usize, Regex)> = rules
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| Regex::new(&r.pattern).ok().map(|re| (i, re)))
+        .collect();
+
+    let mut findings = Vec::new();
+    let mut current_file = String::new();
+    let mut line_num: u32 = 1;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(b_path) = line.split(" b/").nth(1) {
+                current_file = b_path.trim().to_string();
+            }
+        } else if line.starts_with("@@ ")
+            && let Some(new_part) = line.split('+').nth(1)
+            && let Some(num_str) = new_part.split([',', ' ']).next()
+        {
+            line_num = num_str.parse().unwrap_or(1);
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            let content = &line[1..];
+            for (idx, re) in &compiled {
+                let rule = &rules[*idx];
+                // Apply file filter if present.
+                if !rule.files.is_empty()
+                    && !rule
+                        .files
+                        .iter()
+                        .any(|g| file_matches_glob(&current_file, g))
+                {
+                    continue;
+                }
+                if re.is_match(content) {
+                    findings.push(ReviewFinding {
+                        file: current_file.clone(),
+                        line: line_num,
+                        severity: parse_severity_str(&rule.severity),
+                        category: parse_category_str(&rule.category),
+                        issue: rule.message.clone(),
+                        suggested_fix: String::new(),
+                        confidence: Some(1.0),
+                    });
+                }
+            }
+            line_num += 1;
+        } else if line.starts_with(' ') {
+            // Context line — exists in both old and new file.
+            line_num += 1;
+        }
+        // '-' removed lines do not increment the new-file line counter.
+    }
+
+    findings
 }
 
 #[cfg(test)]
