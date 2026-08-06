@@ -18,8 +18,15 @@ npm/platform/*/bin/
 # Model cache (never commit the GGUF file)
 *.gguf
 *.gguf.part
+*.receipt.json
 models/
-.diffmind/
+
+# .diffmind holds both generated state and files a team is meant to commit,
+# so ignore it selectively rather than wholesale. config.toml, rules.toml and
+# baseline.json are project configuration and belong in version control.
+.diffmind/symbols.json
+.diffmind/cache/
+.diffmind/daemon.json
 
 # Environment
 .env

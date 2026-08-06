@@ -1,0 +1,43 @@
+# Consumed by https://pre-commit.com — a user adds diffmind to their
+# .pre-commit-config.yaml and the framework handles installation and staging.
+#
+#   repos:
+#     - repo: https://github.com/thinkgrid-labs/diffmind
+#       rev: v0.8.0
+#       hooks:
+#         - id: diffmind
+#
+# `language: system` because the binary is installed out-of-band (install.sh,
+# npm, or cargo) — pre-commit cannot build a Rust binary itself.
+- id: diffmind
+  name: diffmind (AI code review)
+  description: Review staged changes locally. Blocks on high-severity findings.
+  entry: diffmind --staged --min-severity high --fail-on high
+  language: system
+  # diffmind reads the staged diff from git itself, so pre-commit must not
+  # append the changed filenames to the command.
+  pass_filenames: false
+  # One review of the whole staged set, not one per file.
+  always_run: true
+  stages: [pre-commit]
+
+- id: diffmind-rules-only
+  name: diffmind (deterministic rules only)
+  description: >-
+    Regex rules from .diffmind/rules.toml plus the built-in detectors.
+    Still loads the model, but --max-tokens 1 keeps generation negligible —
+    use this when you want instant, fully deterministic feedback.
+  entry: diffmind --staged --max-tokens 1 --triage off --min-severity medium --fail-on medium
+  language: system
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+
+- id: diffmind-push
+  name: diffmind (AI code review, pre-push)
+  description: Review the whole branch before pushing.
+  entry: diffmind --min-severity high --fail-on high
+  language: system
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]

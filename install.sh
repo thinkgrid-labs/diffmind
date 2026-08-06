@@ -69,6 +69,40 @@ if ! curl -fSL --progress-bar "$URL" -o "$TMP/$ARCHIVE"; then
   exit 1
 fi
 
+# ── Verify checksum ──────────────────────────────────────────────────────────
+#
+# Every release publishes checksums.txt alongside the archives. Downloading it
+# and never checking it provided no protection at all against a corrupted
+# transfer or a tampered mirror.
+
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  SHA_CMD=""
+fi
+
+if [ -n "$SHA_CMD" ] && curl -fsSL "${BASE_URL}/checksums.txt" -o "$TMP/checksums.txt" 2>/dev/null; then
+  EXPECTED=$(awk -v f="$ARCHIVE" '$2 == f || $2 == "*"f {print $1}' "$TMP/checksums.txt" | head -n1)
+  if [ -n "$EXPECTED" ]; then
+    ACTUAL=$($SHA_CMD "$TMP/$ARCHIVE" | awk '{print $1}')
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+      echo "" >&2
+      echo "error: checksum mismatch for $ARCHIVE" >&2
+      echo "  expected  $EXPECTED" >&2
+      echo "  actual    $ACTUAL" >&2
+      echo "  The download is corrupt or has been tampered with. Not installing." >&2
+      exit 1
+    fi
+    echo "  Verified  sha256 ok"
+  else
+    echo "  Warning: no checksum listed for $ARCHIVE; skipping verification" >&2
+  fi
+elif [ -z "$SHA_CMD" ]; then
+  echo "  Warning: no sha256 tool found; skipping checksum verification" >&2
+fi
+
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
 if [ ! -f "$TMP/$BIN" ]; then

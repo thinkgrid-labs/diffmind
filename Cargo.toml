@@ -13,7 +13,6 @@ candle-core = { version = "0.10.2" }
 candle-nn = { version = "0.10.2" }
 candle-transformers = { version = "0.10.2" }
 tokenizers = { version = "0.21.0", default-features = false, features = ["fancy-regex"] }
-rand = "0.10.1"
 ratatui = "0.30"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
@@ -27,6 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 lazy_static = "1"
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 toml = "0.8"
+memmap2 = "0.9"
+sha2 = "0.10"
 
 
 # Release profile: Optimize for maximum execution speed.
