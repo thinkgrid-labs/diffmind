@@ -215,11 +215,21 @@ jobs:
           chmod +x npm/platform/linux-x64/bin/diffmind
           npm/platform/linux-x64/bin/diffmind --version
 
+      # Every path below MUST start with "./".
+      #
+      # `npm publish <arg>` resolves its argument as a package spec, and a bare
+      # two-segment path like `npm/cli` matches the GitHub shorthand
+      # `github:npm/cli` — the npm CLI's own repository. npm then fetches, packs
+      # and tries to publish *that*, producing a baffling
+      # `403 Forbidden - PUT https://registry.npmjs.org/npm`. A leading "./"
+      # forces the folder interpretation.
+      #
       # Platform packages first: @diffmind/cli depends on them, and publishing
       # it first would briefly resolve to nothing.
       - name: Publish platform packages
         run: |
-          for dir in npm/platform/*/; do
+          set -euo pipefail
+          for dir in ./npm/platform/*/; do
             echo "publishing ${dir}"
             npm publish "${dir}" --provenance --access public
           done
@@ -227,6 +237,47 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @diffmind/cli
-        run: npm publish npm/cli --provenance --access public
+        run: npm publish ./npm/cli --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # A publish that fails partway leaves @diffmind/cli depending on platform
+      # packages that do not exist — `npm i -g @diffmind/cli` then installs a
+      # launcher with no binary to launch. That went unnoticed for several
+      # releases, so assert the whole set is really on the registry.
+      - name: Verify all six packages published
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGES="@diffmind/cli"
+          for dir in ./npm/platform/*/; do
+            PACKAGES="${PACKAGES} @diffmind/cli-$(basename "${dir}")"
+          done
+
+          MISSING=""
+          for pkg in ${PACKAGES}; do
+            # The registry is read-through-cached, so a fresh publish can take a
+            # moment to become visible.
+            FOUND=""
+            for attempt in 1 2 3 4 5; do
+              if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+                FOUND="yes"
+                break
+              fi
+              sleep 10
+            done
+            if [ -n "${FOUND}" ]; then
+              echo "  ok       ${pkg}@${VERSION}"
+            else
+              echo "  MISSING  ${pkg}@${VERSION}"
+              MISSING="${MISSING} ${pkg}"
+            fi
+          done
+
+          if [ -n "${MISSING}" ]; then
+            echo "::error::not published:${MISSING}"
+            exit 1
+          fi
+          echo "All packages published at ${VERSION}."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
