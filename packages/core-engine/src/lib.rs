@@ -12,6 +12,8 @@ pub enum EngineError {
     GgufError(String),
     #[error("failed to load model weights: {0}")]
     ModelLoadError(String),
+    #[error("{0}")]
+    DeviceUnavailable(String),
     #[error("tensor error: {0}")]
     TensorError(#[from] candle_core::Error),
     #[error("forward pass error: {0}")]
@@ -203,13 +205,13 @@ fn metal_device() -> Result<Device, EngineError> {
         } else {
             "Metal is only available on macOS. Use --device cpu."
         };
-        return Err(EngineError::ModelLoadError(reason.into()));
+        return Err(EngineError::DeviceUnavailable(reason.into()));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         return Device::new_metal(0)
-            .map_err(|e| EngineError::ModelLoadError(format!("Metal unavailable: {e}")));
+            .map_err(|e| EngineError::DeviceUnavailable(format!("Metal unavailable: {e}")));
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -236,7 +238,9 @@ pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
                     }
                 }
             } else if cfg!(target_os = "macos") {
-                eprintln!("  Device     CPU  (Intel Mac — Metal needs Apple Silicon, using Accelerate BLAS)");
+                eprintln!(
+                    "  Device     CPU  (Intel Mac — Metal needs Apple Silicon, using Accelerate BLAS)"
+                );
             } else {
                 eprintln!("  Device     CPU");
             }
@@ -1227,9 +1231,15 @@ mod tests {
     fn auto_device_is_cpu_unless_metal_is_supported() {
         let dev = resolve_device(&DevicePreference::Auto).expect("auto must always resolve");
         if METAL_SUPPORTED {
-            assert!(dev.is_metal() || dev.is_cpu(), "auto fell back to something unexpected");
+            assert!(
+                dev.is_metal() || dev.is_cpu(),
+                "auto fell back to something unexpected"
+            );
         } else {
-            assert!(dev.is_cpu(), "auto selected a non-CPU device on a build without Metal support");
+            assert!(
+                dev.is_cpu(),
+                "auto selected a non-CPU device on a build without Metal support"
+            );
         }
     }
 

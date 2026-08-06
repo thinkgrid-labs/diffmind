@@ -875,20 +875,20 @@ where
                     };
                     app_lock.state.select(Some(i));
                 }
-                KeyCode::Char('a') => {
-                    if !app_lock.analyzing {
-                        app_lock.analyzing = true;
-                        app_lock.status = "Analyzing...".to_string();
-                        let app_clone = Arc::clone(&app);
-                        tokio::spawn(async move {
-                            let app_err = Arc::clone(&app_clone);
-                            if let Err(e) = background_analysis(app_clone).await {
-                                let mut app = app_err.lock().await;
-                                app.status = format!("Error: {}", e);
-                                app.analyzing = false;
-                            }
-                        });
-                    }
+                // Guard rather than an inner `if`: pressing 'a' while a run is
+                // already in flight falls through to the catch-all and is ignored.
+                KeyCode::Char('a') if !app_lock.analyzing => {
+                    app_lock.analyzing = true;
+                    app_lock.status = "Analyzing...".to_string();
+                    let app_clone = Arc::clone(&app);
+                    tokio::spawn(async move {
+                        let app_err = Arc::clone(&app_clone);
+                        if let Err(e) = background_analysis(app_clone).await {
+                            let mut app = app_err.lock().await;
+                            app.status = format!("Error: {}", e);
+                            app.analyzing = false;
+                        }
+                    });
                 }
                 _ => {}
             }
