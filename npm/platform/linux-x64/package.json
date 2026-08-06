@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli-linux-x64",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "diffmind prebuilt binary for linux-x64 (x86_64-unknown-linux-gnu)",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
   "license": "MIT",

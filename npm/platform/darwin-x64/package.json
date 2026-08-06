@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli-darwin-x64",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "diffmind prebuilt binary for darwin-x64 (x86_64-apple-darwin)",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
   "license": "MIT",
