@@ -1,0 +1,29 @@
+{
+  "name": "@diffmind/cli-linux-arm64",
+  "version": "0.7.0",
+  "description": "diffmind prebuilt binary for linux-arm64 (aarch64-unknown-linux-gnu)",
+  "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
+  "license": "MIT",
+  "homepage": "https://github.com/thinkgrid-labs/diffmind#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkgrid-labs/diffmind.git",
+    "directory": "npm/platform/linux-arm64"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/diffmind"
+  ],
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
