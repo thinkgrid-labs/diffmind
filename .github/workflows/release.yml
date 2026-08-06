@@ -170,7 +170,7 @@ jobs:
 
             **Build from source**
             ```bash
-            cargo install diffmind
+            cargo install --git https://github.com/thinkgrid-labs/diffmind diffmind
             ```
 
             ## SHA-256 checksums

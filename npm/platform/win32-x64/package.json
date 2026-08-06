@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli-win32-x64",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "diffmind prebuilt binary for win32-x64 (x86_64-pc-windows-msvc)",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
   "license": "MIT",

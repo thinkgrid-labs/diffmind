@@ -62,8 +62,10 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
+      # `--lib` skipped the `diffmind` binary crate entirely, so none of the
+      # CLI's tests ever ran in CI. --all-targets covers lib, bin and tests.
       - name: cargo test
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --all-targets
 
   # ─── Build check (all platforms) ───────────────────────────────────────────
   build:

@@ -1,6 +1,6 @@
 [package]
 name = "core-engine"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 description = "Diffmind shared AI engine core"
 
@@ -13,8 +13,14 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = "2.0.18"
 log = "0.4"
-rand = { workspace = true }
 regex = { workspace = true }
+# Memory-mapping the GGUF halves peak RSS: reading it into a Vec kept the whole
+# quantized model on the heap while candle copied tensors out of it.
+memmap2 = { workspace = true }
+# Finding fingerprints (baselines) and cache keys.
+sha2 = { workspace = true }
+# Remote backends (Ollama / OpenAI-compatible).
+reqwest = { workspace = true }
 
 # On macOS, enable Metal (Apple Silicon GPU) and Accelerate (CPU BLAS).
 # Cargo merges features — these are additive on top of the workspace dep.

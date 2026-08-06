@@ -1,0 +1,196 @@
+# Composite action so a consumer's workflow is three lines instead of the
+# five hand-assembled steps the README used to ask people to copy.
+name: "diffmind code review"
+description: "Local-first AI code review. No API keys, no data leaves the runner."
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  version:
+    description: "diffmind release tag to install, or 'latest'."
+    required: false
+    default: "latest"
+  model:
+    description: "Model size: 0.5b, 1.5b, 3b, 7b, 14b, 32b."
+    required: false
+    default: "1.5b"
+  base:
+    description: "Base ref to diff against. Defaults to the PR's base branch."
+    required: false
+    default: ""
+  min-severity:
+    description: "Minimum severity to report: low, medium, high."
+    required: false
+    default: "low"
+  fail-on:
+    description: "Severity that fails the job. Set to 'none' to never fail."
+    required: false
+    default: "high"
+  format:
+    description: "text, json, sarif, or markdown."
+    required: false
+    default: "sarif"
+  output:
+    description: "File to write the report to."
+    required: false
+    default: "diffmind.sarif"
+  upload-sarif:
+    description: "Upload SARIF to GitHub Code Scanning for inline PR annotations."
+    required: false
+    default: "true"
+  comment:
+    description: "Post the review as a PR comment (requires format markdown)."
+    required: false
+    default: "false"
+  ticket:
+    description: "Acceptance criteria to check the diff against (path or text)."
+    required: false
+    default: ""
+  args:
+    description: "Extra flags passed through to diffmind."
+    required: false
+    default: ""
+
+outputs:
+  findings:
+    description: "Number of findings reported."
+    value: ${{ steps.review.outputs.findings }}
+  report:
+    description: "Path to the written report."
+    value: ${{ steps.review.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # The model is ~1.1 GB; without this every run re-downloads it from
+    # HuggingFace and takes minutes.
+    - name: Cache diffmind model
+      uses: actions/cache@v4
+      with:
+        path: ~/.diffmind/models
+        key: diffmind-model-${{ runner.os }}-${{ inputs.model }}
+
+    - name: Install diffmind
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
+        else
+          curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/download/${{ inputs.version }}/install.sh \
+            | VERSION="${{ inputs.version }}" bash
+        fi
+        diffmind --version
+
+    - name: Download model
+      shell: bash
+      run: diffmind download --model "${{ inputs.model }}"
+
+    - name: Run review
+      id: review
+      shell: bash
+      env:
+        DIFFMIND_TICKET: ${{ inputs.ticket }}
+      run: |
+        set -uo pipefail
+
+        BASE="${{ inputs.base }}"
+        if [ -z "$BASE" ]; then
+          BASE="${GITHUB_BASE_REF:-}"
+        fi
+
+        ARGS=(
+          --model "${{ inputs.model }}"
+          --min-severity "${{ inputs.min-severity }}"
+          --format "${{ inputs.format }}"
+          --output "${{ inputs.output }}"
+        )
+
+        # 'none' means report everything but never fail the job.
+        if [ "${{ inputs.fail-on }}" != "none" ]; then
+          ARGS+=(--fail-on "${{ inputs.fail-on }}")
+        fi
+        if [ -n "${DIFFMIND_TICKET}" ]; then
+          ARGS+=(--ticket "${DIFFMIND_TICKET}")
+        fi
+        # shellcheck disable=SC2206
+        EXTRA=(${{ inputs.args }})
+
+        if [ -n "$BASE" ]; then
+          # actions/checkout defaults to a shallow clone with no base branch.
+          git fetch --no-tags --depth=50 origin "$BASE" || true
+          git diff "origin/$BASE...HEAD" | diffmind --stdin "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
+        else
+          diffmind "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
+        fi
+        STATUS=$?
+
+        echo "report=${{ inputs.output }}" >> "$GITHUB_OUTPUT"
+
+        COUNT=0
+        if [ -f "${{ inputs.output }}" ] && [ "${{ inputs.format }}" = "sarif" ]; then
+          COUNT=$(python3 -c "import json,sys; print(len(json.load(open('${{ inputs.output }}'))['runs'][0]['results']))" 2>/dev/null || echo 0)
+        fi
+        echo "findings=${COUNT}" >> "$GITHUB_OUTPUT"
+
+        # Exit 2 is a diffmind failure; exit 1 is "found blocking issues".
+        # Only the latter should be reported as a review failure.
+        if [ "$STATUS" -eq 2 ]; then
+          echo "::error::diffmind failed to run"
+          exit 2
+        fi
+        echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+        exit "$STATUS"
+
+    # `always()` so a failing gate still publishes the annotations that explain
+    # why it failed.
+    - name: Upload SARIF
+      if: always() && inputs.upload-sarif == 'true' && inputs.format == 'sarif'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.output }}
+        category: diffmind
+
+    - name: Job summary
+      if: always() && inputs.format == 'markdown'
+      shell: bash
+      run: cat "${{ inputs.output }}" >> "$GITHUB_STEP_SUMMARY" || true
+
+    - name: Comment on PR
+      if: always() && inputs.comment == 'true' && inputs.format == 'markdown' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = '${{ inputs.output }}';
+          if (!fs.existsSync(path)) return;
+          const body = fs.readFileSync(path, 'utf8');
+          const marker = '<!-- diffmind-review -->';
+
+          // Update the existing comment instead of adding one per push.
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const existing = comments.find(
+            (c) => c.user.type === 'Bot' && c.body.includes(marker)
+          );
+
+          const payload = `${marker}\n${body}`;
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: payload,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: payload,
+            });
+          }

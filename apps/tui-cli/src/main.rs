@@ -1,184 +1,331 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use core_engine::{
-    CommitSuggestion, DevicePreference, PrDescription, ReviewAnalyzer, ReviewFinding, Severity,
+    AnalysisStats, Baseline, CommitSuggestion, CustomRule, PrDescription, ReviewAnalyzer,
+    ReviewBackend, ReviewCache, ReviewFinding, ReviewSummary, Severity,
 };
+use crossterm::style::Stylize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     collections::HashSet,
-    io,
+    io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
-use tokio::sync::Mutex;
 
 mod cli;
+mod config;
+mod daemon;
 mod download;
 mod git;
+mod hooks;
 mod indexer;
+mod output;
 mod rag;
 mod rules;
+mod settings;
+mod tui;
 
+use crate::cli::OutputFormat;
 use crate::indexer::Indexer;
+use crate::settings::{BackendChoice, Settings};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = cli::parse();
+/// Exit codes. Distinguishing "found problems" from "could not run" is what
+/// lets a CI job tell a real review failure apart from a crashed binary — both
+/// used to be exit 1.
+const EXIT_FINDINGS: i32 = 1;
+const EXIT_ERROR: i32 = 2;
 
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| anyhow::anyhow!("Could not find home directory"))?;
-    let model_dir = PathBuf::from(home).join(".diffmind").join("models");
-    let project_root = std::env::current_dir()?;
-
-    // 1. Handle subcommands
-    if let Some(command) = args.command {
-        match command {
-            cli::Commands::Download { model, force } => {
-                download::ensure_model_files(model.as_deref(), &model_dir, force)?;
-                return Ok(());
-            }
-            cli::Commands::Index => {
-                let mut indexer = Indexer::new(project_root.clone());
-                let existing = Indexer::load(&project_root);
-                let new_index = indexer.build_index(existing)?;
-                indexer.save(&new_index)?;
-                println!("Index updated: {} symbols found", new_index.symbols.len());
-                return Ok(());
-            }
-            cli::Commands::Describe {
-                branch,
-                last,
-                stdin,
-                ticket,
-                model,
-                device,
-            } => {
-                let diff = if stdin {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    io::stdin().read_to_string(&mut buf).ok();
-                    buf
-                } else if last {
-                    git::get_last_commit_diff(&[])?
-                } else {
-                    git::get_diff(&branch, &[])?
-                };
-                if diff.trim().is_empty() {
-                    println!("No changes detected. Nothing to describe.");
-                    return Ok(());
-                }
-                let ticket_text = resolve_ticket(ticket.as_deref());
-                run_describe(&diff, &model_dir, ticket_text.as_deref(), &model, &device).await?;
-                return Ok(());
-            }
-            cli::Commands::Commit {
-                model,
-                device,
-                apply,
-            } => {
-                let diff = git::get_staged_diff()?;
-                run_commit(&diff, &model_dir, &model, &device, apply).await?;
-                return Ok(());
-            }
+fn main() {
+    let code = match run() {
+        Ok(exit) => exit,
+        Err(e) => {
+            eprintln!("\n  {}  {e:#}\n", "error".red().bold());
+            EXIT_ERROR
         }
-    }
-
-    // 2. Capture diff
-    let diff = if args.stdin {
-        use std::io::Read;
-        let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer).ok();
-        buffer
-    } else if args.last {
-        git::get_last_commit_diff(&args.files)?
-    } else {
-        git::get_diff(&args.branch, &args.files)?
     };
+    std::process::exit(code);
+}
 
-    if diff.trim().is_empty() {
-        println!("No changes detected. Nothing to analyze.");
-        return Ok(());
-    }
+fn home_dir() -> Result<PathBuf> {
+    std::env::var("DIFFMIND_HOME")
+        .or_else(|_| std::env::var("HOME"))
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map_err(|_| anyhow::anyhow!("could not determine home directory; set DIFFMIND_HOME"))
+}
 
-    // 3. Resolve ticket / user story content (file path or inline text)
-    let ticket = resolve_ticket(args.ticket.as_deref());
+fn run() -> Result<i32> {
+    let mut args = cli::parse();
 
-    // 4. Load custom rules (zero cost — runs before the model)
-    let custom_rules = rules::load_custom_rules(&project_root);
+    let home = home_dir()?;
+    let model_dir = home.join(".diffmind").join("models");
+    // Anchor project files at the repository root so running from a
+    // subdirectory still finds `.diffmind/`.
+    let project_root = git::repo_root().unwrap_or(std::env::current_dir()?);
+    let file_config = config::FileConfig::load(&project_root);
 
-    // 5. Launch UI (TUI or static)
-    if args.tui {
-        run_tui(diff, model_dir, project_root, args.model.clone(), ticket).await?;
-    } else {
-        let min_sev = parse_severity(&args.min_severity);
-        let has_findings = run_static(
-            &diff,
+    if let Some(command) = args.command.take() {
+        return run_command(
+            command,
+            &args,
+            &home,
             &model_dir,
             &project_root,
-            &args,
-            min_sev,
-            ticket,
-            custom_rules,
-        )
-        .await?;
+            &file_config,
+        );
+    }
 
-        // Non-zero exit if any findings at or above --min-severity (CI gate).
-        if has_findings {
-            std::process::exit(1);
+    let settings = settings::resolve_settings(&args, &file_config)?;
+    let diff = capture_diff(&args, &settings)?;
+
+    if diff.trim().is_empty() {
+        // Not an error: a clean branch is a passing review.
+        if !settings.format.is_machine_readable() {
+            eprintln!("\n  No changes detected. Nothing to analyze.\n");
+        } else {
+            emit(
+                &settings,
+                &ReviewSummary::default(),
+                &AnalysisStats::default(),
+                "none",
+            )?;
+        }
+        return Ok(0);
+    }
+
+    if args.tui {
+        tui::run(
+            diff,
+            model_dir,
+            project_root,
+            settings,
+            resolve_ticket(args.ticket.as_deref()),
+        )?;
+        return Ok(0);
+    }
+
+    review(&args, &settings, &diff, &home, &model_dir, &project_root)
+}
+
+fn run_command(
+    command: cli::Commands,
+    args: &cli::Cli,
+    home: &Path,
+    model_dir: &Path,
+    project_root: &Path,
+    file_config: &config::FileConfig,
+) -> Result<i32> {
+    match command {
+        cli::Commands::Download {
+            model,
+            force,
+            verify,
+        } => {
+            if verify {
+                let id = model.unwrap_or_else(|| settings::DEFAULT_MODEL.to_string());
+                return Ok(if download::verify_model_files(&id, model_dir)? {
+                    0
+                } else {
+                    EXIT_ERROR
+                });
+            }
+            download::ensure_model_files(model.as_deref(), model_dir, force)?;
+            Ok(0)
+        }
+
+        cli::Commands::Index { rebuild } => {
+            let mut indexer = Indexer::new(project_root.to_path_buf())?;
+            let existing = if rebuild {
+                None
+            } else {
+                Indexer::load(project_root)
+            };
+            let index = indexer.build_index(existing)?;
+            indexer.save(&index)?;
+            println!(
+                "Index updated: {} symbols across {} files",
+                index.symbol_count(),
+                index.file_mtimes.len()
+            );
+            Ok(0)
+        }
+
+        cli::Commands::Describe {
+            branch,
+            last,
+            stdin,
+            ticket,
+            model,
+            device,
+        } => {
+            let mut merged = clone_args_for_subcommand(args, model, device);
+            merged.branch = branch;
+            merged.last = last;
+            merged.stdin = stdin;
+            let settings = settings::resolve_settings(&merged, file_config)?;
+
+            let diff = capture_diff(&merged, &settings)?;
+            if diff.trim().is_empty() {
+                println!("No changes detected. Nothing to describe.");
+                return Ok(0);
+            }
+            let ticket_text = resolve_ticket(ticket.as_deref());
+            run_describe(&diff, model_dir, ticket_text.as_deref(), &settings)?;
+            Ok(0)
+        }
+
+        cli::Commands::Commit {
+            model,
+            device,
+            apply,
+        } => {
+            let merged = clone_args_for_subcommand(args, model, device);
+            let settings = settings::resolve_settings(&merged, file_config)?;
+            let diff = git::get_staged_diff(&[])?;
+            run_commit(&diff, model_dir, &settings, apply)?;
+            Ok(0)
+        }
+
+        cli::Commands::Baseline { action } => {
+            run_baseline(action, args, file_config, model_dir, project_root, home)
+        }
+
+        cli::Commands::InstallHooks {
+            hook,
+            min_severity,
+            force,
+        } => {
+            let git_dir = git::git_dir()
+                .context("not inside a git repository — run this from your project")?;
+            hooks::install(&git_dir, &hook, &min_severity, force)?;
+            Ok(0)
+        }
+
+        cli::Commands::Serve {
+            idle_timeout,
+            port,
+            model,
+            device,
+            stop,
+            status,
+        } => {
+            let merged = clone_args_for_subcommand(args, model, device);
+            let settings = settings::resolve_settings(&merged, file_config)?;
+            run_serve(
+                idle_timeout,
+                port,
+                stop,
+                status,
+                &settings,
+                home,
+                model_dir,
+                project_root,
+            )
+        }
+
+        cli::Commands::Cache { action } => {
+            let base = project_root.join(".diffmind");
+            match action {
+                cli::CacheAction::Clear => {
+                    if let Some(cache) = ReviewCache::open(&base) {
+                        cache.clear()?;
+                        println!("Cache cleared.");
+                    }
+                    Ok(0)
+                }
+                cli::CacheAction::Show => {
+                    let dir = base.join("cache");
+                    let (count, bytes) = cache_stats(&dir);
+                    println!("  Location  {}", dir.display());
+                    println!("  Entries   {count}");
+                    println!("  Size      {:.1} MB", bytes as f64 / 1_048_576.0);
+                    Ok(0)
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
-// ─── Device helpers ──────────────────────────────────────────────────────────
-
-fn parse_device(s: &str) -> DevicePreference {
-    match s.to_lowercase().as_str() {
-        "metal" => DevicePreference::Metal,
-        "cpu" => DevicePreference::Cpu,
-        _ => DevicePreference::Auto,
+/// Subcommands accept their own `--model`/`--device`; fold them into a copy of
+/// the top-level args so settings resolution stays in one place.
+fn clone_args_for_subcommand(
+    args: &cli::Cli,
+    model: Option<String>,
+    device: Option<String>,
+) -> cli::Cli {
+    cli::Cli {
+        command: None,
+        model: model.or_else(|| args.model.clone()),
+        device: device.or_else(|| args.device.clone()),
+        backend: args.backend.clone(),
+        backend_url: args.backend_url.clone(),
+        backend_model: args.backend_model.clone(),
+        backend_api_key_env: args.backend_api_key_env.clone(),
+        backend_context: args.backend_context,
+        backend_timeout: args.backend_timeout,
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        seed: args.seed,
+        debug: args.debug,
+        no_cache: args.no_cache,
+        no_daemon: args.no_daemon,
+        ..Default::default()
     }
 }
 
-// ─── Severity helpers ────────────────────────────────────────────────────────
+fn cache_stats(dir: &Path) -> (usize, u64) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    read.flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .fold((0, 0), |(c, b), m| (c + 1, b + m.len()))
+}
 
-fn parse_severity(s: &str) -> Severity {
-    match s.to_lowercase().as_str() {
-        "high" => Severity::High,
-        "medium" => Severity::Medium,
-        _ => Severity::Low,
+// ─── Diff capture ────────────────────────────────────────────────────────────
+
+fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
+    if args.stdin {
+        let mut buffer = String::new();
+        io::stdin()
+            .read_to_string(&mut buffer)
+            .context("could not read the diff from stdin")?;
+        return Ok(buffer);
     }
-}
 
-/// Returns true if `finding` meets or exceeds `threshold`.
-/// Ordering: High > Medium > Low.
-fn severity_rank(s: &Severity) -> u8 {
-    match s {
-        Severity::High => 2,
-        Severity::Medium => 1,
-        Severity::Low => 0,
+    if !git::is_repo() {
+        anyhow::bail!(
+            "not inside a git repository. Run diffmind from your project, or pipe a diff:\n\
+             \x20 git diff main...HEAD | diffmind --stdin"
+        );
     }
-}
 
-fn meets_threshold(finding: &Severity, threshold: &Severity) -> bool {
-    severity_rank(finding) >= severity_rank(threshold)
-}
+    if args.staged {
+        return git::get_staged_diff(&args.files);
+    }
+    if args.last {
+        return git::get_last_commit_diff(&args.files);
+    }
 
-// ─── Ticket / requirements resolver ─────────────────────────────────────────
+    // Nobody said which branch — ask git rather than assuming `main`.
+    let branch = settings.branch.clone().unwrap_or_else(git::default_branch);
+    git::get_diff(&branch, &args.files)
+}
 
 /// Accepts either a file path or inline text.
-/// - If the value is a path that exists on disk → read and return its contents.
-/// - Otherwise treat the value itself as the requirements text.
 fn resolve_ticket(input: Option<&str>) -> Option<String> {
     let raw = input?;
-    let path = std::path::Path::new(raw);
-    if path.exists() {
+    let path = Path::new(raw);
+    if path.is_file() {
         match std::fs::read_to_string(path) {
             Ok(content) => Some(content),
             Err(e) => {
-                eprintln!("Warning: could not read ticket file '{}': {}", raw, e);
+                eprintln!("  !  could not read ticket file '{raw}': {e}");
                 None
             }
         }
@@ -187,41 +334,34 @@ fn resolve_ticket(input: Option<&str>) -> Option<String> {
     }
 }
 
-// ─── Language detection ──────────────────────────────────────────────────────
-
 /// Extracts language names from a git diff by inspecting file extensions in
-/// `diff --git` header lines. Used to build a language-aware system prompt.
+/// `diff --git` header lines, so the prompt can name the right idioms.
 fn detect_languages(diff: &str) -> Vec<String> {
     let mut langs: HashSet<String> = HashSet::new();
 
-    for line in diff.lines() {
-        if !line.starts_with("diff --git") {
-            continue;
-        }
-        // The rightmost '.' gives the extension (appears twice in the header;
-        // rsplit ensures we grab the real extension and not a path component).
-        if let Some(ext) = line.rsplit('.').next() {
-            // Strip any trailing whitespace that could follow the filename.
-            let ext = ext.split_whitespace().next().unwrap_or("");
-            let lang = match ext {
-                "rs" => Some("Rust"),
-                "ts" | "tsx" => Some("TypeScript"),
-                "js" | "jsx" | "mjs" | "cjs" => Some("JavaScript"),
-                "py" => Some("Python"),
-                "go" => Some("Go"),
-                "java" => Some("Java"),
-                "kt" | "kts" => Some("Kotlin"),
-                "swift" => Some("Swift"),
-                "rb" => Some("Ruby"),
-                "cs" => Some("C#"),
-                "cpp" | "cc" | "cxx" => Some("C++"),
-                "c" | "h" => Some("C"),
-                "php" => Some("PHP"),
-                _ => None,
-            };
-            if let Some(l) = lang {
-                langs.insert(l.to_string());
-            }
+    for file in core_engine::parse_diff(diff) {
+        let ext = file.path.rsplit('.').next().unwrap_or("");
+        let lang = match ext {
+            "rs" => Some("Rust"),
+            "ts" | "tsx" => Some("TypeScript"),
+            "js" | "jsx" | "mjs" | "cjs" => Some("JavaScript"),
+            "py" => Some("Python"),
+            "go" => Some("Go"),
+            "java" => Some("Java"),
+            "kt" | "kts" => Some("Kotlin"),
+            "swift" => Some("Swift"),
+            "rb" => Some("Ruby"),
+            "cs" => Some("C#"),
+            "cpp" | "cc" | "cxx" | "hpp" => Some("C++"),
+            "c" | "h" => Some("C"),
+            "php" => Some("PHP"),
+            "scala" => Some("Scala"),
+            "ex" | "exs" => Some("Elixir"),
+            "sql" => Some("SQL"),
+            _ => None,
+        };
+        if let Some(l) = lang {
+            langs.insert(l.to_string());
         }
     }
 
@@ -230,269 +370,447 @@ fn detect_languages(diff: &str) -> Vec<String> {
     result
 }
 
-// ─── Static (non-TUI) runner ─────────────────────────────────────────────────
+// ─── Backend construction ────────────────────────────────────────────────────
 
-fn count_diff_files(diff: &str) -> usize {
-    diff.lines().filter(|l| l.starts_with("diff --git")).count()
+pub fn build_backend(choice: &BackendChoice, model_dir: &Path) -> Result<Box<dyn ReviewBackend>> {
+    match choice {
+        BackendChoice::Local { model, device, .. } => {
+            let info = download::find_model(model)
+                .ok_or_else(|| anyhow::anyhow!("unknown model '{model}'"))?;
+            let model_path = model_dir.join(info.gguf_filename);
+            let tokenizer_path = model_dir.join("tokenizer.json");
+
+            if !model_path.exists() || !tokenizer_path.exists() {
+                anyhow::bail!(
+                    "model files not found. Run `diffmind download --model {model}` first."
+                );
+            }
+            // Catch a truncated download here, where the fix is obvious, rather
+            // than letting candle fail with an opaque GGUF parse error.
+            if download::looks_truncated(model_dir, info.gguf_filename) {
+                anyhow::bail!(
+                    "{} is incomplete (a previous download was interrupted).\n\
+                     Re-download with: diffmind download --model {model} --force",
+                    info.gguf_filename
+                );
+            }
+
+            let backend =
+                core_engine::CandleBackend::from_path(&model_path, &tokenizer_path, device.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(Box::new(backend))
+        }
+
+        BackendChoice::Remote {
+            protocol,
+            url,
+            model,
+            api_key,
+            context_tokens,
+            timeout,
+        } => {
+            let backend = core_engine::RemoteBackend::new(
+                *protocol,
+                url,
+                model,
+                api_key.clone(),
+                *context_tokens,
+                *timeout,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(Box::new(backend))
+        }
+    }
 }
 
-fn make_spinner(msg: &str) -> ProgressBar {
+/// Assemble a fully-configured analyzer. Shared by the CLI, the TUI and the daemon.
+pub fn build_analyzer(
+    backend: Box<dyn ReviewBackend>,
+    settings: &Settings,
+    project_root: &Path,
+    diff: &str,
+    ticket: Option<String>,
+    custom_rules: Vec<CustomRule>,
+    baseline: Option<Baseline>,
+) -> ReviewAnalyzer {
+    let mut analyzer = ReviewAnalyzer::new(backend)
+        .with_languages(detect_languages(diff))
+        .with_custom_rules(custom_rules)
+        .with_baseline(baseline)
+        .with_triage(settings.triage)
+        .with_min_confidence(settings.min_confidence)
+        .with_sampling(settings.temperature, settings.seed)
+        .with_debug(settings.debug);
+
+    if settings.use_cache {
+        analyzer = analyzer.with_cache(ReviewCache::open(&project_root.join(".diffmind")));
+    }
+    if let Some(req) = ticket {
+        analyzer = analyzer.with_requirements(req);
+    }
+    analyzer
+}
+
+/// Symbol context for the prompt, when an index exists.
+pub fn build_context(project_root: &Path, diff: &str, budget: usize) -> String {
+    Indexer::load(project_root)
+        .and_then(|index| rag::build_context(diff, &index, budget))
+        .unwrap_or_default()
+}
+
+fn load_baseline(project_root: &Path, enabled: bool) -> Option<Baseline> {
+    if !enabled {
+        return None;
+    }
+    let path = project_root.join(".diffmind").join("baseline.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    match Baseline::parse(&raw) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("  !  could not parse .diffmind/baseline.json: {e}");
+            None
+        }
+    }
+}
+
+// ─── Review ──────────────────────────────────────────────────────────────────
+
+fn make_spinner(msg: &str, quiet: bool) -> ProgressBar {
+    // Machine-readable output goes to stdout; a spinner on stderr is fine, but
+    // a non-TTY (CI log, pipe) should not collect thousands of tick frames.
+    if quiet || !io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
             .template("  {spinner:.cyan}  {msg}")
-            .unwrap(),
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(Duration::from_millis(80));
     pb
 }
 
-/// Returns `true` if any findings at or above `min_severity` were found,
-/// which causes `main` to exit with code 1 (CI gate).
-async fn run_static(
+fn review(
+    args: &cli::Cli,
+    settings: &Settings,
     diff: &str,
+    home: &Path,
     model_dir: &Path,
     project_root: &Path,
-    args: &cli::Cli,
-    min_severity: Severity,
-    ticket: Option<String>,
-    custom_rules: Vec<core_engine::CustomRule>,
-) -> Result<bool> {
-    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", args.model));
-    let tokenizer_path = model_dir.join("tokenizer.json");
+) -> Result<i32> {
+    let ticket = resolve_ticket(args.ticket.as_deref());
+    let custom_rules = rules::load_custom_rules(project_root);
+    let baseline = load_baseline(project_root, settings.use_baseline);
+    let is_text = settings.format == OutputFormat::Text;
 
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Model files not found. Run `diffmind download` first."
-        ));
+    print_header(
+        args,
+        settings,
+        diff,
+        ticket.as_deref(),
+        custom_rules.len(),
+        is_text,
+    );
+
+    let spinner = make_spinner("Loading model...", !is_text);
+
+    // Prefer a resident daemon: it has already paid the model-load cost.
+    let (model_id, device_id) = settings.backend.identity();
+    let daemon_client = if settings.use_daemon && settings.backend.is_local() {
+        daemon::Client::connect(home, &model_id, &device_id)
+    } else {
+        None
+    };
+
+    let (summary, stats, backend_label) = if let Some(client) = daemon_client {
+        spinner.set_message(format!("Analyzing via {}...", client.describe()));
+        let context = build_context(project_root, diff, 8000);
+        let response = client
+            .review(daemon::ReviewRequest {
+                diff: diff.to_string(),
+                context,
+                languages: detect_languages(diff),
+                requirements: ticket.clone(),
+                max_tokens: settings.max_tokens,
+                min_confidence: settings.min_confidence,
+                triage: format!("{:?}", settings.triage).to_lowercase(),
+                rules: custom_rules.clone(),
+                baseline: baseline
+                    .as_ref()
+                    .and_then(|b| serde_json::to_string(b).ok()),
+                use_cache: settings.use_cache,
+                project_root: project_root.to_string_lossy().to_string(),
+            })
+            .context("the daemon failed; retry with --no-daemon to run in-process")?;
+        spinner.finish_and_clear();
+        (response.summary, response.stats.into(), response.backend)
+    } else {
+        let backend = build_backend(&settings.backend, model_dir)?;
+        let backend_label = backend.describe();
+
+        let context = build_context(project_root, diff, 8000);
+        let mut analyzer = build_analyzer(
+            backend,
+            settings,
+            project_root,
+            diff,
+            ticket.clone(),
+            custom_rules.clone(),
+            baseline,
+        );
+
+        spinner.set_message("Analyzing diff...");
+        let (summary, stats) =
+            run_with_progress(&mut analyzer, diff, &context, settings, &spinner)?;
+        spinner.finish_and_clear();
+        (summary, stats, backend_label)
+    };
+
+    // Report at --min-severity; gate at --fail-on.
+    let shown: Vec<&ReviewFinding> = summary
+        .findings
+        .iter()
+        .filter(|f| f.severity >= settings.min_severity)
+        .collect();
+    let gated = shown
+        .iter()
+        .filter(|f| f.severity >= settings.fail_on)
+        .count();
+
+    let filtered = ReviewSummary {
+        findings: shown.iter().map(|f| (*f).clone()).collect(),
+        positives: summary.positives.clone(),
+        suggestions: summary.suggestions.clone(),
+    };
+
+    if is_text {
+        output::print_positives_and_suggestions(&filtered.positives, &filtered.suggestions);
+        output::print_footer(shown.len(), gated, &stats);
+    }
+    emit(settings, &filtered, &stats, &backend_label)?;
+
+    Ok(if gated > 0 { EXIT_FINDINGS } else { 0 })
+}
+
+/// Drive the analyzer with a live spinner and streamed findings.
+fn run_with_progress(
+    analyzer: &mut ReviewAnalyzer,
+    diff: &str,
+    context: &str,
+    settings: &Settings,
+    spinner: &ProgressBar,
+) -> Result<(ReviewSummary, AnalysisStats)> {
+    // The model blocks the calling thread, so a background ticker keeps the
+    // elapsed time honest during a long single-chunk inference.
+    let label = Arc::new(std::sync::Mutex::new(String::from("chunk 1/1")));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (label, done, pb) = (label.clone(), done.clone(), spinner.clone());
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                let secs = start.elapsed().as_secs();
+                let elapsed = if secs < 60 {
+                    format!("{secs}s")
+                } else {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                };
+                let current = label.lock().map(|l| l.clone()).unwrap_or_default();
+                pb.set_message(format!("Analyzing {current}  ({elapsed} elapsed)"));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
     }
 
-    // ── Header ────────────────────────────────────────────────────────────────
+    let is_text = settings.format == OutputFormat::Text;
+    let min_severity = settings.min_severity;
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let progress_label = label.clone();
+    let stream_pb = spinner.clone();
+    let stream_counter = counter.clone();
+
+    let result = analyzer.analyze(
+        diff,
+        context,
+        settings.max_tokens,
+        move |chunk, total| {
+            if let Ok(mut l) = progress_label.lock() {
+                *l = format!("chunk {chunk}/{total}");
+            }
+        },
+        move |findings| {
+            if !is_text {
+                return;
+            }
+            for f in findings.iter().filter(|f| f.severity >= min_severity) {
+                let n = stream_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let rendered = output::format_finding(f, &format!("#{n}"));
+                if stream_pb.is_hidden() {
+                    // A hidden bar swallows `println`, so in CI (no TTY) the
+                    // findings would never be shown at all.
+                    eprintln!("{rendered}");
+                } else {
+                    // Draws above the live spinner without disturbing it.
+                    stream_pb.println(rendered);
+                }
+            }
+        },
+    );
+
+    done.store(true, Ordering::Relaxed);
+    result.map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn print_header(
+    args: &cli::Cli,
+    settings: &Settings,
+    diff: &str,
+    ticket: Option<&str>,
+    rule_count: usize,
+    is_text: bool,
+) {
+    if !is_text {
+        return;
+    }
+
+    let files = core_engine::parse_diff(diff);
     let langs = detect_languages(diff);
-    let model_label = download::find_model(&args.model)
-        .map(|m| format!("{} · Q4_K_M · {:.1} GB", m.name, m.size_gb))
-        .unwrap_or_else(|| format!("Qwen2.5-Coder-{} · Q4_K_M", args.model));
-    let stack_label = if langs.is_empty() {
-        "unknown".to_string()
-    } else {
-        langs.join(", ")
+
+    let model_label = match &settings.backend {
+        BackendChoice::Local { model, .. } => download::find_model(model)
+            .map(|m| format!("{} · Q4_K_M · {:.1} GB", m.name, m.size_gb))
+            .unwrap_or_else(|| model.clone()),
+        BackendChoice::Remote {
+            protocol,
+            model,
+            url,
+            ..
+        } => {
+            format!("{model} · {} ({url})", protocol.as_str())
+        }
     };
-    let file_count = count_diff_files(diff);
-    let branch_label = if args.stdin {
+
+    let source = if args.stdin {
         "(stdin)".to_string()
+    } else if args.staged {
+        "staged changes".to_string()
     } else if args.last {
-        "HEAD~1..HEAD  (last commit)".to_string()
+        "last commit".to_string()
     } else {
+        let base = settings.branch.clone().unwrap_or_else(git::default_branch);
         match git::current_branch() {
-            Some(current) if current != args.branch => format!("{} → {}", current, args.branch),
-            _ => args.branch.clone(),
+            Some(current) if current != base => format!("{current} → {base}"),
+            _ => base,
         }
     };
 
     eprintln!();
     eprintln!("  diffmind  code review");
     eprintln!("  {}", "─".repeat(52));
-    eprintln!("  {:<10} {}", "Model", model_label);
-    eprintln!("  {:<10} {}", "Branch", branch_label);
+    eprintln!("  {:<10} {model_label}", "Model");
+    eprintln!("  {:<10} {source}", "Source");
     eprintln!(
         "  {:<10} {} file{}",
         "Changed",
-        file_count,
-        if file_count == 1 { "" } else { "s" }
+        files.len(),
+        if files.len() == 1 { "" } else { "s" }
     );
-    eprintln!("  {:<10} {}", "Stack", stack_label);
-    if let Some(ref t) = ticket {
+    eprintln!(
+        "  {:<10} {}",
+        "Stack",
+        if langs.is_empty() {
+            "unknown".to_string()
+        } else {
+            langs.join(", ")
+        }
+    );
+    if rule_count > 0 {
+        eprintln!("  {:<10} {rule_count} custom", "Rules");
+    }
+    eprintln!(
+        "  {:<10} report ≥{}, fail ≥{}",
+        "Gate",
+        settings.min_severity.as_str(),
+        settings.fail_on.as_str()
+    );
+    if let Some(t) = ticket {
         let preview: String = t.chars().take(60).collect();
         eprintln!(
-            "  {:<10} {}{}",
+            "  {:<10} {preview}{}",
             "Ticket",
-            preview,
-            if t.len() > 60 { "..." } else { "" }
+            if t.chars().count() > 60 { "..." } else { "" }
         );
     }
     eprintln!();
-
-    // ── Load model weights ────────────────────────────────────────────────────
-    let spinner = make_spinner("Loading model into memory...");
-    let model_bytes = std::fs::read(&model_path)?;
-    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
-
-    // ── RAG context ───────────────────────────────────────────────────────────
-    let index = Indexer::load(project_root);
-    let mut context = String::new();
-    if let Some(idx) = index
-        && let Some(rag_text) = rag::get_rag_context(diff, &idx)
-    {
-        context = rag_text;
-    }
-
-    // ── Build analyzer ────────────────────────────────────────────────────────
-    let device_pref = parse_device(&args.device);
-    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .with_languages(langs)
-        .with_custom_rules(custom_rules)
-        .with_debug(args.debug);
-
-    if let Some(req) = ticket {
-        analyzer = analyzer.with_requirements(req);
-    }
-
-    // ── Run inference with live elapsed timer + per-chunk progress ────────────
-    spinner.set_message("Analyzing diff...");
-
-    // Background thread ticks elapsed seconds so the spinner stays alive even
-    // during long single-chunk inference (model blocks the main thread).
-    let timer_pb = spinner.clone();
-    let timer_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let timer_done_clone = timer_done.clone();
-    let chunk_label = std::sync::Arc::new(std::sync::Mutex::new(String::from("chunk 1/1")));
-    let chunk_label_clone = chunk_label.clone();
-    std::thread::spawn(move || {
-        let start = std::time::Instant::now();
-        while !timer_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let secs = start.elapsed().as_secs();
-            let elapsed = if secs < 60 {
-                format!("{}s", secs)
-            } else {
-                format!("{}m {}s", secs / 60, secs % 60)
-            };
-            let label = chunk_label_clone.lock().unwrap().clone();
-            timer_pb.set_message(format!("Analyzing {}  ({} elapsed)", label, elapsed));
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    });
-
-    // ── Streaming: print findings as each chunk completes (text mode only) ──────
-    // indicatif's .println() draws above the spinner without disturbing it.
-    let pb_progress = spinner.clone();
-    let pb_stream = spinner.clone();
-    let stream_min_sev = min_severity.clone();
-    let stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let stream_count_clone = stream_count.clone();
-    let is_text = matches!(args.format, cli::OutputFormat::Text);
-
-    let (summary, skipped) = analyzer
-        .analyze_diff_chunked_with_progress(
-            diff,
-            &context,
-            args.max_tokens,
-            move |done, total| {
-                *chunk_label.lock().unwrap() = format!("chunk {}/{}", done, total);
-                pb_progress.set_message(format!("Analyzing chunk {}/{}...", done, total));
-            },
-            move |chunk_findings| {
-                if !is_text {
-                    return;
-                }
-                for f in chunk_findings {
-                    if meets_threshold(&f.severity, &stream_min_sev) {
-                        let n = stream_count_clone
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        pb_stream.println(format_finding(f, &format!("#{}", n)));
-                    }
-                }
-            },
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    timer_done.store(true, std::sync::atomic::Ordering::Relaxed);
-    spinner.finish_and_clear();
-
-    // ── Warn about chunks the model failed to parse ───────────────────────────
-    if skipped > 0 {
-        eprintln!(
-            "  !  {} chunk{} returned unparseable output (model may need more tokens or a larger variant).",
-            skipped,
-            if skipped == 1 { "" } else { "s" }
-        );
-    }
-
-    // ── Filter findings to threshold ──────────────────────────────────────────
-    let findings: Vec<&ReviewFinding> = summary
-        .findings
-        .iter()
-        .filter(|f| meets_threshold(&f.severity, &min_severity))
-        .collect();
-
-    match args.format {
-        cli::OutputFormat::Json => {
-            // Emit the full summary as JSON — pipe-friendly for CI dashboards
-            let out = serde_json::json!({
-                "findings": findings,
-                "positives": summary.positives,
-                "suggestions": summary.suggestions,
-            });
-            let json =
-                serde_json::to_string_pretty(&out).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            println!("{}", json);
-        }
-        cli::OutputFormat::Text => {
-            // Findings were already streamed above — just print the footer.
-            if findings.is_empty() {
-                if skipped > 0 {
-                    eprintln!(
-                        "  ?  No parseable findings — try `--model 3b` for better output quality."
-                    );
-                } else {
-                    eprintln!("  {}  No issues found.", "✓".green().bold());
-                }
-            } else {
-                print_summary(findings.len(), skipped);
-            }
-            print_positives_and_suggestions(&summary.positives, &summary.suggestions);
-        }
-    }
-
-    Ok(!findings.is_empty())
 }
 
-// ─── PR description runner ───────────────────────────────────────────────────
+/// Write machine-readable output to `--output` or stdout.
+fn emit(
+    settings: &Settings,
+    summary: &ReviewSummary,
+    stats: &AnalysisStats,
+    model: &str,
+) -> Result<()> {
+    if settings.format == OutputFormat::Text && settings.output_path.is_none() {
+        return Ok(());
+    }
 
-async fn run_describe(
+    let rendered = if settings.format == OutputFormat::Text {
+        // `--output report.md` with the default format still deserves a
+        // readable document rather than an empty file.
+        output::render(OutputFormat::Markdown, summary, stats, model)
+    } else {
+        output::render(settings.format, summary, stats, model)
+    };
+
+    match &settings.output_path {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &rendered).with_context(|| format!("could not write {path}"))?;
+            eprintln!("  Report written to {path}");
+        }
+        None => println!("{rendered}"),
+    }
+    Ok(())
+}
+
+// ─── PR description ──────────────────────────────────────────────────────────
+
+fn run_describe(
     diff: &str,
     model_dir: &Path,
     ticket: Option<&str>,
-    model_id: &str,
-    device: &str,
+    settings: &Settings,
 ) -> Result<()> {
-    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Model files not found. Run `diffmind download` first."
-        ));
-    }
-
     eprintln!();
     eprintln!("  diffmind  PR description");
     eprintln!("  {}", "─".repeat(52));
+    let files = core_engine::parse_diff(diff).len();
     eprintln!(
-        "  {:<10} {} file{}",
+        "  {:<10} {files} file{}",
         "Changed",
-        count_diff_files(diff),
-        if count_diff_files(diff) == 1 { "" } else { "s" }
+        if files == 1 { "" } else { "s" }
     );
     eprintln!();
 
-    let spinner = make_spinner("Loading model...");
-    let model_bytes = std::fs::read(&model_path)?;
-    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
-
-    let device_pref = parse_device(device);
-    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let spinner = make_spinner("Loading model...", false);
+    let backend = build_backend(&settings.backend, model_dir)?;
+    let mut analyzer = ReviewAnalyzer::new(backend)
+        .with_sampling(settings.temperature, settings.seed)
+        .with_debug(settings.debug);
 
     spinner.set_message("Generating PR description...");
-
     let desc = analyzer
         .generate_pr_description(diff, ticket, 768)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     spinner.finish_and_clear();
 
     print_pr_description(&desc);
@@ -500,8 +818,6 @@ async fn run_describe(
 }
 
 fn print_pr_description(desc: &PrDescription) {
-    use crossterm::style::Stylize;
-
     eprintln!();
     eprintln!("  {}  Title", "─".repeat(62).dark_grey());
     eprintln!();
@@ -512,7 +828,7 @@ fn print_pr_description(desc: &PrDescription) {
         eprintln!("  {}  Summary", "─".repeat(62).dark_grey());
         eprintln!();
         for item in &desc.summary {
-            eprintln!("    {}  {}", "·".cyan(), item);
+            eprintln!("    {}  {item}", "·".cyan());
         }
         eprintln!();
     }
@@ -521,7 +837,7 @@ fn print_pr_description(desc: &PrDescription) {
         eprintln!("  {}  Test plan", "─".repeat(62).dark_grey());
         eprintln!();
         for item in &desc.test_plan {
-            eprintln!("    {}  {}", "☐".dark_grey(), item);
+            eprintln!("    {}  {item}", "☐".dark_grey());
         }
         eprintln!();
     }
@@ -534,63 +850,40 @@ fn print_pr_description(desc: &PrDescription) {
     eprintln!();
 }
 
-// ─── Commit message runner ────────────────────────────────────────────────────
+// ─── Commit message ──────────────────────────────────────────────────────────
 
-async fn run_commit(
-    diff: &str,
-    model_dir: &Path,
-    model_id: &str,
-    device: &str,
-    apply: bool,
-) -> Result<()> {
-    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Model files not found. Run `diffmind download` first."
-        ));
-    }
-
+fn run_commit(diff: &str, model_dir: &Path, settings: &Settings, apply: bool) -> Result<()> {
     eprintln!();
     eprintln!("  diffmind  commit message");
     eprintln!("  {}", "─".repeat(52));
+    let files = core_engine::parse_diff(diff).len();
     eprintln!(
-        "  {:<10} {} file{}",
+        "  {:<10} {files} file{}",
         "Staged",
-        count_diff_files(diff),
-        if count_diff_files(diff) == 1 { "" } else { "s" }
+        if files == 1 { "" } else { "s" }
     );
     eprintln!();
 
-    let spinner = make_spinner("Loading model...");
-    let model_bytes = std::fs::read(&model_path)?;
-    let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
-
-    let device_pref = parse_device(device);
-    let mut analyzer = ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, device_pref)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let spinner = make_spinner("Loading model...", false);
+    let backend = build_backend(&settings.backend, model_dir)?;
+    let mut analyzer = ReviewAnalyzer::new(backend)
+        .with_sampling(settings.temperature, settings.seed)
+        .with_debug(settings.debug);
 
     spinner.set_message("Generating commit message...");
-
     let suggestion = analyzer
         .generate_commit_message(diff, 512)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     spinner.finish_and_clear();
 
     print_commit_suggestion(&suggestion);
-
     if apply {
         run_git_commit(&suggestion)?;
     }
-
     Ok(())
 }
 
 fn print_commit_suggestion(s: &CommitSuggestion) {
-    use crossterm::style::Stylize;
-
     eprintln!();
     eprintln!("  {}", "─".repeat(62).dark_grey());
     eprintln!();
@@ -613,7 +906,6 @@ fn print_commit_suggestion(s: &CommitSuggestion) {
 }
 
 fn run_git_commit(s: &CommitSuggestion) -> Result<()> {
-    use crossterm::style::Stylize;
     use std::process::Command;
 
     let mut cmd = Command::new("git");
@@ -624,424 +916,248 @@ fn run_git_commit(s: &CommitSuggestion) -> Result<()> {
 
     eprintln!("  {}  Running git commit...", "·".dark_grey());
     let status = cmd.status()?;
-    if status.success() {
-        eprintln!("  {}  Committed.", "✓".green().bold());
-    } else {
-        return Err(anyhow::anyhow!("git commit failed"));
+    if !status.success() {
+        anyhow::bail!("git commit failed");
     }
+    eprintln!("  {}  Committed.", "✓".green().bold());
     Ok(())
 }
 
-// ─── Coloured finding renderer ────────────────────────────────────────────────
+// ─── Baseline ────────────────────────────────────────────────────────────────
 
-use core_engine::Category;
-use crossterm::style::Stylize;
+fn run_baseline(
+    action: cli::BaselineAction,
+    args: &cli::Cli,
+    file_config: &config::FileConfig,
+    model_dir: &Path,
+    project_root: &Path,
+    _home: &Path,
+) -> Result<i32> {
+    let path = project_root.join(".diffmind").join("baseline.json");
 
-fn severity_color(f: &ReviewFinding) -> String {
-    match f.severity {
-        Severity::High => format!("{}", " HIGH ".on_red().white().bold()),
-        Severity::Medium => format!("{}", " MED  ".on_dark_yellow().white().bold()),
-        Severity::Low => format!("{}", " LOW  ".on_dark_cyan().white().bold()),
-    }
-}
+    match action {
+        cli::BaselineAction::Show => {
+            let Some(baseline) = load_baseline(project_root, true) else {
+                println!("No baseline at {}", path.display());
+                return Ok(0);
+            };
+            println!(
+                "  {} accepted finding(s), recorded {}",
+                baseline.len(),
+                baseline.generated_at
+            );
+            for entry in &baseline.entries {
+                println!("  {}  {}  {}", entry.fingerprint, entry.rule_id, entry.file);
+            }
+            Ok(0)
+        }
 
-fn category_icon(f: &ReviewFinding) -> &'static str {
-    match f.category {
-        Category::Security => "🔒",
-        Category::Quality => "🐛",
-        Category::Performance => "⚡",
-        Category::Maintainability => "📐",
-        Category::Compliance => "📋",
-    }
-}
+        cli::BaselineAction::Clear => {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                println!("Baseline removed.");
+            } else {
+                println!("No baseline to remove.");
+            }
+            Ok(0)
+        }
 
-fn wrap_text(text: &str, indent: usize, width: usize) -> String {
-    let pad = " ".repeat(indent);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.len() + 1 + word.len() <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(format!("{}{}", pad, current));
-            current = word.to_string();
+        cli::BaselineAction::Create { branch, model } => {
+            let mut merged = clone_args_for_subcommand(args, model, None);
+            merged.branch = branch;
+            let mut settings = settings::resolve_settings(&merged, file_config)?;
+            // A baseline must capture everything, or the first `--min-severity
+            // low` run would fail on findings the baseline never recorded.
+            settings.min_severity = Severity::Low;
+            settings.min_confidence = 0.0;
+            settings.use_baseline = false;
+
+            let diff = match merged.branch.clone() {
+                Some(b) => git::get_diff(&b, &[])?,
+                None => git::get_working_tree_diff(&[])?,
+            };
+            if diff.trim().is_empty() {
+                anyhow::bail!(
+                    "no changes to baseline. A baseline records the findings that already \
+                     exist in your working tree; pass --branch <base> to baseline a whole branch."
+                );
+            }
+
+            eprintln!("  Reviewing to establish a baseline — this runs a full analysis.\n");
+            let backend = build_backend(&settings.backend, model_dir)?;
+            let context = build_context(project_root, &diff, 8000);
+            let mut analyzer = build_analyzer(
+                backend,
+                &settings,
+                project_root,
+                &diff,
+                None,
+                rules::load_custom_rules(project_root),
+                None,
+            );
+
+            let spinner = make_spinner("Analyzing...", false);
+            let (summary, _) =
+                run_with_progress(&mut analyzer, &diff, &context, &settings, &spinner)?;
+            spinner.finish_and_clear();
+
+            let baseline =
+                Baseline::from_findings(&summary.findings, chrono::Utc::now().to_rfc3339());
+            std::fs::create_dir_all(path.parent().expect("baseline path has a parent"))?;
+            std::fs::write(&path, serde_json::to_string_pretty(&baseline)?)?;
+
+            println!(
+                "\n  ✓  Baselined {} finding(s) → {}",
+                baseline.len(),
+                path.display()
+            );
+            println!("     Commit this file. Future runs report only new issues.");
+            Ok(0)
         }
     }
-    if !current.is_empty() {
-        lines.push(format!("{}{}", pad, current));
-    }
-    lines.join("\n")
 }
 
-/// Build a fully-formatted, ANSI-coloured string for one finding.
-/// `counter` is a short label shown on the header row, e.g. `"#1"` or `"2/5"`.
-fn format_finding(f: &ReviewFinding, counter: &str) -> String {
-    let sev = severity_color(f);
-    let icon = category_icon(f);
-    let cat = format!("{:?}", f.category).to_lowercase();
-    let loc = format!("{}:{}", f.file, f.line).dark_grey();
-    let counter_label = format!("[{}]", counter).dark_grey();
+// ─── Daemon ──────────────────────────────────────────────────────────────────
 
-    let mut out = String::new();
-
-    // ── Header row ──
-    out.push_str(&format!(
-        "\n  {}  {}  {}  {} {}\n",
-        sev,
-        icon,
-        cat.dark_grey(),
-        loc,
-        counter_label
-    ));
-
-    // ── Separator ──
-    out.push_str(&format!("  {}\n", "─".repeat(62).dark_grey()));
-
-    // ── Issue ──
-    let issue_wrapped = wrap_text(&f.issue, 10, 68);
-    let mut issue_lines = issue_wrapped.lines();
-    out.push_str(&format!(
-        "  {}  {}\n",
-        "Issue".red().bold(),
-        issue_lines.next().unwrap_or("").trim_start()
-    ));
-    for line in issue_lines {
-        out.push_str(&format!("{}\n", line));
+#[allow(clippy::too_many_arguments)]
+fn run_serve(
+    idle_timeout: u64,
+    port: u16,
+    stop: bool,
+    status: bool,
+    settings: &Settings,
+    home: &Path,
+    model_dir: &Path,
+    project_root: &Path,
+) -> Result<i32> {
+    if stop {
+        return Ok(if daemon::stop(home) {
+            println!("Daemon stopped.");
+            0
+        } else {
+            println!("No daemon was running.");
+            0
+        });
     }
 
-    // ── Fix ──
-    let fix_wrapped = wrap_text(&f.suggested_fix, 10, 68);
-    let mut fix_lines = fix_wrapped.lines();
-    out.push_str(&format!(
-        "  {}    {}\n",
-        "Fix".green().bold(),
-        fix_lines.next().unwrap_or("").trim_start()
-    ));
-    for line in fix_lines {
-        out.push_str(&format!("{}\n", line));
+    let (model_id, device_id) = settings.backend.identity();
+
+    if status {
+        return Ok(match daemon::Client::connect(home, &model_id, &device_id) {
+            Some(client) => {
+                println!("Running: {}", client.describe());
+                0
+            }
+            None => {
+                println!("No daemon running for model '{model_id}' on '{device_id}'.");
+                0
+            }
+        });
     }
 
-    out
-}
-
-fn print_summary(count: usize, skipped: usize) {
-    if skipped > 0 {
-        eprintln!(
-            "  {}  {} chunk{} had unparseable output — try --model 3b",
-            "!".yellow(),
-            skipped,
-            if skipped == 1 { "" } else { "s" }
+    if !settings.backend.is_local() {
+        anyhow::bail!(
+            "a daemon only helps a local model — a remote backend has no weights to keep resident."
         );
     }
-    eprintln!(
-        "  {}  {} finding{}  {}",
-        "⚠".yellow().bold(),
-        count,
-        if count == 1 { "" } else { "s" },
-        "(exit 1)".dark_grey()
-    );
-    eprintln!();
-}
 
-fn print_positives_and_suggestions(positives: &[String], suggestions: &[String]) {
-    if positives.is_empty() && suggestions.is_empty() {
-        return;
+    // Refuse to start a second daemon for the same model rather than race for
+    // the info file.
+    if daemon::Client::connect(home, &model_id, &device_id).is_some() {
+        anyhow::bail!(
+            "a daemon is already running for this model. Stop it with `diffmind serve --stop`."
+        );
     }
 
-    if !positives.is_empty() {
-        eprintln!("  {}", "─".repeat(62).dark_grey());
-        eprintln!("  {}  What looks good", "✓".green().bold());
-        for p in positives {
-            eprintln!("     {}  {}", "·".green(), p);
-        }
-        eprintln!();
-    }
+    let server = daemon::Server::bind(port, Duration::from_secs(idle_timeout))?;
+    let bound_port = server.port()?;
 
-    if !suggestions.is_empty() {
-        if positives.is_empty() {
-            eprintln!("  {}", "─".repeat(62).dark_grey());
-        }
-        eprintln!("  💡  Suggestions");
-        for s in suggestions {
-            eprintln!("     {}  {}", "·".dark_yellow(), s);
-        }
-        eprintln!();
-    }
-}
+    eprintln!("  Loading model into memory...");
+    let backend = build_backend(&settings.backend, model_dir)?;
+    let backend_label = backend.describe();
 
-// ─── TUI runner ───────────────────────────────────────────────────────────────
-
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Frame, Terminal,
-    backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-};
-
-struct App {
-    findings: Vec<ReviewFinding>,
-    state: ListState,
-    status: String,
-    analyzing: bool,
-    diff: String,
-    model_dir: PathBuf,
-    project_root: PathBuf,
-    model_id: String,
-    ticket: Option<String>,
-}
-
-async fn run_tui(
-    diff: String,
-    model_dir: PathBuf,
-    project_root: PathBuf,
-    model_id: String,
-    ticket: Option<String>,
-) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let app = Arc::new(Mutex::new(App {
-        findings: Vec::new(),
-        state: ListState::default(),
-        status: "Ready — press 'a' to analyze".to_string(),
-        analyzing: false,
-        diff,
-        model_dir,
-        project_root,
-        model_id,
-        ticket,
-    }));
-
-    let res = tui_loop(&mut terminal, Arc::clone(&app)).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+    daemon::write_info(
+        home,
+        &daemon::DaemonInfo {
+            port: bound_port,
+            token: server.token().to_string(),
+            pid: std::process::id(),
+            model: model_id,
+            device: device_id,
+            version: output::VERSION.to_string(),
+        },
     )?;
-    terminal.show_cursor()?;
 
-    res
-}
+    eprintln!("  diffmind daemon ready");
+    eprintln!("    backend       {backend_label}");
+    eprintln!("    listening     127.0.0.1:{bound_port}");
+    eprintln!("    idle timeout  {idle_timeout}s");
+    eprintln!("    stop with     diffmind serve --stop\n");
 
-async fn tui_loop<B: Backend>(terminal: &mut Terminal<B>, app: Arc<Mutex<App>>) -> Result<()>
-where
-    B::Error: Send + Sync + 'static,
-{
-    loop {
-        {
-            let mut app_lock = app.lock().await;
-            terminal.draw(|f| ui(f, &mut app_lock))?;
-        }
+    // One resident backend, reused across requests. Held in an Option so it can
+    // be moved into the analyzer and back out on each call.
+    let mut resident = Some(backend);
+    let settings = settings.clone();
+    let project_root = project_root.to_path_buf();
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            let mut app_lock = app.lock().await;
-            match key.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let i = match app_lock.state.selected() {
-                        Some(i) if !app_lock.findings.is_empty() => {
-                            (i + 1) % app_lock.findings.len()
-                        }
-                        _ => 0,
-                    };
-                    app_lock.state.select(Some(i));
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let i = match app_lock.state.selected() {
-                        Some(i) if !app_lock.findings.is_empty() => {
-                            if i == 0 {
-                                app_lock.findings.len() - 1
-                            } else {
-                                i - 1
-                            }
-                        }
-                        _ => 0,
-                    };
-                    app_lock.state.select(Some(i));
-                }
-                // Guard rather than an inner `if`: pressing 'a' while a run is
-                // already in flight falls through to the catch-all and is ignored.
-                KeyCode::Char('a') if !app_lock.analyzing => {
-                    app_lock.analyzing = true;
-                    app_lock.status = "Analyzing...".to_string();
-                    let app_clone = Arc::clone(&app);
-                    tokio::spawn(async move {
-                        let app_err = Arc::clone(&app_clone);
-                        if let Err(e) = background_analysis(app_clone).await {
-                            let mut app = app_err.lock().await;
-                            app.status = format!("Error: {}", e);
-                            app.analyzing = false;
-                        }
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-async fn background_analysis(app: Arc<Mutex<App>>) -> Result<()> {
-    let (diff, model_dir, project_root, model_id, ticket) = {
-        let app = app.lock().await;
-        (
-            app.diff.clone(),
-            app.model_dir.clone(),
-            app.project_root.clone(),
-            app.model_id.clone(),
-            app.ticket.clone(),
-        )
-    };
-
-    let model_path = model_dir.join(format!("qwen2.5-coder-{}-instruct-q4_k_m.gguf", model_id));
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    let model_bytes = std::fs::read(model_path)?;
-    let tokenizer_bytes = std::fs::read(tokenizer_path)?;
-
-    let index = Indexer::load(&project_root);
-    let mut context = String::new();
-    if let Some(idx) = index
-        && let Some(rag_text) = rag::get_rag_context(&diff, &idx)
-    {
-        context = rag_text;
-    }
-
-    let langs = detect_languages(&diff);
-    let mut analyzer =
-        ReviewAnalyzer::new_with_device(&model_bytes, &tokenizer_bytes, DevicePreference::Auto)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .with_languages(langs);
-
-    if let Some(req) = ticket {
-        analyzer = analyzer.with_requirements(req);
-    }
-
-    let summary = analyzer
-        .analyze_diff_chunked(&diff, &context, 1024)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    let mut app_lock = app.lock().await;
-    let count = summary.findings.len();
-    app_lock.findings = summary.findings;
-    app_lock.status = format!(
-        "Done — {} finding{}",
-        count,
-        if count == 1 { "" } else { "s" }
-    );
-    app_lock.analyzing = false;
-    if count > 0 {
-        app_lock.state.select(Some(0));
-    }
-    Ok(())
-}
-
-fn ui(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let header = Paragraph::new(format!(" diffmind  {}", app.status))
-        .block(Block::default().borders(Borders::ALL).title("Status"))
-        .style(if app.analyzing {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Green)
-        });
-    f.render_widget(header, chunks[0]);
-
-    if app.findings.is_empty() && !app.analyzing {
-        render_welcome_screen(f, chunks[1]);
-    } else {
-        let body_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(chunks[1]);
-
-        let items: Vec<ListItem> = app
-            .findings
-            .iter()
-            .map(|f| {
-                let color = match f.severity {
-                    Severity::High => Color::Red,
-                    Severity::Medium => Color::Yellow,
-                    Severity::Low => Color::Cyan,
-                };
-                let tag = match f.category {
-                    core_engine::Category::Compliance => "[Req]",
-                    _ => match f.severity {
-                        Severity::High => "[High]",
-                        Severity::Medium => "[Med]",
-                        Severity::Low => "[Low]",
-                    },
-                };
-                ListItem::new(format!("{} {}", tag, f.file)).style(Style::default().fg(color))
-            })
-            .collect();
-
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Findings"))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
-        f.render_stateful_widget(list, body_chunks[0], &mut app.state);
-
-        let detail_text = if let Some(i) = app.state.selected() {
-            if let Some(finding) = app.findings.get(i) {
-                format!(
-                    "FILE: {}\nLINE: {}\nCATEGORY: {:?}\n\nISSUE:\n{}\n\nFIX:\n{}",
-                    finding.file,
-                    finding.line,
-                    finding.category,
-                    finding.issue,
-                    finding.suggested_fix
-                )
-            } else {
-                "No selection".to_string()
-            }
-        } else {
-            "Select a finding with j/k".to_string()
+    let result = server.run(|req| {
+        let Some(backend) = resident.take() else {
+            return daemon::Response::Error {
+                message: "backend unavailable".into(),
+            };
         };
 
-        let detail = Paragraph::new(detail_text)
-            .block(Block::default().borders(Borders::ALL).title("Details"))
-            .wrap(Wrap { trim: true });
-        f.render_widget(detail, body_chunks[1]);
-    }
+        let baseline = req
+            .baseline
+            .as_deref()
+            .and_then(|raw| Baseline::parse(raw).ok());
 
-    let footer = Paragraph::new(" [q] Quit  [a] Analyze  [j/k] Navigate ")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, chunks[2]);
-}
+        // Everything the client can vary per invocation must come from the
+        // request, not from whatever the daemon happened to be started with —
+        // otherwise `--no-cache` and friends are silently ignored, and a daemon
+        // started in one repo would write another repo's cache.
+        let mut per_request = settings.clone();
+        per_request.max_tokens = req.max_tokens;
+        per_request.min_confidence = req.min_confidence;
+        per_request.triage = core_engine::TriageMode::parse(&req.triage);
+        per_request.use_cache = req.use_cache;
 
-fn render_welcome_screen(f: &mut Frame, area: ratatui::layout::Rect) {
-    let welcome = Paragraph::new(
-        "\n  Welcome to diffmind\n  ====================\n\n  Press 'a' to run analysis\n  j / k to navigate findings\n  q to quit",
-    )
-    .block(Block::default().borders(Borders::ALL).title("Start"))
-    .style(Style::default().fg(Color::Cyan));
-    f.render_widget(welcome, area);
+        let request_root = if req.project_root.is_empty() {
+            project_root.clone()
+        } else {
+            PathBuf::from(&req.project_root)
+        };
+
+        let mut analyzer = build_analyzer(
+            backend,
+            &per_request,
+            &request_root,
+            &req.diff,
+            req.requirements.clone(),
+            req.rules.clone(),
+            baseline,
+        );
+
+        let outcome = analyzer.analyze(&req.diff, &req.context, req.max_tokens, |_, _| {}, |_| {});
+
+        let backend_label = analyzer.backend_description();
+        // Reclaim the loaded weights for the next request — the whole point of
+        // the daemon.
+        resident = Some(analyzer.into_backend());
+
+        match outcome {
+            Ok((summary, stats)) => daemon::Response::Ok(Box::new(daemon::ReviewResponse {
+                summary,
+                stats: (&stats).into(),
+                backend: backend_label,
+            })),
+            Err(e) => daemon::Response::Error {
+                message: e.to_string(),
+            },
+        }
+    });
+
+    daemon::clear_info(home);
+    result?;
+    Ok(0)
 }
