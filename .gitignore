@@ -10,8 +10,10 @@ pkg/
 .npm/
 .pnpm-debug.log*
 
-# Wasm build output
-packages/core-wasm/pkg/
+# npm packaging — release binaries are injected by npm/scripts/prepare.mjs
+# at publish time and must never be committed
+npm/platform/*/bin/
+*.tgz
 
 # Model cache (never commit the GGUF file)
 *.gguf

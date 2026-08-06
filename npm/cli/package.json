@@ -1,0 +1,48 @@
+{
+  "name": "@diffmind/cli",
+  "version": "0.7.1",
+  "description": "Local-first AI code review for your git diffs — on-device inference, no cloud, no API keys",
+  "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
+  "license": "MIT",
+  "homepage": "https://github.com/thinkgrid-labs/diffmind#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thinkgrid-labs/diffmind.git",
+    "directory": "npm/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/thinkgrid-labs/diffmind/issues"
+  },
+  "keywords": [
+    "ai",
+    "code-review",
+    "local-first",
+    "offline",
+    "privacy",
+    "security",
+    "git",
+    "diff",
+    "cli",
+    "rust"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "diffmind": "./bin/diffmind.js"
+  },
+  "files": [
+    "bin/diffmind.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "@diffmind/cli-darwin-arm64": "0.7.1",
+    "@diffmind/cli-darwin-x64": "0.7.1",
+    "@diffmind/cli-linux-arm64": "0.7.1",
+    "@diffmind/cli-linux-x64": "0.7.1",
+    "@diffmind/cli-win32-x64": "0.7.1"
+  }
+}

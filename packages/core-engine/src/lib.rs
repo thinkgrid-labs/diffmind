@@ -12,6 +12,8 @@ pub enum EngineError {
     GgufError(String),
     #[error("failed to load model weights: {0}")]
     ModelLoadError(String),
+    #[error("{0}")]
+    DeviceUnavailable(String),
     #[error("tensor error: {0}")]
     TensorError(#[from] candle_core::Error),
     #[error("forward pass error: {0}")]
@@ -152,13 +154,68 @@ const MAX_CONTEXT_TOKENS: usize = 4096;
 /// Which compute device to use for inference.
 #[derive(Debug, Clone, Default)]
 pub enum DevicePreference {
-    /// Try Metal on macOS, fall back to CPU everywhere else.
+    /// Metal on Apple Silicon, CPU everywhere else.
     #[default]
     Auto,
     /// Force CPU inference on all platforms.
     Cpu,
-    /// Force Metal (macOS / Apple Silicon). Returns an error on other platforms.
+    /// Force Metal. Errors on any build that cannot use it, rather than
+    /// failing later during inference.
     Metal,
+}
+
+/// Whether this build can safely run candle's Metal backend.
+///
+/// `Device::new_metal(0)` succeeding is NOT sufficient. An Intel Mac reports
+/// Metal 3 support and opens the device fine, but candle's matmul kernels are
+/// written against Apple-GPU-only SIMD-group matrix intrinsics. Probed on an
+/// Intel Iris Plus 655 (macOS 15.7.7):
+///
+/// ```text
+/// Device::new_metal(0) -> OK
+///   OK    f32 alloc
+///   OK    f32 add
+///   PANIC f32 matmul
+/// ```
+///
+/// Allocation and elementwise ops work; the first `matmul` — which every
+/// forward pass needs — dies building its compute pipeline:
+///
+/// ```text
+/// thread 'main' panicked at candle-metal-kernels-0.10.2/src/metal/device.rs:111
+///   NSError { code: 2, "AIR builtin function was called but no definition was
+///             found.", domain: "CompilerError" }
+/// ```
+///
+/// That is an `unwrap()` inside candle, and the release profile sets
+/// `panic = "abort"`, so it cannot be caught and turned into a CPU fallback
+/// at runtime. The only reliable fix is to not select Metal on hardware whose
+/// kernels do not exist. Gating on the target architecture does that: the
+/// release matrix ships a native `aarch64-apple-darwin` build for Apple
+/// Silicon (which keeps Metal) and `x86_64-apple-darwin` for Intel Macs
+/// (which get CPU + Accelerate BLAS).
+const METAL_SUPPORTED: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
+/// Open a Metal device, or explain precisely why this build cannot.
+fn metal_device() -> Result<Device, EngineError> {
+    if !METAL_SUPPORTED {
+        let reason = if cfg!(target_os = "macos") {
+            "Metal inference requires an Apple Silicon GPU. This is the Intel build, \
+             and candle's matmul kernels need Apple-GPU-only intrinsics. Use --device cpu."
+        } else {
+            "Metal is only available on macOS. Use --device cpu."
+        };
+        return Err(EngineError::DeviceUnavailable(reason.into()));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Device::new_metal(0)
+            .map_err(|e| EngineError::DeviceUnavailable(format!("Metal unavailable: {e}")));
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    unreachable!("guarded by METAL_SUPPORTED")
 }
 
 /// Select the best available device according to the caller's preference.
@@ -167,22 +224,11 @@ pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
     match pref {
         DevicePreference::Cpu => Ok(Device::Cpu),
 
-        DevicePreference::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                Device::new_metal(0)
-                    .map_err(|e| EngineError::ModelLoadError(format!("Metal unavailable: {e}")))
-            }
-            #[cfg(not(target_os = "macos"))]
-            Err(EngineError::ModelLoadError(
-                "Metal is only available on macOS".into(),
-            ))
-        }
+        DevicePreference::Metal => metal_device(),
 
         DevicePreference::Auto => {
-            #[cfg(target_os = "macos")]
-            {
-                match Device::new_metal(0) {
+            if METAL_SUPPORTED {
+                match metal_device() {
                     Ok(d) => {
                         eprintln!("  Device     Metal (Apple Silicon GPU)");
                         return Ok(d);
@@ -191,9 +237,13 @@ pub fn resolve_device(pref: &DevicePreference) -> Result<Device, EngineError> {
                         eprintln!("  Device     CPU  (Metal unavailable, using Accelerate BLAS)");
                     }
                 }
+            } else if cfg!(target_os = "macos") {
+                eprintln!(
+                    "  Device     CPU  (Intel Mac — Metal needs Apple Silicon, using Accelerate BLAS)"
+                );
+            } else {
+                eprintln!("  Device     CPU");
             }
-            #[cfg(not(target_os = "macos"))]
-            eprintln!("  Device     CPU");
 
             Ok(Device::Cpu)
         }
@@ -1173,6 +1223,40 @@ fn detect_custom_rule_violations(diff: &str, rules: &[CustomRule]) -> Vec<Review
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--device auto` must never hand back a Metal device on a build that
+    /// cannot run candle's matmul kernels — doing so aborts mid-inference
+    /// instead of falling back. See `METAL_SUPPORTED`.
+    #[test]
+    fn auto_device_is_cpu_unless_metal_is_supported() {
+        let dev = resolve_device(&DevicePreference::Auto).expect("auto must always resolve");
+        if METAL_SUPPORTED {
+            assert!(
+                dev.is_metal() || dev.is_cpu(),
+                "auto fell back to something unexpected"
+            );
+        } else {
+            assert!(
+                dev.is_cpu(),
+                "auto selected a non-CPU device on a build without Metal support"
+            );
+        }
+    }
+
+    /// Explicit `--device metal` on an unsupported build must return a clean
+    /// error the CLI can print, not panic deep inside candle.
+    #[test]
+    fn explicit_metal_errors_cleanly_when_unsupported() {
+        if METAL_SUPPORTED {
+            return; // nothing to assert — Metal is a legitimate choice here
+        }
+        let err = resolve_device(&DevicePreference::Metal)
+            .expect_err("metal must be refused when unsupported");
+        assert!(
+            err.to_string().contains("--device cpu"),
+            "error should tell the user what to do instead, got: {err}"
+        );
+    }
 
     #[test]
     fn test_chunk_diff_basic() {

@@ -61,6 +61,17 @@ VERSION=v.x.x curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/lat
 
 Download `diffmind-x86_64-pc-windows-msvc.zip` from [GitHub Releases](https://github.com/thinkgrid-labs/diffmind/releases), extract it, and place `diffmind.exe` anywhere on your `PATH`.
 
+### npm
+
+```bash
+npx @diffmind/cli --help
+
+# or install globally
+npm install -g @diffmind/cli
+```
+
+`@diffmind/cli` is a launcher — the binary ships in a per-platform package (`@diffmind/cli-darwin-arm64`, `@diffmind/cli-linux-x64`, …) declared as an optional dependency, so npm downloads only the one matching your machine. Linux binaries are glibc-linked; on musl (Alpine) use a glibc base image or build from source.
+
 ### Build from source (Rust)
 
 ```bash
