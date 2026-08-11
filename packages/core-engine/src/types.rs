@@ -109,6 +109,11 @@ pub struct ReviewFinding {
     /// Absent only on freshly-parsed model output, before `assign_rule_ids`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
+    /// Rule set the model claimed this finding violates. Transient: `finalize`
+    /// validates it against the rule sets that actually govern the file, folds
+    /// it into `rule_id`, and clears it — so it never reaches any output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
     /// The review unit this finding came out of, so a reader can be shown the
     /// exact hunk and context that produced it. Absent on findings from the
     /// deterministic detectors, which are not derived from a unit and already
@@ -325,6 +330,7 @@ mod tests {
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            rule: None,
             unit_id: None,
         }
     }

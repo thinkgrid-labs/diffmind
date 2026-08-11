@@ -30,6 +30,10 @@ pub struct CacheKeyInput<'a> {
     pub chunk: &'a str,
     pub context: &'a str,
     pub languages: &'a str,
+    /// Identity of the prose rule sets in force. Without it, editing a rulebook
+    /// would serve findings produced by the previous wording — the edit would
+    /// appear to do nothing at all.
+    pub rulebook_digest: &'a str,
     pub requirements: &'a str,
     pub max_tokens: u32,
     pub temperature: f64,
@@ -57,6 +61,7 @@ impl ReviewCache {
             input.chunk,
             input.context,
             input.languages,
+            input.rulebook_digest,
             input.requirements,
         ] {
             h.update(part.as_bytes());
@@ -140,6 +145,7 @@ mod tests {
             chunk,
             context: "",
             languages: "Rust",
+            rulebook_digest: "",
             requirements: "",
             max_tokens: 1024,
             temperature: 0.0,
@@ -158,6 +164,7 @@ mod tests {
                 suggested_fix: "fix".into(),
                 confidence: Some(0.9),
                 rule_id: Some("DM001".into()),
+                rule: None,
                 unit_id: None,
             }],
             positives: vec!["nice".into()],
@@ -200,6 +207,11 @@ mod tests {
 
         let mut k = input("diff", "m");
         k.seed = 8;
+        assert_ne!(base, ReviewCache::key(&k));
+
+        // Editing a rulebook must invalidate, or the edit appears to do nothing.
+        let mut k = input("diff", "m");
+        k.rulebook_digest = "abc123";
         assert_ne!(base, ReviewCache::key(&k));
     }
 

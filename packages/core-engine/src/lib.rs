@@ -15,6 +15,7 @@ pub mod error;
 pub mod json_guard;
 pub mod prefilter;
 pub mod prompt;
+pub mod rulebook;
 pub mod sarif;
 pub mod suppression;
 pub mod types;
@@ -30,6 +31,7 @@ pub use detectors::{detect_commented_out_code, detect_removed_used_variables};
 pub use diff::{FileDiff, anchor_findings, parse_diff};
 pub use error::EngineError;
 pub use prefilter::{DropReason, PrefilterOptions, PrefilterReport, looks_generated, prefilter};
+pub use rulebook::{DEFAULT_RULEBOOK, RULEBOOK_RULE_PREFIX, Rulebook};
 pub use sarif::to_sarif;
 pub use suppression::{Baseline, InlineSuppressions};
 pub use types::{

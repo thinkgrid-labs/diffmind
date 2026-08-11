@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use core_engine::{
     AnalysisStats, Baseline, CommitSuggestion, CustomRule, PrDescription, PrefilterOptions,
     PrefilterReport, ReviewAnalyzer, ReviewBackend, ReviewCache, ReviewFinding, ReviewSummary,
-    Severity,
+    Rulebook, Severity,
 };
 use crossterm::style::Stylize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -262,6 +262,32 @@ fn run_command(
             )
         }
 
+        cli::Commands::Rules { action } => match action {
+            cli::RulesAction::Init => {
+                let path = rules::init_rulebooks(project_root)?;
+                println!("  ✓  Wrote {}", path.display());
+                println!("     Edit it, then commit it — review standards belong in the repo.");
+                Ok(0)
+            }
+            cli::RulesAction::List => {
+                let books = rules::load_rulebooks(project_root);
+                if books.is_empty() {
+                    println!("No rule sets. Run `diffmind rules init` to scaffold one.");
+                    return Ok(0);
+                }
+                for b in &books {
+                    let scope = if b.scope.is_empty() {
+                        "whole repository".to_string()
+                    } else {
+                        b.scope.join(", ")
+                    };
+                    let severity = b.severity.map(|s| s.as_str()).unwrap_or("unset");
+                    println!("  {:<24} {severity:<7} {scope}", b.id);
+                }
+                Ok(0)
+            }
+        },
+
         cli::Commands::Cache { action } => {
             let base = project_root.join(".diffmind");
             match action {
@@ -459,19 +485,42 @@ pub fn build_backend(choice: &BackendChoice, model_dir: &Path) -> Result<Box<dyn
 }
 
 /// Assemble a fully-configured analyzer. Shared by the CLI, the TUI and the daemon.
+/// Everything a project contributes to a review beyond the diff itself.
+/// Bundled because these three are always loaded together, from the same
+/// `.diffmind/` directory, and are meaningless apart.
+#[derive(Default, Clone)]
+pub struct ProjectRules {
+    /// Regex rules from `.diffmind/rules.toml`.
+    pub custom: Vec<CustomRule>,
+    /// Prose rule sets from `.diffmind/rules/*.md`.
+    pub books: Vec<Rulebook>,
+    /// Findings already accepted, from `.diffmind/baseline.json`.
+    pub baseline: Option<Baseline>,
+}
+
+impl ProjectRules {
+    pub fn load(project_root: &Path, use_baseline: bool) -> Self {
+        ProjectRules {
+            custom: rules::load_custom_rules(project_root),
+            books: rules::load_rulebooks(project_root),
+            baseline: load_baseline(project_root, use_baseline),
+        }
+    }
+}
+
 pub fn build_analyzer(
     backend: Box<dyn ReviewBackend>,
     settings: &Settings,
     project_root: &Path,
     diff: &str,
     ticket: Option<String>,
-    custom_rules: Vec<CustomRule>,
-    baseline: Option<Baseline>,
+    project: ProjectRules,
 ) -> ReviewAnalyzer {
     let mut analyzer = ReviewAnalyzer::new(backend)
         .with_languages(detect_languages(diff))
-        .with_custom_rules(custom_rules)
-        .with_baseline(baseline)
+        .with_custom_rules(project.custom)
+        .with_rulebooks(project.books)
+        .with_baseline(project.baseline)
         .with_triage(settings.triage)
         .with_min_confidence(settings.min_confidence)
         .with_sampling(settings.temperature, settings.seed)
@@ -610,8 +659,7 @@ fn review(
     project_root: &Path,
 ) -> Result<i32> {
     let ticket = resolve_ticket(args.ticket.as_deref());
-    let custom_rules = rules::load_custom_rules(project_root);
-    let baseline = load_baseline(project_root, settings.use_baseline);
+    let project = ProjectRules::load(project_root, settings.use_baseline);
     let is_text = settings.format == OutputFormat::Text;
 
     print_header(
@@ -619,7 +667,7 @@ fn review(
         settings,
         diff,
         ticket.as_deref(),
-        custom_rules.len(),
+        project.custom.len(),
         prefilter,
         is_text,
     );
@@ -645,8 +693,10 @@ fn review(
                 max_tokens: settings.max_tokens,
                 min_confidence: settings.min_confidence,
                 triage: format!("{:?}", settings.triage).to_lowercase(),
-                rules: custom_rules.clone(),
-                baseline: baseline
+                rules: project.custom.clone(),
+                rulebooks: project.books.clone(),
+                baseline: project
+                    .baseline
                     .as_ref()
                     .and_then(|b| serde_json::to_string(b).ok()),
                 use_cache: settings.use_cache,
@@ -666,8 +716,7 @@ fn review(
             project_root,
             diff,
             ticket.clone(),
-            custom_rules.clone(),
-            baseline,
+            project,
         );
 
         spinner.set_message("Analyzing diff...");
@@ -1118,8 +1167,10 @@ fn run_baseline(
                 project_root,
                 &diff,
                 None,
-                rules::load_custom_rules(project_root),
-                None,
+                ProjectRules {
+                    baseline: None,
+                    ..ProjectRules::load(project_root, false)
+                },
             );
 
             let spinner = make_spinner("Analyzing...", false);
@@ -1260,8 +1311,11 @@ fn run_serve(
             &request_root,
             &req.diff,
             req.requirements.clone(),
-            req.rules.clone(),
-            baseline,
+            ProjectRules {
+                custom: req.rules.clone(),
+                books: req.rulebooks.clone(),
+                baseline,
+            },
         );
 
         // Built here rather than sent by the client: the daemon owns chunking,

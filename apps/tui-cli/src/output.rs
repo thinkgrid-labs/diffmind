@@ -342,6 +342,7 @@ mod tests {
             suggested_fix: "do the other thing".into(),
             confidence: Some(0.9),
             rule_id: Some("DM001".into()),
+            rule: None,
             unit_id: None,
         }
     }

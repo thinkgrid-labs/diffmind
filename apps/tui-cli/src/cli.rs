@@ -243,6 +243,11 @@ pub enum Commands {
         #[arg(long)]
         status: bool,
     },
+    /// Manage the prose rule sets in `.diffmind/rules/`
+    Rules {
+        #[command(subcommand)]
+        action: RulesAction,
+    },
     /// Inspect or clear the review cache
     Cache {
         #[command(subcommand)]
@@ -263,6 +268,14 @@ pub enum BaselineAction {
     Show,
     /// Delete the baseline
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RulesAction {
+    /// Write a starter `.diffmind/rules/default.md`
+    Init,
+    /// List the rule sets that would be loaded, and what they govern
+    List,
 }
 
 #[derive(Subcommand, Debug)]

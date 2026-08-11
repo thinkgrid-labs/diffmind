@@ -426,6 +426,7 @@ index 111..222 100644
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            rule: None,
             unit_id: None,
         }
     }

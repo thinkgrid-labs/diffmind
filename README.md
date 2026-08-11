@@ -30,6 +30,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **Deterministic pre-filter** — lockfiles, generated files, minified bundles, assets and formatting-only hunks are dropped before the model sees them, and the run tells you exactly what it skipped: `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
 - **Deterministic detectors** — commented-out code, removed-but-still-used declarations, and your own regex rules. These run before the model, cost nothing, and are the findings you can trust unconditionally.
 - **Security, bug, performance and maintainability review** by a local model
+- **Review standards as markdown** — commit your team's own rules to `.diffmind/rules/`, scoped by path. Prose the model reads, versioned next to the code it governs.
 - **Ticket-aware review** — check the diff actually implements the acceptance criteria (`--ticket`)
 - **Suppressions** — inline `// diffmind-ignore` comments and a project baseline, so one false positive doesn't get the whole gate deleted
 - **SARIF output** — inline PR annotations via GitHub Code Scanning, no bot account or token
@@ -151,6 +152,7 @@ Findings carry a stable rule ID, shown in the output, so you can silence exactly
 | `DM002`          | A declaration was removed but is still referenced   |
 | `DM900.<category>` | A model-authored finding of that category        |
 | `custom.<slug>`  | One of your `.diffmind/rules.toml` rules           |
+| `rulebook.<id>`  | A violation of one of your `.diffmind/rules/*.md`  |
 
 ### Inline
 
@@ -280,7 +282,50 @@ api_key_env = "DIFFMIND_API_KEY"
 
 Unknown keys are reported rather than silently ignored.
 
-### Team rules — `.diffmind/rules.toml`
+### Review standards — `.diffmind/rules/*.md`
+
+Rules that need judgement rather than a pattern. Written as prose, committed to
+the repo, and read by the model on every review — so a team's review culture
+becomes a reviewed artifact instead of tacit knowledge.
+
+```bash
+diffmind rules init     # scaffold .diffmind/rules/default.md
+diffmind rules list     # what would load, and what each governs
+```
+
+```markdown
+---
+scope: ["src/api/**/*.ts"]
+severity: high
+---
+
+# API conventions
+
+- Public handlers must return `ApiError`, never a bare string.
+- Any new endpoint needs a corresponding entry in `openapi.yaml`.
+- Reject changes that widen a response struct without a version bump.
+```
+
+| Key | Description |
+| ---------- | ----------------------------------------------------------------- |
+| `scope`    | Globs this rule set governs. Omit to cover the whole repository.  |
+| `severity` | **Ceiling** for findings attributed to it — never a promotion.     |
+| `id`       | Name used to attribute and suppress. Defaults to the file stem.    |
+
+A finding the model attributes to a rule set gets the rule ID
+`rulebook.<id>`, so it suppresses like any other:
+`// diffmind-ignore-next-line rulebook.api-conventions`. An attribution naming a
+rule set that does not govern that file is discarded — a 1.5B will invent a
+plausible name, and an invented one could never be suppressed.
+
+Rule bodies go in the *stable* half of the prompt and units are grouped by which
+rule sets govern them, so every unit in a group sends a byte-identical prefix.
+That is what keeps prompt-prefix caching possible; scoping rules per file would
+otherwise make every prompt unique.
+
+A rule set that fails to parse is reported and skipped, never silently ignored.
+
+### Pattern rules — `.diffmind/rules.toml`
 
 Regex rules run before the model: instant, deterministic, zero inference cost.
 
@@ -320,6 +365,8 @@ category = "security"
 diffmind describe                 # PR title, summary, and test plan
 diffmind commit                   # conventional commit message for staged changes
 diffmind commit --apply
+diffmind rules init               # scaffold .diffmind/rules/default.md
+diffmind rules list               # show which rule sets load
 diffmind index                    # build the symbol index
 diffmind cache show               # cache location and size
 diffmind cache clear
@@ -338,6 +385,7 @@ Commands:
   describe       Generate a PR title and description
   commit         Suggest a conventional commit message
   baseline       Record current findings as accepted
+  rules          Manage the prose rule sets in .diffmind/rules/
   install-hooks  Install git hooks
   serve          Keep the model resident between runs
   cache          Inspect or clear the review cache
@@ -400,6 +448,7 @@ diffmind/
 │   ├── json_guard.rs           # constrained-decoding state machine
 │   ├── prefilter.rs            # deterministic noise removal, with counts
 │   ├── prompt.rs               # prompt construction
+│   ├── rulebook.rs             # prose rule sets (.diffmind/rules/*.md)
 │   ├── unit.rs                 # hunks → review units (the cached, reviewed thing)
 │   ├── sarif.rs                # SARIF 2.1.0 output
 │   └── suppression.rs          # inline directives and baselines

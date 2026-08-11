@@ -224,24 +224,13 @@ fn analyze(
     // Every one of these was previously ignored by the TUI path.
     let backend = crate::build_backend(&settings.backend, &model_dir)?;
     let context_for = crate::context_builder(&project_root, 8000);
-    let custom_rules = crate::rules::load_custom_rules(&project_root);
-    let baseline = if settings.use_baseline {
-        std::fs::read_to_string(project_root.join(".diffmind").join("baseline.json"))
-            .ok()
-            .and_then(|raw| core_engine::Baseline::parse(&raw).ok())
-    } else {
-        None
-    };
 
-    let mut analyzer = crate::build_analyzer(
-        backend,
-        &settings,
-        &project_root,
-        &diff,
-        ticket,
-        custom_rules,
-        baseline,
-    );
+    // Loaded exactly as the CLI loads it, so the TUI cannot report a different
+    // result than the same flags do outside it.
+    let project = crate::ProjectRules::load(&project_root, settings.use_baseline);
+
+    let mut analyzer =
+        crate::build_analyzer(backend, &settings, &project_root, &diff, ticket, project);
 
     let _ = tx.send(Msg::Progress("Analyzing...".into()));
 
@@ -472,6 +461,7 @@ mod tests {
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            rule: None,
             unit_id: None,
         }
     }

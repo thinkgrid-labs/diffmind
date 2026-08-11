@@ -10,6 +10,7 @@ use crate::prompt::{
     PROMPT_VERSION, Prompt, ReviewPromptInput, commit_message_prompt, pr_description_prompt,
     review_prompt, triage_prompt, truncate_to_char_boundary,
 };
+use crate::rulebook::{self, Rulebook};
 use crate::suppression::{Baseline, InlineSuppressions};
 use crate::types::{
     CommitSuggestion, CustomRule, PrDescription, ReviewFinding, ReviewSummary, model_rule_id,
@@ -77,6 +78,7 @@ pub struct ReviewAnalyzer {
     custom_rules: Vec<CustomRule>,
     baseline: Option<Baseline>,
     cache: Option<ReviewCache>,
+    rulebooks: Vec<Rulebook>,
     triage: TriageMode,
     min_confidence: f32,
     temperature: f64,
@@ -94,6 +96,7 @@ impl ReviewAnalyzer {
             custom_rules: Vec::new(),
             baseline: None,
             cache: None,
+            rulebooks: Vec::new(),
             triage: TriageMode::default(),
             min_confidence: 0.0,
             temperature: defaults.temperature,
@@ -138,6 +141,12 @@ impl ReviewAnalyzer {
 
     pub fn with_cache(mut self, cache: Option<ReviewCache>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Load prose rule sets from `.diffmind/rules/`.
+    pub fn with_rulebooks(mut self, rulebooks: Vec<Rulebook>) -> Self {
+        self.rulebooks = rulebooks;
         self
     }
 
@@ -197,14 +206,16 @@ impl ReviewAnalyzer {
         (available / TOKENS_PER_DIFF_LINE).clamp(MIN_CHUNK_LINES, MAX_CHUNK_LINES)
     }
 
-    fn build_prompt(&self, diff: &str, context: &str) -> Prompt {
+    fn build_prompt(&self, diff: &str, context: &str, rulebooks: &[&Rulebook]) -> Prompt {
         review_prompt(&ReviewPromptInput {
             diff,
             context,
             languages: self.languages.as_deref(),
             requirements: self.requirements.as_deref(),
+            rulebooks,
             max_context_bytes: self.context_budget_bytes(),
             max_requirements_bytes: 2000,
+            max_rules_bytes: self.context_budget_bytes(),
         })
     }
 
@@ -264,7 +275,14 @@ impl ReviewAnalyzer {
 
         // Deterministic detectors first — instant, and independent of the model.
         let det = detectors::run_all(&files, &self.custom_rules);
-        let det = self.finalize(det, &files, &inline, &mut stats, &mut emitted, None);
+        let det = self.finalize(
+            det,
+            &files,
+            &inline,
+            &mut stats,
+            &mut emitted,
+            Attribution::none(),
+        );
         if !det.is_empty() {
             on_chunk_result(&det);
         }
@@ -275,16 +293,28 @@ impl ReviewAnalyzer {
         stats.files_skipped_by_triage = skip.len();
 
         let reviewable = filter_diff(diff, &skip);
-        let units = build_units(
+        let mut units = build_units(
             &reviewable,
             self.max_chunk_lines(max_tokens_per_chunk as usize),
         );
         stats.units_total = units.len();
 
+        // Cloned once per run: `analyze_chunk` needs `&mut self`, so the
+        // per-unit lookups must not hold a borrow on `self.rulebooks`.
+        let rulebooks = self.rulebooks.clone();
+
+        // Order units so that every unit governed by the same set of rule sets
+        // is contiguous. Those units render a byte-identical system prompt, so
+        // a backend that can reuse a prompt prefix gets the longest possible
+        // run of hits. Findings are sorted before output regardless, so this
+        // changes only the order work is done in.
+        units.sort_by_key(|u| rulebook::group_key(&rulebook::applicable(&rulebooks, &u.file)));
+
         for (i, unit) in units.iter().enumerate() {
             on_progress(i + 1, units.len());
+            let books = rulebook::applicable(&rulebooks, &unit.file);
 
-            match self.analyze_chunk(&unit.text, context_for, max_tokens_per_chunk, 0) {
+            match self.analyze_chunk(&unit.text, context_for, &books, max_tokens_per_chunk, 0) {
                 Ok((unit_summary, cached)) => {
                     if cached {
                         stats.units_cached += 1;
@@ -295,7 +325,10 @@ impl ReviewAnalyzer {
                         &inline,
                         &mut stats,
                         &mut emitted,
-                        Some(&unit.id),
+                        Attribution {
+                            unit_id: Some(&unit.id),
+                            rulebooks: &books,
+                        },
                     );
                     if !findings.is_empty() {
                         on_chunk_result(&findings);
@@ -327,12 +360,39 @@ impl ReviewAnalyzer {
         inline: &InlineSuppressions,
         stats: &mut AnalysisStats,
         emitted: &mut HashSet<(String, u32, String)>,
-        unit_id: Option<&str>,
+        from: Attribution<'_>,
     ) -> Vec<ReviewFinding> {
+        let (unit_id, rulebooks) = (from.unit_id, from.rulebooks);
         // Give model findings an explicit rule ID so they can be suppressed and
         // reported like any other, and record which unit produced them so a
         // reader can be shown the hunk the model was actually looking at.
         for f in &mut findings {
+            // A rule set the model claims to have applied is only honoured if it
+            // is one that actually governs this file. Small models invent
+            // plausible names, and an invented one would produce a finding that
+            // no `diffmind-ignore` directive could ever suppress.
+            let claimed = f.rule.take();
+            let matched = claimed.as_deref().and_then(|name| {
+                let name = name
+                    .trim()
+                    .trim_start_matches(rulebook::RULEBOOK_RULE_PREFIX);
+                rulebooks.iter().find(|b| b.id.eq_ignore_ascii_case(name))
+            });
+
+            if let Some(book) = matched {
+                if f.rule_id.is_none() {
+                    f.rule_id = Some(book.rule_id());
+                }
+                // The declared severity is a ceiling, not an override: one
+                // opinionated style document must not be able to fill a triage
+                // list with `high`.
+                if let Some(ceiling) = book.severity
+                    && f.severity > ceiling
+                {
+                    f.severity = ceiling;
+                }
+            }
+
             if f.rule_id.is_none() {
                 f.rule_id = Some(model_rule_id(f.category));
             }
@@ -383,6 +443,7 @@ impl ReviewAnalyzer {
         &mut self,
         chunk: &str,
         context_for: &dyn Fn(&str) -> String,
+        rulebooks: &[&Rulebook],
         max_tokens: u32,
         depth: u32,
     ) -> Result<(ReviewSummary, bool), EngineError> {
@@ -391,7 +452,7 @@ impl ReviewAnalyzer {
         }
 
         let context = context_for(chunk);
-        let prompt = self.build_prompt(chunk, &context);
+        let prompt = self.build_prompt(chunk, &context, rulebooks);
 
         if !self.prompt_fits(&prompt, max_tokens as usize) {
             if depth >= MAX_SPLIT_DEPTH {
@@ -406,8 +467,9 @@ impl ReviewAnalyzer {
             // context, so the halves stay independently cacheable.
             let (a, b) = split_in_half(chunk);
             let (mut first, cached_a) =
-                self.analyze_chunk(&a, context_for, max_tokens, depth + 1)?;
-            let (second, cached_b) = self.analyze_chunk(&b, context_for, max_tokens, depth + 1)?;
+                self.analyze_chunk(&a, context_for, rulebooks, max_tokens, depth + 1)?;
+            let (second, cached_b) =
+                self.analyze_chunk(&b, context_for, rulebooks, max_tokens, depth + 1)?;
             first.merge(second);
             return Ok((first, cached_a && cached_b));
         }
@@ -419,6 +481,7 @@ impl ReviewAnalyzer {
                 chunk,
                 context: &context,
                 languages: self.languages.as_deref().unwrap_or(""),
+                rulebook_digest: &rulebook::digest(rulebooks),
                 requirements: self.requirements.as_deref().unwrap_or(""),
                 max_tokens,
                 temperature: self.temperature,
@@ -572,6 +635,24 @@ impl ReviewAnalyzer {
             .context_tokens()
             .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
         (available * 3).clamp(4_000, 60_000)
+    }
+}
+
+/// Where a batch of findings came from, so `finalize` can stamp provenance and
+/// validate any rule set the model claimed. Bundled because these two always
+/// travel together and are meaningless apart.
+struct Attribution<'a> {
+    unit_id: Option<&'a str>,
+    rulebooks: &'a [&'a Rulebook],
+}
+
+impl Attribution<'_> {
+    /// Findings that did not come from a unit — the deterministic detectors.
+    fn none() -> Self {
+        Attribution {
+            unit_id: None,
+            rulebooks: &[],
+        }
     }
 }
 
@@ -925,6 +1006,109 @@ diff --git a/src/a.rs b/src/a.rs
         );
     }
 
+    /// Emits one finding that claims to violate `rule`, at `high`.
+    struct ClaimingBackend {
+        rule: &'static str,
+    }
+
+    impl ReviewBackend for ClaimingBackend {
+        fn generate(&mut self, _p: &Prompt, _o: &GenOptions) -> Result<String, EngineError> {
+            Ok(format!(
+                r#"{{"findings":[{{"file":"src/a.rs","line":1,"severity":"high","category":"quality","issue":"i","suggested_fix":"f","rule":"{}"}}],"positives":[],"suggestions":[]}}"#,
+                self.rule
+            ))
+        }
+        fn describe(&self) -> String {
+            "claiming".into()
+        }
+        fn context_tokens(&self) -> usize {
+            32_768
+        }
+    }
+
+    const ONE_FILE: &str = "\
+diff --git a/src/a.rs b/src/a.rs
++++ b/src/a.rs
+@@ -1,1 +1,1 @@
++let a = 2;
+";
+
+    fn run_with_claim(claim: &'static str, books: Vec<Rulebook>) -> Vec<ReviewFinding> {
+        let mut analyzer = ReviewAnalyzer::new(Box::new(ClaimingBackend { rule: claim }))
+            .with_triage(TriageMode::Off)
+            .with_rulebooks(books);
+        analyzer
+            .analyze(ONE_FILE, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .expect("analysis should succeed")
+            .0
+            .findings
+    }
+
+    fn rulebook(id: &str, severity: Option<Severity>) -> Rulebook {
+        Rulebook {
+            id: id.into(),
+            scope: vec![],
+            severity,
+            body: "- A rule.".into(),
+        }
+    }
+
+    #[test]
+    fn a_claimed_rule_set_becomes_a_suppressible_rule_id() {
+        let findings = run_with_claim("api", vec![rulebook("api", None)]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id.as_deref(), Some("rulebook.api"));
+        assert!(
+            findings[0].rule.is_none(),
+            "the transient claim must not reach any output"
+        );
+    }
+
+    #[test]
+    fn a_rule_sets_declared_severity_is_a_ceiling() {
+        // The model said `high`; the rule set is declared `low`. One opinionated
+        // style document must not be able to fill a triage list with `high`.
+        let findings = run_with_claim("style", vec![rulebook("style", Some(Severity::Low))]);
+        assert_eq!(findings[0].severity, Severity::Low);
+
+        // A ceiling never promotes.
+        let findings = run_with_claim("sec", vec![rulebook("sec", Some(Severity::High))]);
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn an_invented_rule_set_name_is_not_honoured() {
+        // Small models produce plausible-looking names. Accepting one would
+        // create a finding no `diffmind-ignore` directive could ever suppress,
+        // because the rule it names does not exist.
+        let findings = run_with_claim("does-not-exist", vec![rulebook("api", Some(Severity::Low))]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].rule_id.as_deref(),
+            Some("DM900.quality"),
+            "should fall back to the generic model rule id"
+        );
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "an unmatched claim must not apply anyone's ceiling"
+        );
+    }
+
+    #[test]
+    fn a_rule_set_that_does_not_govern_the_file_cannot_be_claimed() {
+        let scoped = Rulebook {
+            id: "web".into(),
+            scope: vec!["src/web/**".into()],
+            severity: Some(Severity::Low),
+            body: "- A rule.".into(),
+        };
+        // The diff touches `src/a.rs`, which `web` does not govern.
+        let findings = run_with_claim("web", vec![scoped]);
+        assert_eq!(findings[0].rule_id.as_deref(), Some("DM900.quality"));
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
     #[test]
     fn detector_findings_carry_no_unit_id() {
         // They are not produced from a unit, and they already carry an exact
@@ -974,6 +1158,7 @@ diff --git a/src/auth.js b/src/auth.js
                 chunk: "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n",
                 context: ctx,
                 languages: "Rust",
+                rulebook_digest: "",
                 requirements: "",
                 max_tokens: 512,
                 temperature: 0.0,

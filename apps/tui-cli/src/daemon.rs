@@ -90,6 +90,10 @@ pub struct ReviewRequest {
     pub min_confidence: f32,
     pub triage: String,
     pub rules: Vec<core_engine::CustomRule>,
+    /// Prose rule sets, sent rather than re-read: the daemon may be serving a
+    /// different repository than the one it was started in.
+    #[serde(default)]
+    pub rulebooks: Vec<core_engine::Rulebook>,
     pub baseline: Option<String>,
     pub use_cache: bool,
     /// Where the daemon loads the symbol index and cache from. The client does
@@ -557,6 +561,7 @@ mod tests {
                 min_confidence: 0.0,
                 triage: "off".into(),
                 rules: vec![],
+                rulebooks: vec![],
                 baseline: None,
                 use_cache: false,
                 project_root: ".".into(),
@@ -601,6 +606,7 @@ mod tests {
                 min_confidence: 0.0,
                 triage: "off".into(),
                 rules: vec![],
+                rulebooks: vec![],
                 baseline: None,
                 use_cache: false,
                 project_root: ".".into(),
