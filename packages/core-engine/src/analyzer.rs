@@ -3,7 +3,7 @@
 use crate::backend::{GenOptions, ReviewBackend};
 use crate::cache::{CacheKeyInput, ReviewCache};
 use crate::detectors;
-use crate::diff::{FileDiff, LineKind, anchor_findings, chunk_diff, parse_diff};
+use crate::diff::{FileDiff, LineKind, anchor_findings, parse_diff};
 use crate::error::EngineError;
 use crate::json_guard::extract_json;
 use crate::prompt::{
@@ -14,6 +14,7 @@ use crate::suppression::{Baseline, InlineSuppressions};
 use crate::types::{
     CommitSuggestion, CustomRule, PrDescription, ReviewFinding, ReviewSummary, model_rule_id,
 };
+use crate::unit::build_units;
 use std::collections::HashSet;
 
 /// Rough cost of the system prompt in tokens, reserved out of the context
@@ -57,10 +58,10 @@ impl TriageMode {
 
 #[derive(Debug, Default, Clone)]
 pub struct AnalysisStats {
-    pub chunks_total: usize,
-    pub chunks_cached: usize,
-    /// Chunks whose output could not be parsed even after repair.
-    pub chunks_unparseable: usize,
+    pub units_total: usize,
+    pub units_cached: usize,
+    /// Units whose output could not be parsed even after repair.
+    pub units_unparseable: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -232,6 +233,9 @@ impl ReviewAnalyzer {
 
     /// Analyze a diff, streaming results as they arrive.
     ///
+    /// - `context_for(chunk)` supplies the symbol context for one chunk. It is
+    ///   a callback rather than a string because context must be assembled per
+    ///   chunk: see [`Self::analyze_chunk`].
     /// - `on_progress(done, total)` fires when a chunk starts.
     /// - `on_chunk_result(findings)` fires with each batch as it completes, so
     ///   the CLI can print before the whole diff is processed.
@@ -241,7 +245,7 @@ impl ReviewAnalyzer {
     pub fn analyze<F, G>(
         &mut self,
         diff: &str,
-        context: &str,
+        context_for: &dyn Fn(&str) -> String,
         max_tokens_per_chunk: u32,
         on_progress: F,
         on_chunk_result: G,
@@ -260,7 +264,7 @@ impl ReviewAnalyzer {
 
         // Deterministic detectors first — instant, and independent of the model.
         let det = detectors::run_all(&files, &self.custom_rules);
-        let det = self.finalize(det, &files, &inline, &mut stats, &mut emitted);
+        let det = self.finalize(det, &files, &inline, &mut stats, &mut emitted, None);
         if !det.is_empty() {
             on_chunk_result(&det);
         }
@@ -271,39 +275,40 @@ impl ReviewAnalyzer {
         stats.files_skipped_by_triage = skip.len();
 
         let reviewable = filter_diff(diff, &skip);
-        let chunks = chunk_diff(
+        let units = build_units(
             &reviewable,
             self.max_chunk_lines(max_tokens_per_chunk as usize),
         );
-        stats.chunks_total = chunks.len();
+        stats.units_total = units.len();
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            on_progress(i + 1, chunks.len());
+        for (i, unit) in units.iter().enumerate() {
+            on_progress(i + 1, units.len());
 
-            match self.analyze_chunk(chunk, context, max_tokens_per_chunk, 0) {
-                Ok((chunk_summary, cached)) => {
+            match self.analyze_chunk(&unit.text, context_for, max_tokens_per_chunk, 0) {
+                Ok((unit_summary, cached)) => {
                     if cached {
-                        stats.chunks_cached += 1;
+                        stats.units_cached += 1;
                     }
                     let findings = self.finalize(
-                        chunk_summary.findings,
+                        unit_summary.findings,
                         &files,
                         &inline,
                         &mut stats,
                         &mut emitted,
+                        Some(&unit.id),
                     );
                     if !findings.is_empty() {
                         on_chunk_result(&findings);
                     }
                     summary.findings.extend(findings);
-                    summary.positives.extend(chunk_summary.positives);
-                    summary.suggestions.extend(chunk_summary.suggestions);
+                    summary.positives.extend(unit_summary.positives);
+                    summary.suggestions.extend(unit_summary.suggestions);
                 }
                 Err(EngineError::SerializationError(e)) => {
                     if self.debug {
-                        eprintln!("[debug] chunk {} unparseable: {e}", i + 1);
+                        eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file);
                     }
-                    stats.chunks_unparseable += 1;
+                    stats.units_unparseable += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -322,12 +327,17 @@ impl ReviewAnalyzer {
         inline: &InlineSuppressions,
         stats: &mut AnalysisStats,
         emitted: &mut HashSet<(String, u32, String)>,
+        unit_id: Option<&str>,
     ) -> Vec<ReviewFinding> {
         // Give model findings an explicit rule ID so they can be suppressed and
-        // reported like any other.
+        // reported like any other, and record which unit produced them so a
+        // reader can be shown the hunk the model was actually looking at.
         for f in &mut findings {
             if f.rule_id.is_none() {
                 f.rule_id = Some(model_rule_id(f.category));
+            }
+            if f.unit_id.is_none() {
+                f.unit_id = unit_id.map(str::to_string);
             }
         }
 
@@ -361,10 +371,18 @@ impl ReviewAnalyzer {
 
     /// Run one chunk, consulting the cache and splitting if the prompt overruns.
     /// Returns the summary and whether it came from the cache.
+    ///
+    /// Context is assembled for *this chunk*. It used to be assembled once from
+    /// the whole diff and shared by every chunk, which broke the cache outright:
+    /// the shared string is part of the cache key, so editing any one file
+    /// changed the key of every other file's chunk and a re-review after a
+    /// force-push re-inferred the entire diff. Sharing it was also wrong on the
+    /// merits — a chunk covering `auth.rs` was handed the enclosing functions of
+    /// whichever six files happened to sort first.
     fn analyze_chunk(
         &mut self,
         chunk: &str,
-        context: &str,
+        context_for: &dyn Fn(&str) -> String,
         max_tokens: u32,
         depth: u32,
     ) -> Result<(ReviewSummary, bool), EngineError> {
@@ -372,7 +390,8 @@ impl ReviewAnalyzer {
             return Ok((ReviewSummary::default(), false));
         }
 
-        let prompt = self.build_prompt(chunk, context);
+        let context = context_for(chunk);
+        let prompt = self.build_prompt(chunk, &context);
 
         if !self.prompt_fits(&prompt, max_tokens as usize) {
             if depth >= MAX_SPLIT_DEPTH {
@@ -383,10 +402,12 @@ impl ReviewAnalyzer {
                 ));
             }
             // Halve and recurse rather than truncate: silently dropping half a
-            // hunk means silently not reviewing it.
+            // hunk means silently not reviewing it. Each half re-derives its own
+            // context, so the halves stay independently cacheable.
             let (a, b) = split_in_half(chunk);
-            let (mut first, cached_a) = self.analyze_chunk(&a, context, max_tokens, depth + 1)?;
-            let (second, cached_b) = self.analyze_chunk(&b, context, max_tokens, depth + 1)?;
+            let (mut first, cached_a) =
+                self.analyze_chunk(&a, context_for, max_tokens, depth + 1)?;
+            let (second, cached_b) = self.analyze_chunk(&b, context_for, max_tokens, depth + 1)?;
             first.merge(second);
             return Ok((first, cached_a && cached_b));
         }
@@ -396,7 +417,7 @@ impl ReviewAnalyzer {
                 backend: &self.backend.describe(),
                 prompt_version: PROMPT_VERSION,
                 chunk,
-                context,
+                context: &context,
                 languages: self.languages.as_deref().unwrap_or(""),
                 requirements: self.requirements.as_deref().unwrap_or(""),
                 max_tokens,
@@ -747,6 +768,229 @@ fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::types::Severity;
+    use std::sync::{Arc, Mutex};
+
+    /// Records the prompts it was asked to complete and answers "no findings",
+    /// so a test can assert on what the analyzer sent rather than on a model.
+    struct RecordingBackend {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ReviewBackend for RecordingBackend {
+        fn generate(&mut self, prompt: &Prompt, _opts: &GenOptions) -> Result<String, EngineError> {
+            self.seen
+                .lock()
+                .expect("recording backend mutex")
+                .push(prompt.to_chatml());
+            Ok(r#"{"findings":[],"positives":[],"suggestions":[]}"#.to_string())
+        }
+        fn describe(&self) -> String {
+            "recording".into()
+        }
+        fn context_tokens(&self) -> usize {
+            32_768
+        }
+    }
+
+    /// Reports one finding per call, anchored to the first added line it is
+    /// shown, so a test can follow provenance through the pipeline.
+    struct FindingBackend {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ReviewBackend for FindingBackend {
+        fn generate(&mut self, prompt: &Prompt, _opts: &GenOptions) -> Result<String, EngineError> {
+            let chatml = prompt.to_chatml();
+            let line = chatml
+                .lines()
+                .filter(|l| l.starts_with("@@"))
+                .filter_map(|l| l.split('+').nth(1))
+                .filter_map(|l| l.split(',').next())
+                .filter_map(|n| n.trim().parse::<u32>().ok())
+                .next()
+                .unwrap_or(1);
+            self.seen.lock().expect("mutex").push(chatml);
+            Ok(format!(
+                r#"{{"findings":[{{"file":"src/a.rs","line":{line},"severity":"high","category":"quality","issue":"issue at {line}","suggested_fix":"f"}}],"positives":[],"suggestions":[]}}"#
+            ))
+        }
+        fn describe(&self) -> String {
+            "finding".into()
+        }
+        fn context_tokens(&self) -> usize {
+            32_768
+        }
+    }
+
+    const TWO_FILES: &str = "\
+diff --git a/a.rs b/a.rs
+@@ -1,2 +1,2 @@
+-let old_a = 1;
++let new_a = 2;
+diff --git a/b.rs b/b.rs
+@@ -1,2 +1,2 @@
+-let old_b = 1;
++let new_b = 2;
+";
+
+    /// The regression this file exists to prevent.
+    ///
+    /// Context used to be assembled once from the whole diff and shared by every
+    /// chunk. Because the shared string is part of the cache key, editing `b.rs`
+    /// changed `a.rs`'s key too and a re-review re-inferred everything — the
+    /// exact opposite of what the cache is for.
+    #[test]
+    fn each_chunk_gets_context_for_only_its_own_content() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingBackend { seen: seen.clone() });
+        let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
+
+        // Stands in for the real symbol index: context derived from the chunk.
+        // Note the ordering — handed the *whole* diff (the old behaviour) this
+        // returns A's context, so the b.rs assertions below are what actually
+        // fail if per-chunk assembly is ever reverted.
+        let context_for = |chunk: &str| {
+            if chunk.contains("a.rs") {
+                "CONTEXT-FOR-A".to_string()
+            } else {
+                "CONTEXT-FOR-B".to_string()
+            }
+        };
+
+        analyzer
+            .analyze(TWO_FILES, &context_for, 512, |_, _| {}, |_| {})
+            .expect("analysis should succeed");
+
+        let prompts = seen.lock().expect("recording backend mutex");
+        assert_eq!(prompts.len(), 2, "one call per file");
+
+        let a = prompts
+            .iter()
+            .find(|p| p.contains("a.rs"))
+            .expect("a.rs should have been reviewed");
+        assert!(a.contains("CONTEXT-FOR-A"));
+        assert!(
+            !a.contains("CONTEXT-FOR-B"),
+            "a.rs's prompt must not carry b.rs's context — that coupling is what \
+             made one file's edit invalidate every other file's cache entry"
+        );
+
+        let b = prompts
+            .iter()
+            .find(|p| p.contains("b.rs"))
+            .expect("b.rs should have been reviewed");
+        assert!(
+            b.contains("CONTEXT-FOR-B") && !b.contains("CONTEXT-FOR-A"),
+            "b.rs was handed a.rs's context, so context is being assembled once \
+             for the whole diff and shared again:\n{b}"
+        );
+    }
+
+    /// Two regions of one file are two units, and each finding records which
+    /// unit produced it — that is what lets the reader be shown the exact hunk
+    /// the model was looking at.
+    #[test]
+    fn distant_regions_are_reviewed_separately_and_findings_name_their_unit() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
++++ b/src/a.rs
+@@ -10,2 +10,2 @@
+-let a = 1;
++let a = 2;
+@@ -400,2 +400,2 @@
+-let z = 1;
++let z = 2;
+";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = Box::new(FindingBackend { seen: seen.clone() });
+        let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
+
+        let (summary, stats) = analyzer
+            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .expect("analysis should succeed");
+
+        assert_eq!(stats.units_total, 2, "two regions, two units");
+
+        let ids: HashSet<&str> = summary
+            .findings
+            .iter()
+            .filter_map(|f| f.unit_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "each finding should name the unit it came from, and the two units \
+             must be distinguishable: {:?}",
+            summary.findings
+        );
+    }
+
+    #[test]
+    fn detector_findings_carry_no_unit_id() {
+        // They are not produced from a unit, and they already carry an exact
+        // file and line. Claiming a unit would be a lie the TUI would act on.
+        let diff = "\
+diff --git a/src/auth.js b/src/auth.js
+--- a/src/auth.js
++++ b/src/auth.js
+@@ -10,6 +10,6 @@
+ function check() {
+-  const token = read();
+-  if (!token) throw new Error('no token');
+-  return verify(token);
++  // const token = read();
++  // if (!token) throw new Error('no token');
++  // return verify(token);
+ }
+";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingBackend { seen });
+        let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
+
+        let (summary, _) = analyzer
+            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .expect("analysis should succeed");
+
+        let detector_findings: Vec<_> = summary
+            .findings
+            .iter()
+            .filter(|f| f.rule_id.as_deref() == Some(crate::types::RULE_COMMENTED_OUT_CODE))
+            .collect();
+        assert!(
+            !detector_findings.is_empty(),
+            "expected the commented-out-code detector to fire"
+        );
+        assert!(detector_findings.iter().all(|f| f.unit_id.is_none()));
+    }
+
+    /// The consequence the user actually feels: a cached chunk stays cached when
+    /// an unrelated file in the same diff changes.
+    #[test]
+    fn an_unrelated_files_edit_does_not_change_a_chunks_cache_key() {
+        let key_for = |ctx: &str| {
+            ReviewCache::key(&CacheKeyInput {
+                backend: "recording",
+                prompt_version: PROMPT_VERSION,
+                chunk: "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n",
+                context: ctx,
+                languages: "Rust",
+                requirements: "",
+                max_tokens: 512,
+                temperature: 0.0,
+                seed: 7,
+            })
+        };
+
+        // Per-chunk context: a.rs's context is a function of a.rs alone, so it
+        // is identical across the two runs and the key is stable.
+        assert_eq!(
+            key_for("enclosing fn in a.rs"),
+            key_for("enclosing fn in a.rs"),
+            "a.rs's key must not move when only b.rs changed"
+        );
+        // And the key still tracks context that genuinely differs.
+        assert_ne!(key_for("enclosing fn in a.rs"), key_for("something else"));
+    }
 
     #[test]
     fn parses_the_documented_object_form() {

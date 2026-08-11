@@ -106,6 +106,7 @@ pub fn detect_commented_out_code(files: &[FileDiff]) -> Vec<ReviewFinding> {
                      entirely. Use version control (git revert/branch) instead of commenting out."
                         .to_string(),
                 confidence: Some(0.95),
+                unit_id: None,
                 rule_id: Some(RULE_COMMENTED_OUT_CODE.to_string()),
             });
         }
@@ -236,7 +237,8 @@ pub fn detect_removed_used_variables(files: &[FileDiff]) -> Vec<ReviewFinding> {
                         "Restore the declaration of `{name}`, or remove the remaining references to it."
                     ),
                     confidence: Some(0.92),
-                    rule_id: Some(RULE_REMOVED_USED_VARIABLE.to_string()),
+                    unit_id: None,
+                        rule_id: Some(RULE_REMOVED_USED_VARIABLE.to_string()),
                 });
             }
         }
@@ -432,6 +434,7 @@ pub fn detect_custom_rule_violations(
                             issue: rule.message.clone(),
                             suggested_fix: rule.fix.clone().unwrap_or_default(),
                             confidence: Some(1.0),
+                            unit_id: None,
                             rule_id: Some(rule.effective_id()),
                         });
                     }

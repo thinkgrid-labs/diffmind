@@ -223,7 +223,7 @@ fn analyze(
 ) -> Result<()> {
     // Every one of these was previously ignored by the TUI path.
     let backend = crate::build_backend(&settings.backend, &model_dir)?;
-    let context = crate::build_context(&project_root, &diff, 8000);
+    let context_for = crate::context_builder(&project_root, 8000);
     let custom_rules = crate::rules::load_custom_rules(&project_root);
     let baseline = if settings.use_baseline {
         std::fs::read_to_string(project_root.join(".diffmind").join("baseline.json"))
@@ -250,11 +250,11 @@ fn analyze(
     let (summary, stats) = analyzer
         .analyze(
             &diff,
-            &context,
+            &context_for,
             settings.max_tokens,
             move |done, total| {
                 let _ =
-                    progress_tx.send(Msg::Progress(format!("Analyzing chunk {done}/{total}...")));
+                    progress_tx.send(Msg::Progress(format!("Analyzing unit {done}/{total}...")));
             },
             move |batch| {
                 let _ = findings_tx.send(Msg::Findings(batch.to_vec()));
@@ -472,6 +472,7 @@ mod tests {
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            unit_id: None,
         }
     }
 

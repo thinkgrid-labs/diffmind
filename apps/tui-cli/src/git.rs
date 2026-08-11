@@ -1,40 +1,32 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
-/// Paths never worth spending inference on. Kept in one place so every diff
-/// entry point (branch, last commit, staged) excludes the same things.
+/// Directories that are never worth even *reading*: dependency trees and build
+/// output, where a single `git diff` can run to hundreds of megabytes.
+///
+/// This list used to also carry lockfiles, minified bundles, snapshots and
+/// binary assets. Those moved to `core_engine::prefilter`, because a pathspec
+/// exclusion is invisible: the file never enters the diff, so there is no way
+/// to tell the reviewer *what* was skipped. "312 hunks → 74 reviewable
+/// (238 filtered: lockfiles, generated, formatting)" is the line that makes the
+/// filtering trustworthy, and it can only be produced in process.
+///
+/// What stays here is what we would not want to pay to read, ever.
 const EXCLUDES: &[&str] = &[
     ":!node_modules",
     ":!vendor",
     ":!target",
-    ":!*-lock.json",
-    ":!pnpm-lock.yaml",
-    ":!package-lock.json",
-    ":!yarn.lock",
-    ":!Cargo.lock",
-    ":!poetry.lock",
-    ":!go.sum",
-    ":!composer.lock",
     ":!dist",
     ":!build",
     ":!.next",
     ":!.cache",
-    ":!*.map",
-    ":!*.min.js",
-    ":!*.min.css",
-    ":!*.snap",
-    ":!*.svg",
-    ":!*.png",
-    ":!*.jpg",
-    ":!*.gif",
-    ":!*.pdf",
-    ":!*.woff",
-    ":!*.woff2",
 ];
 
-/// Refuse diffs larger than this. Past it, chunking alone would take longer
-/// than a human review.
-const MAX_DIFF_KB: usize = 1500;
+/// Hard ceiling on the *raw* diff, before filtering. Only a backstop against
+/// pathological input eating memory — the reviewable-size limit is applied to
+/// the post-filter diff by the caller, since a 40 MB lockfile change should
+/// leave a perfectly reviewable branch behind.
+const MAX_RAW_DIFF_MB: usize = 64;
 
 fn git(args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
@@ -125,14 +117,50 @@ fn run_diff(range: Option<&str>, paths: &[String], cached: bool) -> Result<Strin
     }
 
     let diff = String::from_utf8_lossy(&output.stdout).to_string();
-    let size_kb = diff.len() / 1024;
-    if size_kb > MAX_DIFF_KB {
+    let size_mb = diff.len() / (1024 * 1024);
+    if size_mb > MAX_RAW_DIFF_MB {
         return Err(anyhow::anyhow!(
-            "diff is too large to review ({size_kb} KB, limit {MAX_DIFF_KB} KB). \
+            "diff is too large to process ({size_mb} MB, limit {MAX_RAW_DIFF_MB} MB). \
              Review specific paths instead, e.g. `diffmind src/`."
         ));
     }
     Ok(diff)
+}
+
+/// Repo-relative paths git marks `linguist-generated` in `.gitattributes`.
+///
+/// Asked in one batch: `check-attr` is a process spawn, and a 40-file diff
+/// should not cost 40 of them.
+pub fn linguist_generated(paths: &[String]) -> std::collections::HashSet<String> {
+    let mut generated = std::collections::HashSet::new();
+    if paths.is_empty() {
+        return generated;
+    }
+
+    let mut args: Vec<&str> = vec!["check-attr", "linguist-generated", "--"];
+    args.extend(paths.iter().map(String::as_str));
+
+    let Ok(output) = git(&args) else {
+        return generated;
+    };
+    if !output.status.success() {
+        return generated;
+    }
+
+    // `<path>: linguist-generated: set` — the path may itself contain ": ",
+    // so split from the right.
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((path, value)) = line.rsplit_once(": ") else {
+            continue;
+        };
+        if value.trim() != "set" {
+            continue;
+        }
+        if let Some((path, _)) = path.rsplit_once(": ") {
+            generated.insert(path.to_string());
+        }
+    }
+    generated
 }
 
 /// Returns the diff for the most recent commit only.
@@ -227,15 +255,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn excludes_cover_the_usual_noise() {
-        for pattern in [
-            ":!node_modules",
-            ":!pnpm-lock.yaml",
-            ":!Cargo.lock",
-            ":!*.min.js",
-        ] {
+    fn excludes_cover_only_the_never_read_directories() {
+        for pattern in [":!node_modules", ":!target", ":!dist"] {
             assert!(EXCLUDES.contains(&pattern), "{pattern} should be excluded");
         }
+        // Lockfiles and friends must reach the diff so the pre-filter can drop
+        // them *and say so*. Excluding them here would make the count a lie.
+        for pattern in [":!pnpm-lock.yaml", ":!Cargo.lock", ":!*.min.js", ":!*.svg"] {
+            assert!(
+                !EXCLUDES.contains(&pattern),
+                "{pattern} belongs in the pre-filter, where it can be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn linguist_generated_is_empty_rather_than_failing_without_paths() {
+        assert!(linguist_generated(&[]).is_empty());
     }
 
     #[test]

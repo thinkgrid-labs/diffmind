@@ -140,6 +140,7 @@ mod tests {
             suggested_fix: "use env vars".into(),
             confidence: Some(0.9),
             rule_id: Some(rule.into()),
+            unit_id: None,
         }
     }
 

@@ -84,7 +84,6 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub diff: String,
-    pub context: String,
     pub languages: Vec<String>,
     pub requirements: Option<String>,
     pub max_tokens: u32,
@@ -93,6 +92,9 @@ pub struct ReviewRequest {
     pub rules: Vec<core_engine::CustomRule>,
     pub baseline: Option<String>,
     pub use_cache: bool,
+    /// Where the daemon loads the symbol index and cache from. The client does
+    /// not send assembled context: the daemon owns chunking, so only it knows
+    /// what each chunk contains and therefore what context that chunk needs.
     pub project_root: String,
 }
 
@@ -115,9 +117,9 @@ pub struct ReviewResponse {
 /// struct); mirror it rather than force serde into the engine's public API.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SerializableStats {
-    pub chunks_total: usize,
-    pub chunks_cached: usize,
-    pub chunks_unparseable: usize,
+    pub units_total: usize,
+    pub units_cached: usize,
+    pub units_unparseable: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -127,9 +129,9 @@ pub struct SerializableStats {
 impl From<&AnalysisStats> for SerializableStats {
     fn from(s: &AnalysisStats) -> Self {
         SerializableStats {
-            chunks_total: s.chunks_total,
-            chunks_cached: s.chunks_cached,
-            chunks_unparseable: s.chunks_unparseable,
+            units_total: s.units_total,
+            units_cached: s.units_cached,
+            units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -141,9 +143,9 @@ impl From<&AnalysisStats> for SerializableStats {
 impl From<SerializableStats> for AnalysisStats {
     fn from(s: SerializableStats) -> Self {
         AnalysisStats {
-            chunks_total: s.chunks_total,
-            chunks_cached: s.chunks_cached,
-            chunks_unparseable: s.chunks_unparseable,
+            units_total: s.units_total,
+            units_cached: s.units_cached,
+            units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -549,7 +551,6 @@ mod tests {
         let response = client
             .review(ReviewRequest {
                 diff: "d".into(),
-                context: String::new(),
                 languages: vec![],
                 requirements: None,
                 max_tokens: 128,
@@ -594,7 +595,6 @@ mod tests {
         let err = attacker
             .review(ReviewRequest {
                 diff: "secret code".into(),
-                context: String::new(),
                 languages: vec![],
                 requirements: None,
                 max_tokens: 16,

@@ -158,6 +158,7 @@ mod tests {
                 suggested_fix: "fix".into(),
                 confidence: Some(0.9),
                 rule_id: Some("DM001".into()),
+                unit_id: None,
             }],
             positives: vec!["nice".into()],
             suggestions: vec![],

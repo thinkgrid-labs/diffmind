@@ -251,7 +251,7 @@ fn parse_git_header_path(rest: &str) -> String {
 
 /// Parse `@@ -old_start,old_count +new_start,new_count @@ optional context`.
 /// Returns `(old_start, new_start)`, defaulting to 1 on malformed input.
-fn parse_hunk_header(line: &str) -> (u32, u32) {
+pub(crate) fn parse_hunk_header(line: &str) -> (u32, u32) {
     let mut old_start = 1u32;
     let mut new_start = 1u32;
 
@@ -272,80 +272,6 @@ fn parse_hunk_header(line: &str) -> (u32, u32) {
     }
 
     (old_start, new_start)
-}
-
-// ─── Chunking ────────────────────────────────────────────────────────────────
-
-/// Split a diff into model-sized chunks.
-///
-/// Every chunk is self-describing: continuation chunks of a long file are
-/// re-prefixed with that file's `diff --git` header and a synthetic hunk
-/// header. Without it the model saw an anonymous slab of `+`/`-` lines with no
-/// filename and invented one for the `file` field of its findings.
-pub fn chunk_diff(diff: &str, max_lines: usize) -> Vec<String> {
-    let max_lines = max_lines.max(1);
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(4096);
-    let mut line_count = 0usize;
-    // Header lines to replay at the top of a continuation chunk.
-    let mut file_header = String::new();
-    let mut hunk_header = String::new();
-
-    let push_chunk = |current: &mut String, chunks: &mut Vec<String>| {
-        if !current.trim().is_empty() {
-            chunks.push(std::mem::take(current));
-        } else {
-            current.clear();
-        }
-    };
-
-    for line in diff.lines() {
-        let is_file_boundary = line.starts_with("diff --git");
-
-        if is_file_boundary && !current.is_empty() {
-            push_chunk(&mut current, &mut chunks);
-            line_count = 0;
-        } else if line_count >= max_lines && !current.is_empty() {
-            push_chunk(&mut current, &mut chunks);
-            line_count = 0;
-            // Replay context so this chunk stands alone.
-            if !file_header.is_empty() {
-                current.push_str(&file_header);
-                current.push('\n');
-                line_count += 1;
-            }
-            if !hunk_header.is_empty() {
-                current.push_str(&hunk_header);
-                current.push_str("  [continued]\n");
-                line_count += 1;
-            }
-        }
-
-        if is_file_boundary {
-            file_header = line.to_string();
-            hunk_header.clear();
-        } else if line.starts_with("@@") {
-            hunk_header = line.to_string();
-        }
-
-        // Truncate extremely long lines (e.g. minified code) to prevent OOM.
-        if line.len() > 2048 {
-            let mut end = 2048;
-            while end > 0 && !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            current.push_str(&line[..end]);
-            current.push_str("... [line truncated]");
-        } else {
-            current.push_str(line);
-        }
-
-        current.push('\n');
-        line_count += 1;
-    }
-
-    push_chunk(&mut current, &mut chunks);
-    chunks
 }
 
 // ─── Finding anchoring ───────────────────────────────────────────────────────
@@ -490,45 +416,6 @@ index 111..222 100644
         assert_eq!(files[0].path, "my b/dir.rs");
     }
 
-    #[test]
-    fn continuation_chunks_carry_the_file_header() {
-        let mut diff = String::from("diff --git a/big.rs b/big.rs\n@@ -1,100 +1,100 @@\n");
-        for i in 0..20 {
-            diff.push_str(&format!("+line {i}\n"));
-        }
-        let chunks = chunk_diff(&diff, 8);
-        assert!(chunks.len() > 1, "expected the diff to split");
-        for (i, c) in chunks.iter().enumerate() {
-            assert!(
-                c.contains("big.rs"),
-                "chunk {i} has no filename, so the model cannot attribute findings:\n{c}"
-            );
-        }
-    }
-
-    #[test]
-    fn chunk_diff_splits_on_file_boundary() {
-        let diff = "diff --git a/f1.js b/f1.js\n+a\ndiff --git a/f2.js b/f2.js\n-b\n";
-        let chunks = chunk_diff(diff, 100);
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].contains("f1.js"));
-        assert!(chunks[1].contains("f2.js"));
-    }
-
-    #[test]
-    fn chunk_diff_empty() {
-        assert!(chunk_diff("", 10).is_empty());
-    }
-
-    #[test]
-    fn chunk_diff_never_emits_blank_chunks() {
-        let chunks = chunk_diff("\n\n\n", 1);
-        assert!(
-            chunks.is_empty(),
-            "whitespace-only chunks waste a full inference pass"
-        );
-    }
-
     fn f(file: &str, line: u32) -> ReviewFinding {
         ReviewFinding {
             file: file.into(),
@@ -539,6 +426,7 @@ index 111..222 100644
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            unit_id: None,
         }
     }
 

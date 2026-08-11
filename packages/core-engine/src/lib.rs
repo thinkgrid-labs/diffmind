@@ -13,10 +13,12 @@ pub mod detectors;
 pub mod diff;
 pub mod error;
 pub mod json_guard;
+pub mod prefilter;
 pub mod prompt;
 pub mod sarif;
 pub mod suppression;
 pub mod types;
+pub mod unit;
 
 pub use analyzer::{AnalysisStats, ReviewAnalyzer, TriageMode, parse_review_response};
 pub use backend::{
@@ -25,10 +27,12 @@ pub use backend::{
 };
 pub use cache::ReviewCache;
 pub use detectors::{detect_commented_out_code, detect_removed_used_variables};
-pub use diff::{FileDiff, anchor_findings, chunk_diff, parse_diff};
+pub use diff::{FileDiff, anchor_findings, parse_diff};
 pub use error::EngineError;
+pub use prefilter::{DropReason, PrefilterOptions, PrefilterReport, looks_generated, prefilter};
 pub use sarif::to_sarif;
 pub use suppression::{Baseline, InlineSuppressions};
 pub use types::{
     Category, CommitSuggestion, CustomRule, PrDescription, ReviewFinding, ReviewSummary, Severity,
 };
+pub use unit::{ReviewUnit, build_units};

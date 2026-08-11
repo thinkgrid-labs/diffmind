@@ -109,6 +109,12 @@ pub struct ReviewFinding {
     /// Absent only on freshly-parsed model output, before `assign_rule_ids`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
+    /// The review unit this finding came out of, so a reader can be shown the
+    /// exact hunk and context that produced it. Absent on findings from the
+    /// deterministic detectors, which are not derived from a unit and already
+    /// carry an exact file and line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
 }
 
 /// Confidence attributed to a model finding that did not report its own.
@@ -319,6 +325,7 @@ mod tests {
             suggested_fix: String::new(),
             confidence: None,
             rule_id: None,
+            unit_id: None,
         }
     }
 

@@ -126,12 +126,12 @@ pub fn print_positives_and_suggestions(positives: &[String], suggestions: &[Stri
 pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
     eprintln!("  {}", "─".repeat(62).dark_grey());
 
-    if stats.chunks_unparseable > 0 {
+    if stats.units_unparseable > 0 {
         eprintln!(
             "  {}  {} chunk{} produced unusable output — try a larger --model",
             "!".yellow(),
-            stats.chunks_unparseable,
-            plural(stats.chunks_unparseable)
+            stats.units_unparseable,
+            plural(stats.units_unparseable)
         );
     }
     if stats.suppressed > 0 {
@@ -166,13 +166,13 @@ pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
             plural(stats.files_skipped_by_triage)
         );
     }
-    if stats.chunks_cached > 0 {
+    if stats.units_cached > 0 {
         eprintln!(
             "  {}  {}/{} chunk{} served from cache",
             "·".dark_grey(),
-            stats.chunks_cached,
-            stats.chunks_total,
-            plural(stats.chunks_total)
+            stats.units_cached,
+            stats.units_total,
+            plural(stats.units_total)
         );
     }
 
@@ -219,9 +219,9 @@ pub fn render(
             "positives": summary.positives,
             "suggestions": summary.suggestions,
             "stats": {
-                "chunks": stats.chunks_total,
-                "chunks_cached": stats.chunks_cached,
-                "chunks_unparseable": stats.chunks_unparseable,
+                "units": stats.units_total,
+                "units_cached": stats.units_cached,
+                "units_unparseable": stats.units_unparseable,
                 "suppressed": stats.suppressed,
                 "discarded_unanchorable": stats.unanchorable,
                 "below_confidence": stats.below_confidence,
@@ -312,8 +312,8 @@ fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> Stri
 
     out.push_str(&format!(
         "<sub>diffmind {VERSION} · {model} · {} chunk{} analyzed",
-        stats.chunks_total,
-        plural(stats.chunks_total)
+        stats.units_total,
+        plural(stats.units_total)
     ));
     if stats.suppressed > 0 {
         out.push_str(&format!(" · {} suppressed", stats.suppressed));
@@ -342,6 +342,7 @@ mod tests {
             suggested_fix: "do the other thing".into(),
             confidence: Some(0.9),
             rule_id: Some("DM001".into()),
+            unit_id: None,
         }
     }
 

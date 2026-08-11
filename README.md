@@ -27,6 +27,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 
 ## Features
 
+- **Deterministic pre-filter** — lockfiles, generated files, minified bundles, assets and formatting-only hunks are dropped before the model sees them, and the run tells you exactly what it skipped: `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
 - **Deterministic detectors** — commented-out code, removed-but-still-used declarations, and your own regex rules. These run before the model, cost nothing, and are the findings you can trust unconditionally.
 - **Security, bug, performance and maintainability review** by a local model
 - **Ticket-aware review** — check the diff actually implements the acceptance criteria (`--ticket`)
@@ -267,6 +268,8 @@ triage        = "auto"     # two-pass triage on large diffs
 cache         = true
 temperature   = 0.0        # 0 = greedy and reproducible
 max_tokens    = 1024
+# Extra paths to drop, on top of the built-in noise rules.
+ignore        = ["**/legacy/**", "*.generated.ts"]
 
 [backend]
 kind        = "local"      # or "ollama" / "openai-compatible"
@@ -371,13 +374,14 @@ Options:
 ## How It Works
 
 1. **Parse** — the diff is parsed once into typed per-file hunks with real pre/post-image line numbers.
-2. **Deterministic detectors** — commented-out code, removed-but-used declarations, and your regex rules. No model involved.
-3. **Context** — the enclosing function of each hunk (plus definitions of referenced symbols) is pulled from `.diffmind/symbols.json`.
-4. **Triage** — on large diffs, a cheap first pass decides which files carry real risk.
-5. **Chunked inference** — chunks are sized to the backend's *actual* context window, read from the GGUF metadata.
-6. **Constrained decoding** — the sampler consults a JSON state machine before committing each token, so the model cannot emit a preamble, an unbalanced brace, or a truncated string. Output that hits the token cap is repaired rather than discarded.
-7. **Anchoring** — findings pointing at a file not in the diff are dropped; off-by-N line numbers snap to the nearest changed line.
-8. **Suppression** — inline directives, the baseline, and `--min-confidence` are applied, then results are deduplicated and sorted.
+2. **Pre-filter** — lockfiles, `linguist-generated` paths, files carrying a `@generated` banner, minified bundles, assets, snapshots, your `ignore` globs, and hunks that only change whitespace are dropped. Costs nothing, typically removes most of a real branch, and the counts are reported rather than silently applied. Whitespace inside a string literal counts as content, and indentation is never dismissed in Python or YAML.
+3. **Deterministic detectors** — commented-out code, removed-but-used declarations, and your regex rules. No model involved.
+4. **Context** — the enclosing function of each hunk (plus definitions of referenced symbols) is pulled from `.diffmind/symbols.json`, assembled per chunk so one file's edit does not invalidate another's cached result.
+5. **Triage** — on large diffs, a cheap first pass decides which files carry real risk.
+6. **Review units** — hunks are grouped into regions of a file rather than cut wherever a line budget ran out, so related hunks are read together and an edit in one function only re-reviews that function. Units are sized to the backend's *actual* context window, read from the GGUF metadata.
+7. **Constrained decoding** — the sampler consults a JSON state machine before committing each token, so the model cannot emit a preamble, an unbalanced brace, or a truncated string. Output that hits the token cap is repaired rather than discarded.
+8. **Anchoring** — findings pointing at a file not in the diff are dropped; off-by-N line numbers snap to the nearest changed line.
+9. **Suppression** — inline directives, the baseline, and `--min-confidence` are applied, then results are deduplicated and sorted.
 
 ---
 
@@ -394,7 +398,9 @@ diffmind/
 │   ├── detectors.rs            # deterministic rules
 │   ├── diff.rs                 # unified-diff parser, chunking, finding anchoring
 │   ├── json_guard.rs           # constrained-decoding state machine
+│   ├── prefilter.rs            # deterministic noise removal, with counts
 │   ├── prompt.rs               # prompt construction
+│   ├── unit.rs                 # hunks → review units (the cached, reviewed thing)
 │   ├── sarif.rs                # SARIF 2.1.0 output
 │   └── suppression.rs          # inline directives and baselines
 └── apps/tui-cli/src/

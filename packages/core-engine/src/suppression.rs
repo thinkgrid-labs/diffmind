@@ -268,6 +268,7 @@ mod tests {
             suggested_fix: String::new(),
             confidence: None,
             rule_id: Some(rule.into()),
+            unit_id: None,
         }
     }
 
