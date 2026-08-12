@@ -488,6 +488,50 @@ pub fn refresh(token: &str) -> bool {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Why the graph is refreshed before every review rather than on demand.
+    ///
+    /// A stale graph does not merely miss new code — its line ranges point at
+    /// whatever now occupies those lines, and `source` reads the working tree,
+    /// so the model is handed unrelated code labelled as the enclosing symbol.
+    /// Confidently wrong context is worse than none.
+    #[test]
+    fn a_stale_graph_reports_the_wrong_lines_until_reindexed() {
+        let root = project("stale");
+        write(
+            &root,
+            "src/a.rs",
+            "pub fn target() {\n    let secret = 1;\n}\n",
+        );
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+
+        let before = g.definitions_of("target", None, 1).remove(0);
+        assert!(before.source(&root, 100).unwrap().contains("let secret"));
+
+        // Someone adds imports at the top — utterly ordinary.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(
+            &root,
+            "src/a.rs",
+            "// added\n// added\n// added\n// added\n// added\npub fn target() {\n    let secret = 1;\n}\n",
+        );
+
+        let stale = g.definitions_of("target", None, 1).remove(0);
+        assert!(
+            !stale.source(&root, 100).unwrap().contains("let secret"),
+            "this is the failure mode being guarded against"
+        );
+
+        // Re-indexing is what makes it right again, and is cheap enough to do
+        // before every review.
+        g.index(&root, &|_| {}).unwrap();
+        let fresh = g.definitions_of("target", None, 1).remove(0);
+        assert_eq!(fresh.start_line, 6);
+        assert!(fresh.source(&root, 100).unwrap().contains("let secret"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_deleted_file_drops_out_of_the_graph() {
         let root = project("deleted");

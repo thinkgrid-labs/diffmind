@@ -103,6 +103,11 @@ fn run() -> Result<i32> {
     // surfaces review exactly the same set of hunks.
     let (diff, prefilter) = apply_prefilter(&diff, &settings, &project_root)?;
 
+    // Refresh the graph before either surface reads it.
+    if settings.auto_index {
+        sync_graph(&project_root, settings.format.is_machine_readable());
+    }
+
     if prefilter.dropped_everything() {
         // Distinct from "no changes": there *were* changes, and none of them
         // were worth a reviewer's attention. Reporting zero findings without
@@ -725,6 +730,41 @@ fn read_head(path: &Path) -> std::io::Result<String> {
 /// a symbol lookup rather than a re-read of `symbols.json`. Returning a closure
 /// (instead of one context string for the whole diff) is what keeps each
 /// chunk's cache key independent of the other files in the diff.
+/// Bring the code graph up to date before reviewing.
+///
+/// Incremental and mtime-keyed: re-checking an unchanged 647-file repository
+/// costs about a tenth of a second, which is nothing beside one inference pass.
+///
+/// Doing it automatically matters more than the cost. A stale graph does not
+/// merely miss new code — it reports **wrong line ranges**, and `Def::source`
+/// then reads those lines out of the working tree and hands the model unrelated
+/// code labelled as the enclosing function. Confidently wrong context is worse
+/// than none, so the default is to never let the graph fall behind.
+///
+/// Never fatal: the graph is an optimisation, and a review must still run
+/// without it.
+fn sync_graph(project_root: &Path, quiet: bool) {
+    let Ok(mut graph) = Graph::open(project_root) else {
+        return;
+    };
+    // Only the first build is slow enough to be worth a spinner.
+    let spinner = (graph.is_empty() && !quiet)
+        .then(|| make_spinner("Building code graph (first run)...", false));
+
+    let progress = |n: usize| {
+        if let Some(s) = &spinner {
+            s.set_message(format!("Building code graph... {n} files"));
+        }
+    };
+    if let Err(e) = graph.index(project_root, &progress) {
+        eprintln!("  !  code graph not refreshed: {e}");
+    }
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
+    runs::ensure_gitignore(project_root);
+}
+
 /// Merge units the code graph says are two halves of one change. Without a
 /// graph this is the identity function, so behaviour is unchanged.
 pub fn unit_grouper(project_root: &Path) -> core_engine::analyzer::UnitGrouper {
