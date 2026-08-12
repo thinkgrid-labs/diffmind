@@ -483,3 +483,146 @@ fn the_exit_code_follows_the_fail_threshold_not_the_finding_count() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Agent config, ignore files and prose must not cost an inference pass — and
+/// must not reach the model at all.
+///
+/// Reported from the field on 0.9.0: every file under `.claude/` came back as a
+/// HIGH finding. Those files are imperative English about credentials, shell
+/// commands and permissions, which is exactly what a reviewer prompt primed for
+/// "exposed secrets, disabled auth" is looking for. The content assertions
+/// matter more than the path ones here: a path can vanish from the prompt while
+/// the body is still being reviewed under the previous file's header.
+#[test]
+fn agent_config_ignore_files_and_docs_never_reach_the_model() {
+    let dir = tmpdir("toolconfig");
+    let stub = Stub::spawn(2);
+
+    let diff = "\
+--- a/.claude/skills/deploy.md
++++ b/.claude/skills/deploy.md
+@@ -1,2 +1,3 @@
+ # Deploy
++Always export AWS_SECRET_ACCESS_KEY before deploying.
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,2 @@
+-.env
++.env.local
+--- a/.prettierrc.json
++++ b/.prettierrc.json
+@@ -1,1 +1,1 @@
+-{ \"semi\": true }
++{ \"semi\": false }
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ # Project
++Put your token in .env
+--- a/src/two.rs
++++ b/src/two.rs
+@@ -10,2 +10,2 @@
+-let b = verify(token);
++let b = true;
+";
+
+    let run = review_stdin(
+        &dir,
+        diff,
+        &[
+            "--format",
+            "json",
+            "--backend",
+            "openai-compatible",
+            "--backend-model",
+            "stub",
+            "--backend-url",
+            &stub.url(),
+        ],
+    );
+
+    let prompts = stub.prompts();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "only src/two.rs is reviewable.\nstderr: {}",
+        run.stderr
+    );
+
+    for leaked in [
+        "AWS_SECRET_ACCESS_KEY",
+        ".claude",
+        ".gitignore",
+        ".env.local",
+        ".prettierrc",
+        "semi",
+        "README.md",
+        "Put your token",
+    ] {
+        assert!(
+            !prompts[0].contains(leaked),
+            "{leaked:?} reached the model:\n{}",
+            prompts[0]
+        );
+    }
+    assert!(prompts[0].contains("src/two.rs"));
+
+    let found = findings(&run.stdout);
+    let files: Vec<&str> = found.iter().filter_map(|f| f["file"].as_str()).collect();
+    assert_eq!(files, ["src/two.rs"], "only the code file is reported");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The opt-in exists for teams whose docs carry contracts. It reopens prose
+/// only — agent config stays out regardless.
+#[test]
+fn include_docs_reopens_prose_but_not_agent_config() {
+    let dir = tmpdir("includedocs");
+    let stub = Stub::spawn(3);
+
+    let diff = "\
+--- a/.claude/skills/deploy.md
++++ b/.claude/skills/deploy.md
+@@ -1,2 +1,3 @@
+ # Deploy
++Always export AWS_SECRET_ACCESS_KEY before deploying.
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -1,1 +1,2 @@
+ # API
++POST /v1/charge is idempotent.
+";
+
+    let run = review_stdin(
+        &dir,
+        diff,
+        &[
+            "--include-docs",
+            "--format",
+            "json",
+            "--backend",
+            "openai-compatible",
+            "--backend-model",
+            "stub",
+            "--backend-url",
+            &stub.url(),
+        ],
+    );
+
+    let prompts = stub.prompts();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "docs are reviewed, agent config is not.\nstderr: {}",
+        run.stderr
+    );
+    assert!(prompts[0].contains("docs/api.md"));
+    assert!(
+        !prompts[0].contains("AWS_SECRET_ACCESS_KEY"),
+        "--include-docs must not reopen .claude/:\n{}",
+        prompts[0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -702,6 +702,7 @@ fn apply_prefilter(
         &PrefilterOptions {
             generated_paths,
             ignore_globs: settings.ignore_globs.clone(),
+            include_docs: settings.include_docs,
         },
     );
 

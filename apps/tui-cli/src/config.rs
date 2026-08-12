@@ -39,6 +39,10 @@ pub struct ReviewConfig {
     /// Same syntax as a rule's `files`: `*.ts`, `**/legacy/**`, or an exact path.
     #[serde(default)]
     pub ignore: Option<Vec<String>>,
+    /// Review documentation (`.md`, `.rst`, `.txt`) as code. Off by default:
+    /// a model primed for vulnerabilities will find them in prose. Tool config
+    /// and ignore files are always skipped and have no switch.
+    pub include_docs: Option<bool>,
     /// Refresh the code graph before each review. On by default — a stale graph
     /// reports wrong line ranges, not merely missing ones.
     pub auto_index: Option<bool>,

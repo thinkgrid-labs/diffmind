@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.9.1] — 08-12-2026
+
+Config is not code, and reviewing it as though it were produced confident
+nonsense. Reported from the field: every file under `.claude/` came back HIGH.
+
+### Fixed
+
+- **Coding-agent and editor config is no longer reviewed.** `.claude/`,
+  `.cursor/`, `.windsurf/`, `.aider/`, `.vscode/`, `.idea/`, `.zed/` and
+  `.fleet/` are dropped by the pre-filter. These files are imperative English
+  about credentials, shell commands and permissions — precisely the shape a
+  reviewer prompt primed for "exposed secrets, disabled auth" reads as an
+  emergency. `.claude/` is also instructions written *for* a model, which is a
+  poor thing to hand to one.
+- **Ignore files and formatter config are dropped**: `.gitignore`,
+  `.dockerignore`, `.prettierignore` and the rest of the `.*ignore` family,
+  plus `.editorconfig`, `.gitattributes`, `.prettierrc*`, `.eslintrc*`,
+  `.npmrc`, `.nvmrc`, `.cursorrules`. Declarative lists with no program logic
+  in them. `eslint.config.js` and friends are still reviewed — those are real
+  JavaScript, and a bug in one is a bug.
+- **Documentation is dropped by default** (`.md`, `.mdx`, `.rst`, `.txt`,
+  `.adoc`, `.org`, `.tex`). Re-enable with `--include-docs` or
+  `review.include_docs = true` for docs that carry API contracts. The switch
+  covers prose only — agent config stays out either way.
+
+Everything dropped is *counted and reported* in the existing summary line
+("312 hunks → 74 reviewable"), under the new `docs` and `tool config` reasons,
+rather than silently disappearing. Test files are unaffected and still
+reviewed: a test that asserts nothing is worth catching.
+
 ## [0.9.0] — 08-12-2026
 
 diffmind was built as a gate: run it, get a verdict, pass or fail. This release
