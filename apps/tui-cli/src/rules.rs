@@ -128,6 +128,116 @@ fn warn_on_duplicate_ids(rules: &[CustomRule]) {
     }
 }
 
+/// Validate `.diffmind/rules/` and `.diffmind/rules.toml`. Returns the exit code.
+///
+/// Exists because every other check in this module warns on stderr during a
+/// review, where it scrolls past behind the findings. A rule set that stopped
+/// working deserves to fail CI, not to be mentioned in passing.
+pub fn check(project_root: &Path) -> anyhow::Result<i32> {
+    let mut problems = 0usize;
+
+    let dir = project_root.join(".diffmind").join("rules");
+    // Name files, not ids: when two rule sets collide the ids are identical, so
+    // an id-based message tells the reader nothing about which file to edit.
+    let mut parsed: Vec<(std::path::PathBuf, Rulebook)> = Vec::new();
+
+    if dir.is_dir() {
+        let mut entries: Vec<std::path::PathBuf> = walkdir::WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        entries.sort();
+
+        for path in entries {
+            let path = path.as_path();
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("  ✗  {}: {e}", path.display());
+                    problems += 1;
+                    continue;
+                }
+            };
+            match core_engine::rulebook::parse(&stem, &text) {
+                Ok(book) => {
+                    // A glob nobody can satisfy is the silent-no-op this whole
+                    // command exists to surface.
+                    for glob in &book.scope {
+                        if glob.trim().is_empty() {
+                            println!("  ✗  {}: empty glob in `scope`", path.display());
+                            problems += 1;
+                        }
+                    }
+                    println!("  ✓  {:<28} {}", book.id, path.display());
+                    parsed.push((path.to_path_buf(), book));
+                }
+                Err(e) => {
+                    println!("  ✗  {}: {e}", path.display());
+                    problems += 1;
+                }
+            }
+        }
+    }
+
+    // Two rule sets saying the same thing cost tokens twice and give the model
+    // two chances to report the same finding.
+    for i in 0..parsed.len() {
+        for j in (i + 1)..parsed.len() {
+            if parsed[i].1.body == parsed[j].1.body {
+                println!(
+                    "  ✗  {} and {} have identical bodies — delete one.",
+                    parsed[i].0.display(),
+                    parsed[j].0.display()
+                );
+                problems += 1;
+            }
+        }
+    }
+
+    // Counted from what was parsed above rather than by calling
+    // `load_rulebooks`, which would re-parse every file and print its own copy
+    // of the warnings this command has already reported.
+    let mut ids: std::collections::HashMap<&str, Vec<&std::path::Path>> = Default::default();
+    for (path, book) in &parsed {
+        ids.entry(book.id.as_str()).or_default().push(path);
+    }
+    let mut collisions: Vec<_> = ids.iter().filter(|(_, v)| v.len() > 1).collect();
+    collisions.sort_by_key(|(id, _)| *id);
+    for (id, paths) in collisions {
+        let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        println!(
+            "  ✗  {} rule sets share the id '{id}' ({}) — set an explicit `id`.",
+            paths.len(),
+            names.join(", ")
+        );
+        problems += 1;
+    }
+
+    // Pattern rules: an invalid regex is skipped at review time with a warning
+    // nobody reads. Here it is a failure.
+    for rule in load_custom_rules(project_root) {
+        if let Err(e) = regex::Regex::new(&rule.pattern) {
+            println!("  ✗  rule '{}': invalid regex — {e}", rule.effective_id());
+            problems += 1;
+        }
+    }
+
+    if problems == 0 {
+        println!("\n  {} rule set(s), no problems.", parsed.len());
+        Ok(0)
+    } else {
+        println!("\n  {problems} problem(s).");
+        Ok(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

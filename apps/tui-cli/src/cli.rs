@@ -297,6 +297,8 @@ pub enum RulesAction {
     Init,
     /// List the rule sets that would be loaded, and what they govern
     List,
+    /// Validate every rule set and pattern rule. Exit 1 on a problem — for CI.
+    Check,
 }
 
 #[derive(Subcommand, Debug)]

@@ -9,29 +9,83 @@ use crate::rulebook::Rulebook;
 /// and with its declared severity so the ceiling is stated rather than merely
 /// enforced after the fact.
 fn render_rulebooks(books: &[&Rulebook], max_bytes: usize) -> String {
+    render_rulebooks_reporting_drops(books, max_bytes).0
+}
+
+/// Render the rule sets, and name the ones that did not fit.
+///
+/// Two properties, both learned from a `high`-severity security rule set going
+/// missing without a word.
+///
+/// **Whole rule sets are dropped, never truncated.** Half a rule reads as a
+/// complete rule that says something else — "never log tokens unless redacted"
+/// cut short becomes its own inversion.
+///
+/// **The lowest severity goes first.** Rule sets arrive in filename order, so
+/// the previous behaviour shed whichever came last alphabetically: a
+/// `security.md` lost to an `api.md` on the letter `s`. Severity is the only
+/// ranking the author actually declared, so it decides. Ties keep filename
+/// order, which keeps the rendering deterministic and the cache key stable.
+pub(crate) fn render_rulebooks_reporting_drops(
+    books: &[&Rulebook],
+    max_bytes: usize,
+) -> (String, Vec<String>) {
     if books.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
 
-    let mut out = String::from("\n\n### Project review rules\n");
-    for book in books {
+    let entry_for = |book: &Rulebook| {
         let label = match book.severity {
             Some(s) => format!("{} ({} severity)", book.id, s.as_str()),
             None => book.id.clone(),
         };
-        let entry = format!("\n--- {label} ---\n{}\n", book.body);
-        // Stop at a whole rule set rather than truncating one mid-sentence: half
-        // a rule reads as a complete rule that says something else.
-        if out.len() + entry.len() > max_bytes {
-            break;
+        format!("\n--- {label} ---\n{}\n", book.body)
+    };
+
+    // Decide what fits by severity, but render in the original order so the
+    // prompt — and therefore the cache key — does not depend on the ranking.
+    let mut by_priority: Vec<(usize, &&Rulebook)> = books.iter().enumerate().collect();
+    by_priority.sort_by(|a, b| {
+        b.1.budget_rank()
+            .cmp(&a.1.budget_rank())
+            .then(a.0.cmp(&b.0))
+    });
+
+    let header_len = "\n\n### Project review rules\n".len();
+    let mut used = header_len;
+    let mut keep = vec![false; books.len()];
+    let mut dropped = Vec::new();
+
+    for (index, book) in by_priority {
+        let len = entry_for(book).len();
+        if used + len > max_bytes {
+            dropped.push(book.id.clone());
+            continue;
         }
-        out.push_str(&entry);
+        used += len;
+        keep[index] = true;
+    }
+
+    let mut out = String::from("\n\n### Project review rules\n");
+    for (index, book) in books.iter().enumerate() {
+        if keep[index] {
+            out.push_str(&entry_for(book));
+        }
     }
 
     if out.trim() == "### Project review rules" {
-        return String::new();
+        return (String::new(), dropped);
     }
-    out
+    (out, dropped)
+}
+
+/// Ids of the rule sets that would not fit `max_bytes`, worst-affected last.
+///
+/// Exposed so the CLI can say so up front. A rule set that silently stops
+/// applying is the failure this module is otherwise built to avoid.
+pub fn rulebooks_dropped(books: &[Rulebook], max_bytes: usize) -> Vec<String> {
+    let refs: Vec<&Rulebook> = books.iter().collect();
+    render_rulebooks_reporting_drops(&refs, max_bytes).1
 }
 
 /// Bumped whenever a prompt's wording changes. It is part of the review cache
@@ -307,10 +361,78 @@ mod tests {
     fn rb(id: &str, severity: Option<Severity>) -> Rulebook {
         Rulebook {
             id: id.into(),
+            description: None,
+            always: false,
             scope: vec![],
             severity,
             body: format!("- Rule from {id}."),
         }
+    }
+
+    fn sized(id: &str, severity: Option<Severity>, body_bytes: usize) -> Rulebook {
+        Rulebook {
+            body: "x".repeat(body_bytes),
+            ..rb(id, severity)
+        }
+    }
+
+    /// The bug this ordering exists for: rule sets arrive in filename order, so
+    /// a `high` security set was being shed in favour of an unranked style guide
+    /// purely because `s` sorts after `a`.
+    #[test]
+    fn the_lowest_severity_rule_set_is_dropped_first_not_the_last_alphabetically() {
+        let books = [
+            sized("api-conventions", Some(Severity::Low), 400),
+            sized("security", Some(Severity::High), 400),
+        ];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+
+        // Room for the header and exactly one body.
+        let (out, dropped) = render_rulebooks_reporting_drops(&refs, 500);
+
+        assert!(out.contains("security"), "the high rule set must survive");
+        assert!(
+            !out.contains("api-conventions"),
+            "the low one is what should go:\n{out}"
+        );
+        assert_eq!(dropped, ["api-conventions"]);
+    }
+
+    /// Rendering order must stay the input order even though the *keep*
+    /// decision is made by severity — the prompt is a cache key, and reordering
+    /// it on an unrelated axis would invalidate every cached review.
+    #[test]
+    fn surviving_rule_sets_render_in_their_original_order() {
+        let books = [
+            sized("aaa", Some(Severity::Low), 100),
+            sized("bbb", Some(Severity::High), 100),
+        ];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+
+        let (out, dropped) = render_rulebooks_reporting_drops(&refs, 10_000);
+        assert!(dropped.is_empty(), "both fit");
+        assert!(
+            out.find("aaa").unwrap() < out.find("bbb").unwrap(),
+            "input order must survive the severity sort:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_dropped_when_everything_fits() {
+        let books = vec![rb("a", Some(Severity::Low)), rb("b", None)];
+        assert!(rulebooks_dropped(&books, 10_000).is_empty());
+    }
+
+    /// A budget too small even for one rule set yields no rules section at all,
+    /// rather than a header advertising rules that are not there.
+    #[test]
+    fn an_impossible_budget_drops_everything_and_says_so() {
+        let books = [sized("a", Some(Severity::High), 5_000)];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+
+        let (out, dropped) = render_rulebooks_reporting_drops(&refs, 100);
+        assert!(out.is_empty(), "no orphan header");
+        assert_eq!(dropped, ["a"]);
     }
 
     /// The whole reason rule bodies live in the system half.
@@ -366,6 +488,8 @@ mod tests {
             rb("small", None),
             Rulebook {
                 id: "huge".into(),
+                description: None,
+                always: false,
                 scope: vec![],
                 severity: None,
                 body: "x".repeat(5000),

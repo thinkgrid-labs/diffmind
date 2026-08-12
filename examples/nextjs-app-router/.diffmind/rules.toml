@@ -1,0 +1,136 @@
+# Deterministic rules for a Next.js App Router project.
+#
+# These are matched by regex against added (`+`) lines. No model is involved:
+# they cost nothing, never vary between runs, and are safe to block a build on.
+# Judgement calls belong in `.diffmind/rules/*.md` instead.
+#
+# Suppress one inline with:
+#   // diffmind-ignore-next-line nextjs.raw-img
+
+# ─── Security ────────────────────────────────────────────────────────────────
+
+[[rule]]
+id       = "nextjs.public-env-secret"
+pattern  = 'NEXT_PUBLIC_[A-Z0-9_]*(SECRET|PASSWORD|PRIVATE|CREDENTIAL)'
+message  = "A secret is exposed to the browser: NEXT_PUBLIC_* values are inlined into the client bundle."
+fix      = "Drop the NEXT_PUBLIC_ prefix and read it only on the server, or confirm this value is genuinely public."
+severity = "high"
+category = "security"
+
+# Separated from the rule above because TOKEN and KEY have common false
+# positives (NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY, NEXT_PUBLIC_MAPBOX_TOKEN are
+# both meant to be public), so this one warns rather than blocks.
+[[rule]]
+id       = "nextjs.public-env-key"
+pattern  = 'NEXT_PUBLIC_[A-Z0-9_]*(_KEY|_TOKEN)\b'
+message  = "NEXT_PUBLIC_* is inlined into the client bundle — confirm this key is meant to be public."
+fix      = "If it is a publishable/anon key, keep it. If it authorises writes, move it server-side."
+severity = "medium"
+category = "security"
+
+[[rule]]
+id       = "nextjs.dangerously-set-inner-html"
+pattern  = 'dangerouslySetInnerHTML'
+message  = "dangerouslySetInnerHTML renders unescaped HTML — an XSS sink if any part of the value is user-controlled."
+fix      = "Render as text, or sanitise with a vetted library before injecting."
+severity = "high"
+category = "security"
+files    = ["*.tsx", "*.jsx"]
+
+# Rust's regex crate has no lookahead, so this cannot check for the *absence* of
+# rel= on the same tag. It flags every _blank and asks the reviewer to confirm.
+[[rule]]
+id       = "nextjs.target-blank"
+pattern  = '''target=\{?["']_blank'''
+message  = 'target="_blank" gives the opened page access to window.opener unless rel is set.'
+fix      = 'Add rel="noopener noreferrer".'
+severity = "low"
+category = "security"
+files    = ["*.tsx", "*.jsx"]
+
+# ─── App Router correctness ──────────────────────────────────────────────────
+
+[[rule]]
+id       = "nextjs.pages-router-data-fn"
+pattern  = '\b(getServerSideProps|getStaticProps|getStaticPaths)\b'
+message  = "This is a Pages Router API and does nothing in the App Router — the data is never fetched."
+fix      = "Fetch directly in the server component, or use generateStaticParams for dynamic segments."
+severity = "high"
+category = "quality"
+files    = ["app/**", "src/app/**"]
+
+[[rule]]
+id       = "nextjs.legacy-router-import"
+pattern  = '''from\s+["']next/router["']'''
+message  = "next/router is Pages Router and throws in the App Router."
+fix      = "Import useRouter, usePathname and useSearchParams from next/navigation."
+severity = "high"
+category = "quality"
+files    = ["app/**", "src/app/**"]
+
+[[rule]]
+id       = "nextjs.head-in-app-router"
+pattern  = '''from\s+["']next/head["']'''
+message  = "next/head has no effect in the App Router."
+fix      = "Export a `metadata` object or a `generateMetadata` function instead."
+severity = "medium"
+category = "quality"
+files    = ["app/**", "src/app/**"]
+
+# ─── Performance ─────────────────────────────────────────────────────────────
+
+[[rule]]
+id       = "nextjs.raw-img"
+pattern  = '<img\s'
+message  = "A raw <img> skips next/image: no lazy loading, no format negotiation, and layout shift without explicit dimensions."
+fix      = "Use next/image, or add a diffmind-ignore comment if this one is deliberate."
+severity = "medium"
+category = "performance"
+files    = ["*.tsx", "*.jsx"]
+
+[[rule]]
+id       = "nextjs.raw-internal-link"
+pattern  = '''<a\s+href=["']/[^/]'''
+message  = "A bare <a> for an internal route triggers a full page reload and discards client state."
+fix      = "Use next/link."
+severity = "medium"
+category = "performance"
+files    = ["*.tsx", "*.jsx"]
+
+# ─── React correctness ───────────────────────────────────────────────────────
+
+[[rule]]
+id       = "react.index-as-key"
+pattern  = 'key=\{\s*(i|idx|index)\s*\}'
+message  = "An array index as a list key reuses DOM nodes across different items when the list reorders or filters."
+fix      = "Key on a stable id from the data."
+severity = "medium"
+category = "quality"
+files    = ["*.tsx", "*.jsx"]
+
+# ─── Hygiene ─────────────────────────────────────────────────────────────────
+
+[[rule]]
+id       = "ts.ts-ignore"
+pattern  = '@ts-ignore'
+message  = "@ts-ignore silences every error on the next line, including ones introduced later."
+fix      = "Use @ts-expect-error with a reason — it fails when the error goes away."
+severity = "medium"
+category = "maintainability"
+
+[[rule]]
+id       = "ts.blanket-eslint-disable"
+pattern  = 'eslint-disable\s*\*/'
+message  = "A bare /* eslint-disable */ turns off every rule for the whole file."
+fix      = "Disable the specific rule, on the specific line."
+severity = "medium"
+category = "maintainability"
+
+[[rule]]
+id       = "js.console-log"
+pattern  = 'console\.log\('
+message  = "console.log left in application code."
+fix      = "Remove it, or use the project logger."
+severity = "low"
+category = "maintainability"
+files    = ["app/**", "src/**"]

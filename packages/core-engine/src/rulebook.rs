@@ -27,12 +27,36 @@ pub struct Rulebook {
     /// Stable name, used to attribute a finding and to suppress it. Defaults to
     /// the file stem.
     pub id: String,
+    /// One line on what this rule set is for. Not sent to the model — it is
+    /// documentation, shown by `diffmind rules list`.
+    ///
+    /// Cursor uses the equivalent field to let the agent *choose* rules at
+    /// review time. That needs a multi-turn loop and a model good enough to
+    /// pick well; against a 1.5B local model it would quietly skip the rules
+    /// that mattered. Kept as documentation, and as the field that selection
+    /// would use if a frontier backend ever makes it worthwhile.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Globs this rule set applies to. Empty means the whole repository.
+    ///
+    /// A glob prefixed with `!` excludes instead: `["src/**", "!src/legacy/**"]`
+    /// applies to `src` except the legacy tree. An exclusion always wins.
     #[serde(default)]
     pub scope: Vec<String>,
+    /// Apply to every file regardless of `scope`.
+    ///
+    /// An empty `scope` already means "the whole repository", so this is not
+    /// new capability — it is the difference between saying so and forgetting
+    /// to. An always-on rule set is paid for on every single review, so it
+    /// should be a decision, and `rules list` marks it as one.
+    #[serde(default)]
+    pub always: bool,
     /// Declared ceiling for findings attributed to this rule set. A rule set
     /// marked `low` cannot produce a `high` finding, which stops one opinionated
     /// style document from dominating a triage list.
+    ///
+    /// Also the drop order when the prompt budget cannot fit every rule set:
+    /// higher severity is kept first.
     #[serde(default)]
     pub severity: Option<Severity>,
     /// The prose, verbatim, minus the front matter.
@@ -48,14 +72,43 @@ impl Rulebook {
         format!("{RULEBOOK_RULE_PREFIX}{}", self.id)
     }
 
-    /// Does this rule set govern `path`? A rule set with no `scope` governs
-    /// everything.
+    /// Does this rule set govern `path`?
+    ///
+    /// A rule set with no `scope` — or one marked `always` — governs
+    /// everything. An `!` exclusion beats every include, so `["src/**",
+    /// "!src/legacy/**"]` reads the way a `.gitignore` would.
     pub fn applies_to(&self, path: &str) -> bool {
-        self.scope.is_empty()
-            || self
-                .scope
-                .iter()
-                .any(|g| crate::detectors::file_matches_glob(path, g))
+        let (excludes, includes): (Vec<&String>, Vec<&String>) =
+            self.scope.iter().partition(|g| g.starts_with('!'));
+
+        if excludes
+            .iter()
+            .any(|g| crate::detectors::file_matches_glob(path, g.trim_start_matches('!')))
+        {
+            return false;
+        }
+
+        if self.always || includes.is_empty() {
+            return true;
+        }
+
+        includes
+            .iter()
+            .any(|g| crate::detectors::file_matches_glob(path, g))
+    }
+
+    /// Order for shedding rule sets when they do not all fit the prompt.
+    ///
+    /// Higher is kept longer. Severity leads because losing a `high` security
+    /// rule set to an unranked style guide — which is what filename order did —
+    /// is the one outcome nobody would choose.
+    pub fn budget_rank(&self) -> u8 {
+        match self.severity {
+            Some(Severity::High) => 3,
+            Some(Severity::Medium) => 2,
+            Some(Severity::Low) => 1,
+            None => 0,
+        }
     }
 }
 
@@ -71,6 +124,8 @@ pub fn parse(default_id: &str, text: &str) -> Result<Rulebook, String> {
     let mut id = default_id.trim().to_string();
     let mut scope = Vec::new();
     let mut severity = None;
+    let mut description = None;
+    let mut always = false;
 
     for (key, value) in parse_front_matter(front_matter)? {
         match key.as_str() {
@@ -79,7 +134,28 @@ pub fn parse(default_id: &str, text: &str) -> Result<Rulebook, String> {
                     id = value.join("");
                 }
             }
-            "scope" => scope = value,
+            "description" => {
+                let text = value.join(" ").trim().to_string();
+                if !text.is_empty() {
+                    description = Some(text);
+                }
+            }
+            "always" => {
+                let raw = value.join("").trim().to_lowercase();
+                always = match raw.as_str() {
+                    "true" | "yes" => true,
+                    "false" | "no" | "" => false,
+                    other => {
+                        return Err(format!("`always` must be true or false, not `{other}`"));
+                    }
+                };
+            }
+            // Cursor's spelling, accepted so a rule set ported from
+            // `.cursor/rules/` loads without an edit.
+            "alwaysapply" | "alwaysApply" => {
+                always = value.join("").trim().eq_ignore_ascii_case("true");
+            }
+            "scope" | "globs" => scope = value,
             "severity" => {
                 let raw = value.join("");
                 if !raw.trim().is_empty() {
@@ -92,7 +168,8 @@ pub fn parse(default_id: &str, text: &str) -> Result<Rulebook, String> {
             "model" => {}
             other => {
                 return Err(format!(
-                    "unknown front-matter key `{other}`. Supported: id, scope, severity, model"
+                    "unknown front-matter key `{other}`. Supported: id, description, \
+                     scope (alias: globs), always (alias: alwaysApply), severity, model"
                 ));
             }
         }
@@ -104,10 +181,22 @@ pub fn parse(default_id: &str, text: &str) -> Result<Rulebook, String> {
     if body.trim().is_empty() {
         return Err("rule set has front matter but no rules under it".into());
     }
+    // Every glob excluded and none included matches nothing at all, which is a
+    // rule set that silently does no work — the failure this parser exists to
+    // prevent.
+    if !scope.is_empty() && !always && scope.iter().all(|g| g.starts_with('!')) {
+        return Err(
+            "`scope` has only `!` exclusions, so it matches no files. Add an include \
+             glob, or set `always: true` to cover the repository minus the exclusions."
+                .into(),
+        );
+    }
 
     Ok(Rulebook {
         id,
+        description,
         scope,
+        always,
         severity,
         body: body.trim().to_string(),
     })
@@ -239,9 +328,20 @@ pub fn group_key(books: &[&Rulebook]) -> String {
 /// is already built into the prompt, so an untouched copy changes nothing and a
 /// user can see exactly what they are overriding.
 pub const DEFAULT_RULEBOOK: &str = r#"---
+# One line on what this covers. Documentation only — `diffmind rules list`
+# shows it. Not sent to the model.
+# description: House rules for the API layer
+#
 # Globs this rule set applies to. Omit to cover the whole repository.
+# Prefix a glob with `!` to exclude: ["src/**", "!src/legacy/**"].
 # scope: ["src/**/*.rs"]
+#
+# Apply to every file, whatever `scope` says. An always-on rule set is paid
+# for on every review, so make it a decision.
+# always: false
+#
 # Ceiling for findings attributed to this rule set: high, medium, or low.
+# Also the drop order when rule sets do not all fit the prompt — highest kept.
 severity: medium
 ---
 
@@ -350,10 +450,73 @@ severity: high
     fn book(id: &str, scope: &[&str]) -> Rulebook {
         Rulebook {
             id: id.into(),
+            description: None,
+            always: false,
             scope: scope.iter().map(|s| s.to_string()).collect(),
             severity: None,
             body: format!("body of {id}"),
         }
+    }
+
+    /// CodeRabbit's `path_filters` spelling: an `!` glob subtracts. Without it
+    /// the only way to exempt a legacy tree was to enumerate everything else.
+    #[test]
+    fn a_negated_glob_excludes_and_beats_every_include() {
+        let b = book("api", &["src/**", "!src/legacy/**"]);
+
+        assert!(b.applies_to("src/api/handler.ts"));
+        assert!(
+            !b.applies_to("src/legacy/old.ts"),
+            "an exclusion must win over the include that also matches"
+        );
+        assert!(!b.applies_to("docs/readme.ts"), "outside every include");
+    }
+
+    /// `always` plus exclusions is the "whole repo except" shape.
+    #[test]
+    fn always_covers_everything_but_still_honours_exclusions() {
+        let b = Rulebook {
+            always: true,
+            ..book("house", &["!vendor/**"])
+        };
+
+        assert!(b.applies_to("anything/at/all.rs"));
+        assert!(!b.applies_to("vendor/dep.rs"));
+    }
+
+    /// A scope of nothing but exclusions matches no file at all — a rule set
+    /// that silently does no work, which this parser exists to refuse.
+    #[test]
+    fn a_scope_of_only_exclusions_is_rejected() {
+        let err =
+            parse("x", "---\nscope: [\"!src/**\"]\n---\n\n- A rule.\n").expect_err("must not load");
+        assert!(err.contains("matches no files"), "{err}");
+    }
+
+    #[test]
+    fn cursor_spellings_are_accepted_so_a_ported_rule_set_loads() {
+        let b = parse(
+            "ported",
+            "---\ndescription: Ported from Cursor\nglobs: [\"**/*.ts\"]\nalwaysApply: false\n---\n\n- A rule.\n",
+        )
+        .expect("cursor front matter should load");
+
+        assert_eq!(b.description.as_deref(), Some("Ported from Cursor"));
+        assert_eq!(b.scope, ["**/*.ts"]);
+        assert!(!b.always);
+    }
+
+    #[test]
+    fn budget_rank_orders_by_declared_severity() {
+        assert!(
+            book("a", &[]).budget_rank()
+                < Rulebook {
+                    severity: Some(Severity::Low),
+                    ..book("b", &[])
+                }
+                .budget_rank(),
+            "an unranked rule set is shed before one the author graded"
+        );
     }
 
     #[test]

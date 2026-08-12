@@ -667,6 +667,8 @@ mod tests {
                 rules: vec![],
                 rulebooks: vec![core_engine::Rulebook {
                     id: "api".into(),
+                    description: None,
+                    always: false,
                     scope: vec!["src/api/**".into()],
                     severity: Some(core_engine::Severity::High),
                     body: "- Handlers return ApiError.".into(),

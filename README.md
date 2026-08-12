@@ -396,6 +396,42 @@ Your repository's own `.gitignore` is never touched.
 
 ## Your team's standards
 
+Everything lives in `.diffmind/`, committed to your repo:
+
+```
+.diffmind/
+├── config.toml        # settings — model, base branch, gate thresholds
+├── rules.toml         # regex rules: free, deterministic, never vary
+└── rules/*.md         # written rules: judgement, read by the model
+```
+
+### Set it up
+
+```bash
+diffmind rules init     # writes a starter .diffmind/rules/default.md
+# edit it, then:
+diffmind rules list     # shows what loads, its severity ceiling and its globs
+diffmind                # review with them applied
+```
+
+**A complete worked example lives in
+[`examples/nextjs-app-router/`](examples/nextjs-app-router/)** — three scoped
+rule sets plus 13 regex rules for a real React/Next.js project. Copy the folder
+and edit.
+
+### Which file does a rule go in?
+
+**If a regex can decide it, it goes in `rules.toml`.** It costs nothing, never
+changes between runs, and is safe to block a build on. Only judgement goes in a
+`.md`.
+
+| | `rules.toml` | `rules/*.md` |
+| --- | --- | --- |
+| Read by | regex, before the model runs | the model, in the prompt |
+| Cost | free | tokens, every review |
+| Same answer every run | always | depends on the model |
+| Good for | `next/router` in `app/`, `@ts-ignore`, hardcoded secrets | "is this abstraction earning its keep" |
+
 ### Written rules — `.diffmind/rules/*.md`
 
 For rules that need judgement instead of a pattern. They live in the repo and
@@ -405,7 +441,8 @@ people carry.
 
 ```markdown
 ---
-scope: ["src/api/**/*.ts"]
+description: Conventions for the public API layer
+scope: ["src/api/**/*.ts", "!src/api/legacy/**"]
 severity: high
 ---
 
@@ -416,11 +453,25 @@ severity: high
 - Reject changes that widen a response struct without a version bump.
 ```
 
-`scope` is a glob for the files the rule set applies to (leave it out for the
-whole repo). `severity` is a **maximum** for findings from that rule set — it can
-lower a finding's severity but never raise it. `id` defaults to the filename.
-Create a starter file with `diffmind rules init`, and see what loads with
-`diffmind rules list`.
+| Field | Meaning |
+| --- | --- |
+| `id` | Suppression handle, `rulebook.<id>`. Defaults to the filename. |
+| `description` | One line, for humans. Shown by `rules list`; never sent to the model. |
+| `scope` | Globs this governs. Omit for the whole repo. A `!` prefix excludes, and beats every include. |
+| `always` | Apply to every file regardless of `scope`. Paid for on every review — make it deliberate. |
+| `severity` | A **maximum** for findings from this set. Can lower a finding's severity, never raise it. Also the drop order when the budget is tight. |
+
+`globs:` and `alwaysApply:` are accepted as aliases, so a rule ported from
+`.cursor/rules/` loads without an edit.
+
+Create a starter file with `diffmind rules init`, see what loads with
+`diffmind rules list`, and validate the lot with `diffmind rules check` —
+which exits non-zero, so it belongs in CI:
+
+```bash
+diffmind rules check    # parse errors, duplicate ids, identical bodies,
+                        # dead globs, invalid regex in rules.toml
+```
 
 A finding from a rule set gets the ID `rulebook.<id>` and can be silenced like
 any other. If the model credits a rule set that does not apply to that file, the
@@ -431,6 +482,32 @@ Rule text goes in the *unchanging* part of the prompt, and reviews are grouped b
 which rule sets apply, so every review in a group starts with an identical
 prefix. That is what makes prompt-prefix caching possible later. A rule set that
 fails to parse is reported and skipped, never ignored quietly.
+
+#### Scope them, or they get dropped
+
+Every rule set matching a file is pasted into that file's prompt, and the prompt
+shares a byte budget with the diff and the symbol context — the diff always keeps
+at least half. **When the rule sets do not all fit, whole ones are dropped**
+(never truncated: half a rule reads as a complete rule that says something else).
+
+Two things make that safe rather than mysterious:
+
+- **Lowest `severity` goes first**, so a `high` security set outlives a style
+  guide. Unranked sets go before ranked ones.
+- **You are told.** The run prints which sets did not fit and why.
+
+Still, the real lever is `scope`, not brevity. Scoped well, only two or three
+sets ever apply at once:
+
+```
+react.md                    scope: ["**/*.tsx"]
+nextjs-app-router.md        scope: ["app/**", "src/app/**"]
+server-actions-security.md  scope: ["**/actions.ts", "**/route.ts"]
+```
+
+Two rules of thumb: keep each set to a page or two — attention dilutes, and
+twenty pages of rules makes the model worse at each one — and run
+`diffmind rules list` after editing to confirm the globs are what you meant.
 
 ### Pattern rules — `.diffmind/rules.toml`
 

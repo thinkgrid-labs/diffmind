@@ -40,6 +40,20 @@ const MIN_SECTION_BYTES: usize = 400;
 /// Ticket text is a fixed brief, not something that grows with the diff.
 const MAX_REQUIREMENTS_BYTES: usize = 2000;
 
+/// Byte budget for one optional prompt section — the symbol context, or the
+/// project rules — given a backend's window.
+///
+/// Public so the CLI can compute the same number before a review and warn about
+/// rule sets that will not fit, instead of leaving the drop invisible.
+pub fn section_budget_bytes(context_tokens: usize, max_new_tokens: usize, depth: u32) -> usize {
+    let available = context_tokens.saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
+    // Half of what is left, shared by the two sections, at ~3 bytes a token.
+    let share = ((available / 4) * 3).min(MAX_SECTION_BYTES);
+    // The floor never exceeds the share, or a window too small to afford it
+    // would be pushed further over by the very thing meant to protect it.
+    (share >> depth.min(16)).max(MIN_SECTION_BYTES.min(share))
+}
+
 /// Triage only pays for itself once a diff spans enough files that skipping
 /// some saves more than the extra inference pass costs.
 const TRIAGE_MIN_FILES: usize = 6;
@@ -363,18 +377,11 @@ impl ReviewAnalyzer {
     /// truncating one mid-sentence, so this degrades to "fewer rules", then to
     /// "no rules" — never to half a rule that reads like a complete one.
     fn section_budget_bytes(&self, max_new_tokens: usize, depth: u32) -> usize {
-        let available = self
-            .backend
-            .context_tokens()
-            .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
-        // Half of what is left, shared by the two sections, at ~3 bytes a token.
-        let share = ((available / 4) * 3).min(MAX_SECTION_BYTES);
-        // The floor never exceeds the share, or a window too small to afford it
-        // would be pushed further over by the very thing meant to protect it.
-        (share >> depth.min(16)).max(MIN_SECTION_BYTES.min(share))
+        section_budget_bytes(self.backend.context_tokens(), max_new_tokens, depth)
     }
 
     /// True when the prompt fits the window with room for the response.
+    #[allow(clippy::wrong_self_convention)]
     fn prompt_fits(&self, prompt: &Prompt, max_new_tokens: usize) -> bool {
         let budget = self
             .backend
@@ -1457,6 +1464,8 @@ diff --git a/src/a.rs b/src/a.rs
     fn rulebook(id: &str, severity: Option<Severity>) -> Rulebook {
         Rulebook {
             id: id.into(),
+            description: None,
+            always: false,
             scope: vec![],
             severity,
             body: "- A rule.".into(),
@@ -1509,6 +1518,8 @@ diff --git a/src/a.rs b/src/a.rs
     fn a_rule_set_that_does_not_govern_the_file_cannot_be_claimed() {
         let scoped = Rulebook {
             id: "web".into(),
+            description: None,
+            always: false,
             scope: vec!["src/web/**".into()],
             severity: Some(Severity::Low),
             body: "- A rule.".into(),
