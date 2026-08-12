@@ -191,6 +191,61 @@ pub fn get_staged_diff(paths: &[String]) -> Result<String> {
     Ok(diff)
 }
 
+/// Split a `a..b` / `a...b` range into its endpoints, with git's own defaulting
+/// of an omitted side to `HEAD`. Returns `None` when this is not a range at all.
+fn range_endpoints(range: &str) -> Option<(String, String)> {
+    let (left, right) = match range.split_once("...") {
+        Some(pair) => pair,
+        None => range.split_once("..")?,
+    };
+    // A third dot, or any further `..`, is not a range git will accept.
+    if right.contains("..") {
+        return None;
+    }
+    let side = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_string();
+    Some((side(left), side(right)))
+}
+
+/// Does `candidate` name a diff range that resolves in this repository?
+///
+/// Used to tell `diffmind main...HEAD` from `diffmind src/auth/` without making
+/// the user say which they meant. Deliberately strict: both endpoints must
+/// resolve, so a relative path like `../lib/x.rs` is never mistaken for a range.
+pub fn looks_like_range(candidate: &str) -> bool {
+    // An existing path always wins. A file really named `a..b` is odd but real,
+    // and silently reviewing something else would be worse than odd.
+    if std::path::Path::new(candidate).exists() {
+        return false;
+    }
+    match range_endpoints(candidate) {
+        Some((a, b)) => rev_exists(&a) && rev_exists(&b),
+        None => false,
+    }
+}
+
+/// Returns the diff for an explicit `a..b` or `a...b` range.
+pub fn get_range_diff(range: &str, paths: &[String]) -> Result<String> {
+    // `git diff` takes the range positionally, so a value beginning with `-`
+    // would be read as an option rather than a revision.
+    if range.starts_with('-') {
+        anyhow::bail!("'{range}' is not a valid revision range");
+    }
+
+    let Some((left, right)) = range_endpoints(range) else {
+        anyhow::bail!(
+            "'{range}' is not a revision range. Use `a..b` (or `a...b` for changes \
+             since the branches diverged)."
+        );
+    };
+    for rev in [&left, &right] {
+        if !rev_exists(rev) {
+            anyhow::bail!("revision '{rev}' not found in this repository");
+        }
+    }
+
+    run_diff(Some(range), paths, false)
+}
+
 /// Returns the diff of this branch against `branch`.
 pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
     // Prefer the merge-base form so unrelated commits landing on the base
@@ -234,6 +289,15 @@ pub fn get_working_tree_diff(paths: &[String]) -> Result<String> {
     run_diff(Some("HEAD"), paths, false)
 }
 
+/// Short SHA of HEAD, or `None` on an unborn branch.
+pub fn head_sha() -> Option<String> {
+    let out = git(&["rev-parse", "--short", "HEAD"]).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Absolute path to the repository root.
 pub fn repo_root() -> Option<std::path::PathBuf> {
     let out = git(&["rev-parse", "--show-toplevel"]).ok()?;
@@ -272,6 +336,75 @@ mod tests {
     #[test]
     fn linguist_generated_is_empty_rather_than_failing_without_paths() {
         assert!(linguist_generated(&[]).is_empty());
+    }
+
+    #[test]
+    fn range_endpoints_handles_both_dot_forms() {
+        assert_eq!(
+            range_endpoints("v1.0..HEAD"),
+            Some(("v1.0".into(), "HEAD".into()))
+        );
+        assert_eq!(
+            range_endpoints("main...HEAD"),
+            Some(("main".into(), "HEAD".into()))
+        );
+    }
+
+    #[test]
+    fn an_omitted_side_defaults_to_head_as_git_does() {
+        assert_eq!(
+            range_endpoints("main.."),
+            Some(("main".into(), "HEAD".into()))
+        );
+        assert_eq!(
+            range_endpoints("..main"),
+            Some(("HEAD".into(), "main".into()))
+        );
+    }
+
+    #[test]
+    fn a_plain_revision_is_not_a_range() {
+        assert_eq!(range_endpoints("HEAD"), None);
+        assert_eq!(range_endpoints("v1.2.0"), None);
+        assert_eq!(range_endpoints("src/auth"), None);
+    }
+
+    #[test]
+    fn a_relative_path_is_not_mistaken_for_a_range() {
+        // `../lib/x.rs` splits on `..` but neither side is a revision, and the
+        // path may well exist. Reviewing a different set of changes than the
+        // user named would be a silent, confusing failure.
+        assert!(!looks_like_range("../lib/x.rs"));
+        assert!(!looks_like_range("./src"));
+        assert!(!looks_like_range("a/../b"));
+    }
+
+    #[test]
+    fn a_range_with_extra_dots_is_rejected() {
+        assert_eq!(range_endpoints("a..b..c"), None);
+    }
+
+    #[test]
+    fn a_range_beginning_with_a_dash_is_refused() {
+        // `git diff` takes the range positionally, so this would otherwise be
+        // read as a git option rather than a revision.
+        let err = get_range_diff("--upload-pack=x..HEAD", &[]).unwrap_err();
+        assert!(err.to_string().contains("not a valid revision range"));
+    }
+
+    #[test]
+    fn a_non_range_argument_is_reported_as_such() {
+        let err = get_range_diff("HEAD", &[]).unwrap_err();
+        assert!(err.to_string().contains("not a revision range"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_revision_names_the_side_that_failed() {
+        let err = get_range_diff("definitely-not-a-ref..HEAD", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("definitely-not-a-ref"),
+            "the message should say which end is wrong: {err}"
+        );
     }
 
     #[test]

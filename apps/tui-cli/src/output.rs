@@ -122,7 +122,34 @@ pub fn print_positives_and_suggestions(positives: &[String], suggestions: &[Stri
     }
 }
 
-/// Closing summary line, plus anything the user should know was hidden.
+/// One line describing what the run cost.
+///
+/// Deliberately backend-shaped. On the bundled local model the currency is
+/// seconds and throughput — tokens are free and a token budget would be
+/// meaningless. On a metered endpoint tokens are the number that matters. The
+/// `~` marks counts the backend could not tokenise exactly, because a budget
+/// tracked against a silent guess is worse than one that admits it is guessing.
+pub fn cost_line(stats: &AnalysisStats) -> String {
+    let seconds = stats.inference_ms as f64 / 1000.0;
+    let elapsed = if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{}m {:02}s", (seconds as u64) / 60, (seconds as u64) % 60)
+    };
+
+    let approx = if stats.tokens_estimated { "~" } else { "" };
+    let mut line = format!(
+        "{elapsed}  ·  {approx}{} tokens ({approx}{} in, {approx}{} out)",
+        stats.total_tokens(),
+        stats.prompt_tokens,
+        stats.completion_tokens
+    );
+    if let Some(tps) = stats.tokens_per_second() {
+        line.push_str(&format!("  ·  {tps:.0} tok/s"));
+    }
+    line
+}
+
 pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
     eprintln!("  {}", "─".repeat(62).dark_grey());
 
@@ -168,12 +195,18 @@ pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
     }
     if stats.units_cached > 0 {
         eprintln!(
-            "  {}  {}/{} chunk{} served from cache",
+            "  {}  {}/{} unit{} served from cache",
             "·".dark_grey(),
             stats.units_cached,
             stats.units_total,
             plural(stats.units_total)
         );
+    }
+
+    // What the run cost. Displayed every time on purpose: a budget nobody sees
+    // is a budget nobody notices regressing.
+    if stats.inference_ms > 0 {
+        eprintln!("  {}  {}", "·".dark_grey(), cost_line(stats));
     }
 
     if shown == 0 {
@@ -222,6 +255,10 @@ pub fn render(
                 "units": stats.units_total,
                 "units_cached": stats.units_cached,
                 "units_unparseable": stats.units_unparseable,
+                "inference_ms": stats.inference_ms,
+                "prompt_tokens": stats.prompt_tokens,
+                "completion_tokens": stats.completion_tokens,
+                "tokens_estimated": stats.tokens_estimated,
                 "suppressed": stats.suppressed,
                 "discarded_unanchorable": stats.unanchorable,
                 "below_confidence": stats.below_confidence,
@@ -241,7 +278,7 @@ pub fn render(
     }
 }
 
-fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> String {
+pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> String {
     let mut out = String::from("## diffmind code review\n\n");
 
     if summary.findings.is_empty() {

@@ -27,6 +27,7 @@ mod indexer;
 mod output;
 mod rag;
 mod rules;
+mod runs;
 mod settings;
 mod tui;
 
@@ -131,6 +132,7 @@ fn run() -> Result<i32> {
             project_root,
             settings,
             resolve_ticket(args.ticket.as_deref()),
+            prefilter,
         )?;
         return Ok(0);
     }
@@ -262,6 +264,16 @@ fn run_command(
             )
         }
 
+        cli::Commands::Stats { clear } => {
+            if clear {
+                let removed = runs::clear_runs(project_root)?;
+                println!("Cleared {removed} recorded run(s). Verdict history kept.");
+                return Ok(0);
+            }
+            print_stats(project_root);
+            Ok(0)
+        }
+
         cli::Commands::Rules { action } => match action {
             cli::RulesAction::Init => {
                 let path = rules::init_rulebooks(project_root)?;
@@ -351,6 +363,27 @@ fn cache_stats(dir: &Path) -> (usize, u64) {
 // ─── Diff capture ────────────────────────────────────────────────────────────
 
 fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
+    // Each of these names a different set of changes. Silently honouring
+    // whichever the code happens to check first would review something the user
+    // did not ask for.
+    let selectors = [
+        (args.stdin, "--stdin"),
+        (args.staged, "--staged"),
+        (args.last, "--last"),
+        (args.range.is_some(), "--range"),
+    ];
+    let chosen: Vec<&str> = selectors
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect();
+    if chosen.len() > 1 {
+        anyhow::bail!(
+            "{} select different changes — pass only one.",
+            chosen.join(" and ")
+        );
+    }
+
     if args.stdin {
         let mut buffer = String::new();
         io::stdin()
@@ -373,9 +406,29 @@ fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
         return git::get_last_commit_diff(&args.files);
     }
 
+    if let Some((range, paths)) = resolve_range(args) {
+        return git::get_range_diff(&range, &paths);
+    }
+
     // Nobody said which branch — ask git rather than assuming `main`.
     let branch = settings.branch.clone().unwrap_or_else(git::default_branch);
     git::get_diff(&branch, &args.files)
+}
+
+/// Work out whether this run is scoped to an explicit revision range, and which
+/// positional arguments are paths rather than the range itself.
+///
+/// `--range` is authoritative. Failing that, a leading positional that resolves
+/// as a range is taken as one, so `diffmind v1.2.0..HEAD` works the way anyone
+/// would expect without a flag. The detection is strict — both endpoints must
+/// resolve and the string must not name an existing path — so `diffmind ../lib`
+/// is still a path.
+fn resolve_range(args: &cli::Cli) -> Option<(String, Vec<String>)> {
+    if let Some(range) = args.range.clone() {
+        return Some((range, args.files.clone()));
+    }
+    let first = args.files.first()?;
+    git::looks_like_range(first).then(|| (first.clone(), args.files[1..].to_vec()))
 }
 
 /// Accepts either a file path or inline text.
@@ -535,6 +588,69 @@ pub fn build_analyzer(
     analyzer
 }
 
+/// Report what the recorded runs say about whether this tool is earning its
+/// keep. The accept-to-wrong ratio is the headline: every other number here is
+/// context for it.
+fn print_stats(project_root: &Path) {
+    let s = runs::summarize(project_root);
+
+    if s.runs == 0 && s.accepted + s.dismissed + s.wrong == 0 {
+        println!("  No runs recorded yet. Review something, then come back.");
+        return;
+    }
+
+    println!();
+    println!("  diffmind  stats");
+    println!("  {}", "─".repeat(52));
+    println!("  {:<16} {}", "Runs", s.runs);
+    if let (Some(first), Some(last)) = (&s.first_run, &s.last_run) {
+        println!(
+            "  {:<16} {} → {}",
+            "Period",
+            &first[..10.min(first.len())],
+            &last[..10.min(last.len())]
+        );
+    }
+    println!("  {:<16} {}", "Median findings", s.median_findings);
+    println!("  {:<16} {:.1}s", "Median time", s.median_seconds);
+    println!("  {:<16} {}", "Median tokens", s.median_tokens);
+    println!("  {:<16} {:.0}%", "Cache hits", s.cache_hit_rate * 100.0);
+    println!();
+
+    println!(
+        "  {:<16} {} accepted · {} dismissed · {} wrong",
+        "Verdicts", s.accepted, s.dismissed, s.wrong
+    );
+    match s.accept_to_wrong() {
+        Some(ratio) => {
+            // The target from the plan. Below it, the tool is costing more
+            // attention than it saves and the rules or the model need work.
+            let verdict = if ratio >= 2.0 {
+                "on target"
+            } else {
+                "below the 2:1 target"
+            };
+            println!("  {:<16} {ratio:.1}:1  ({verdict})", "Accept : wrong");
+        }
+        None if s.accepted + s.dismissed == 0 => {
+            println!(
+                "  {:<16} no verdicts yet — use the TUI to accept or reject findings",
+                "Accept : wrong"
+            );
+        }
+        None => println!("  {:<16} nothing marked wrong yet", "Accept : wrong"),
+    }
+
+    if !s.worst_rules.is_empty() {
+        println!();
+        println!("  Most often wrong");
+        for (rule, count) in &s.worst_rules {
+            println!("     {count:>3}  {rule}");
+        }
+    }
+    println!();
+}
+
 /// Reviewable size limit, applied to the diff *after* filtering. Past this,
 /// chunking alone takes longer than a human review.
 const MAX_REVIEWABLE_DIFF_KB: usize = 1500;
@@ -662,6 +778,10 @@ fn review(
     let project = ProjectRules::load(project_root, settings.use_baseline);
     let is_text = settings.format == OutputFormat::Text;
 
+    // We are about to write the cache and a run record. Claim the ignore file
+    // first, so neither ever shows up as an untracked change.
+    runs::ensure_gitignore(project_root);
+
     print_header(
         args,
         settings,
@@ -748,6 +868,21 @@ fn review(
         output::print_footer(shown.len(), gated, &stats);
     }
     emit(settings, &filtered, &stats, &backend_label)?;
+
+    // File the run. Never fatal: a review that found real problems must still be
+    // reported even if the notes could not be written.
+    let record = runs::RunRecord::new(
+        git::head_sha().unwrap_or_else(|| "working-tree".into()),
+        git::current_branch(),
+        backend_label.clone(),
+        &filtered,
+        &stats,
+        prefilter,
+    );
+    let rendered = output::markdown(&filtered, &stats, &backend_label);
+    if let Err(e) = runs::save(project_root, &record, &rendered) {
+        eprintln!("  !  could not record this run: {e}");
+    }
 
     Ok(if gated > 0 { EXIT_FINDINGS } else { 0 })
 }
@@ -858,6 +993,8 @@ fn print_header(
         "staged changes".to_string()
     } else if args.last {
         "last commit".to_string()
+    } else if let Some((range, _)) = resolve_range(args) {
+        range
     } else {
         let base = settings.branch.clone().unwrap_or_else(git::default_branch);
         match git::current_branch() {

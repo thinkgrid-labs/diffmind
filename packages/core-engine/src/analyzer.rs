@@ -68,6 +68,27 @@ pub struct AnalysisStats {
     pub below_confidence: usize,
     /// Model findings dropped because they pointed at a file not in the diff.
     pub unanchorable: usize,
+    /// Wall-clock spent inside the backend. Excludes diff parsing, filtering and
+    /// context assembly, which are all sub-millisecond by comparison.
+    pub inference_ms: u64,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    /// True when the token counts are estimates because the backend has no
+    /// tokenizer to ask. Reported rather than hidden — a budget tracked against
+    /// a guess is worse than one that admits it is guessing.
+    pub tokens_estimated: bool,
+}
+
+impl AnalysisStats {
+    pub fn total_tokens(&self) -> usize {
+        self.prompt_tokens + self.completion_tokens
+    }
+
+    /// Generation throughput, or `None` when nothing was generated.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        (self.inference_ms > 0 && self.completion_tokens > 0)
+            .then(|| self.completion_tokens as f64 / (self.inference_ms as f64 / 1000.0))
+    }
 }
 
 pub struct ReviewAnalyzer {
@@ -83,6 +104,19 @@ pub struct ReviewAnalyzer {
     min_confidence: f32,
     temperature: f64,
     seed: u64,
+    /// Accumulated across every backend call in one `analyze`, including triage.
+    metering: Metering,
+}
+
+/// What one run cost. Accumulated on the analyzer because `analyze_chunk`
+/// recurses when a unit overruns the window, and each level must add to the
+/// same total.
+#[derive(Debug, Default, Clone, Copy)]
+struct Metering {
+    inference_ms: u64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    estimated: bool,
 }
 
 impl ReviewAnalyzer {
@@ -101,7 +135,40 @@ impl ReviewAnalyzer {
             min_confidence: 0.0,
             temperature: defaults.temperature,
             seed: defaults.seed,
+            metering: Metering::default(),
         }
+    }
+
+    /// Run the backend, recording what it cost.
+    fn generate_metered(
+        &mut self,
+        prompt: &Prompt,
+        opts: &GenOptions,
+    ) -> Result<String, EngineError> {
+        let prompt_text = prompt.to_chatml();
+        let prompt_tokens = match self.backend.count_tokens(&prompt_text) {
+            Some(n) => n,
+            None => {
+                self.metering.estimated = true;
+                prompt.estimated_tokens()
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let response = self.backend.generate(prompt, opts)?;
+        self.metering.inference_ms += started.elapsed().as_millis() as u64;
+
+        let completion_tokens = match self.backend.count_tokens(&response) {
+            Some(n) => n,
+            None => {
+                self.metering.estimated = true;
+                response.len() / 3
+            }
+        };
+
+        self.metering.prompt_tokens += prompt_tokens;
+        self.metering.completion_tokens += completion_tokens;
+        Ok(response)
     }
 
     /// Set the detected languages for this session. The names are injected into
@@ -179,6 +246,16 @@ impl ReviewAnalyzer {
 
     pub fn context_tokens(&self) -> usize {
         self.backend.context_tokens()
+    }
+
+    /// The units this analyzer would review, for a caller that needs to show a
+    /// reader the hunk a finding actually came from.
+    ///
+    /// Ids match those stamped onto findings, because the sizing comes from the
+    /// same backend and units are grouped per file — so triage dropping a whole
+    /// file cannot shift the ids of the files that survive.
+    pub fn plan_units(&self, diff: &str, max_tokens: u32) -> Vec<crate::unit::ReviewUnit> {
+        build_units(diff, self.max_chunk_lines(max_tokens as usize))
     }
 
     fn gen_options(&self, max_new_tokens: usize) -> GenOptions {
@@ -267,6 +344,7 @@ impl ReviewAnalyzer {
     {
         let files = parse_diff(diff);
         let inline = InlineSuppressions::from_diff(&files);
+        self.metering = Metering::default();
         let mut stats = AnalysisStats::default();
         let mut summary = ReviewSummary::default();
         // Tracks what has already been streamed so a later chunk cannot emit a
@@ -349,6 +427,12 @@ impl ReviewAnalyzer {
 
         summary.dedup();
         summary.sort();
+
+        stats.inference_ms = self.metering.inference_ms;
+        stats.prompt_tokens = self.metering.prompt_tokens;
+        stats.completion_tokens = self.metering.completion_tokens;
+        stats.tokens_estimated = self.metering.estimated;
+
         Ok((summary, stats))
     }
 
@@ -495,9 +579,8 @@ impl ReviewAnalyzer {
             return Ok((hit, true));
         }
 
-        let response = self
-            .backend
-            .generate(&prompt, &self.gen_options(max_tokens as usize))?;
+        let opts = self.gen_options(max_tokens as usize);
+        let response = self.generate_metered(&prompt, &opts)?;
         let summary = parse_review_response(&response)?;
 
         if let (Some(cache), Some(key)) = (self.cache.as_ref(), cache_key.as_ref()) {
@@ -541,7 +624,7 @@ impl ReviewAnalyzer {
             max_new_tokens: 512.min(max_tokens as usize).max(128),
             ..self.gen_options(512)
         };
-        let response = match self.backend.generate(&prompt, &opts) {
+        let response = match self.generate_metered(&prompt, &opts) {
             Ok(r) => r,
             Err(e) => {
                 if self.debug {

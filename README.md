@@ -38,7 +38,8 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **Daemon mode** — keep the model resident so reviews are near-instant
 - **Local RAG** — feeds the model the *enclosing function* of each hunk, not just the diff
 - **Reproducible** — greedy decoding with a fixed seed: the same diff always reviews the same way
-- **Interactive TUI** (`--tui`), JSON / Markdown output, and a proper CI gate
+- **Reviewer's cockpit** (`--tui`) — analyses on launch, shows the hunk and context behind each finding, and records accept / dismiss / wrong so the signal-to-noise ratio is measured rather than guessed
+- JSON / Markdown output, and a proper CI gate
 
 ---
 
@@ -91,11 +92,14 @@ diffmind                   # review this branch against the repo's default branc
 
 `--branch` is no longer assumed to be `main`: diffmind reads the repository's default branch from `origin/HEAD` and falls back to whichever of `main`/`master`/`develop`/`trunk` actually exists.
 
+A bare `a..b` argument is recognised as a revision range without needing `--range`. The detection is strict — both endpoints must resolve as revisions and the string must not name an existing path — so `diffmind ../lib` and a file genuinely called `a..b` are still treated as paths. Paths after a range narrow it: `diffmind v1.2.0..HEAD src/api/`.
+
 ```bash
 diffmind --last            # just the last commit
 diffmind --staged          # just what's staged
+diffmind v1.2.0..HEAD      # an explicit revision range
 diffmind src/auth/         # just these paths
-diffmind --tui             # interactive browser
+diffmind --tui             # the reviewer's cockpit
 ```
 
 ---
@@ -241,6 +245,76 @@ repos:
 
 ---
 
+## The cockpit — `diffmind --tui`
+
+```bash
+diffmind --tui
+```
+
+Analysis starts on launch. Each finding shows the **actual hunk the model
+reviewed** and the **context it was given** — a finding you cannot check is one
+you will eventually stop reading.
+
+| Key | Action |
+| --------- | ------------------------------------------------------------ |
+| `j` / `k` | Move through findings |
+| `a`       | Accept — records the verdict and copies a review comment |
+| `d`       | Dismiss — read, not worth raising |
+| `w`       | Wrong — the finding was incorrect |
+| `PgUp` / `PgDn` | Scroll the detail pane |
+| `r`       | Re-run |
+| `q`       | Quit |
+
+Verdicts are written through immediately, so closing the terminal mid-triage
+loses nothing. They feed `diffmind stats`.
+
+Accept copies via **OSC 52**, the terminal's own clipboard escape — no
+dependency, and it works over SSH. tmux and screen need clipboard passthrough
+enabled; if the copy fails you are told, so you never believe you have copied
+something you have not.
+
+Because the output is private to you, the tool can afford to be wrong
+occasionally: a bad finding costs one keystroke, not an author's afternoon.
+
+---
+
+## Run history
+
+Every review is filed to `.diffmind/runs/<sha>/` — the findings as `run.json`
+and `review.md`, plus what the run cost. `diffmind stats` reads them back:
+
+```
+  Runs             34
+  Median findings  3
+  Median time      6.2s
+  Median tokens    18420
+  Cache hits       61%
+
+  Verdicts         71 accepted · 44 dismissed · 12 wrong
+  Accept : wrong   5.9:1  (on target)
+
+  Most often wrong
+      7  DM900.maintainability
+      3  rulebook.house-style
+```
+
+The **accept-to-wrong ratio** is the number that decides whether the tool is
+earning its keep — noise is this category's known failure mode, and a reviewer
+who cannot measure it will just quietly stop running the reviewer. Verdicts come
+from the TUI. Dismissals are excluded from the ratio: choosing not to raise a
+correct observation is not the tool being wrong.
+
+Run snapshots are overwritten when a sha is reviewed again; verdicts are
+append-only and survive `diffmind stats --clear`, because the ratio is only
+meaningful over months.
+
+diffmind writes `.diffmind/.gitignore` covering `runs/`, `cache/`, `models/`,
+`symbols.json` and `daemon.json` — your review notes stay private, while
+`rules/`, `rules.toml`, `config.toml` and `baseline.json` remain committable.
+Your repository's own `.gitignore` is never touched.
+
+---
+
 ## Daemon mode
 
 Every invocation otherwise pays the model-load cost — seconds, every time.
@@ -368,6 +442,8 @@ diffmind commit --apply
 diffmind rules init               # scaffold .diffmind/rules/default.md
 diffmind rules list               # show which rule sets load
 diffmind index                    # build the symbol index
+diffmind stats                    # cost and signal over recorded runs
+diffmind stats --clear            # drop run snapshots (verdicts are kept)
 diffmind cache show               # cache location and size
 diffmind cache clear
 ```
@@ -386,6 +462,7 @@ Commands:
   commit         Suggest a conventional commit message
   baseline       Record current findings as accepted
   rules          Manage the prose rule sets in .diffmind/rules/
+  stats          Findings, cost and accept/wrong ratio over recorded runs
   install-hooks  Install git hooks
   serve          Keep the model resident between runs
   cache          Inspect or clear the review cache
@@ -396,6 +473,7 @@ Options:
   -l, --last                     Review the last commit only
       --staged                   Review staged changes only
       --stdin                    Read the diff from stdin
+      --range <RANGE>            Review an explicit revision range, e.g. v1.2.0..HEAD
   -t, --tui                      Launch the interactive TUI
       --ticket <FILE_OR_TEXT>    Acceptance criteria to check against
       --min-severity <LEVEL>     Minimum severity to report [default: low]
@@ -467,7 +545,6 @@ diffmind/
 
 - [ ] Auto-fix patches (`diffmind fix`) — gated on remote backends landing, since a 1.5B's patches are not trustworthy enough to apply
 - [ ] Cross-file impact analysis — find callers of deleted or renamed functions
-- [ ] `diffmind stats` — findings over time
 - [ ] VS Code / JetBrains extensions, talking to the daemon
 - [ ] Homebrew tap and scoop manifest
 - [ ] Fine-tuned review model

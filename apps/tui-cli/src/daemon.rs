@@ -122,6 +122,14 @@ pub struct ReviewResponse {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SerializableStats {
     pub units_total: usize,
+    #[serde(default)]
+    pub inference_ms: u64,
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub completion_tokens: usize,
+    #[serde(default)]
+    pub tokens_estimated: bool,
     pub units_cached: usize,
     pub units_unparseable: usize,
     pub files_skipped_by_triage: usize,
@@ -134,6 +142,10 @@ impl From<&AnalysisStats> for SerializableStats {
     fn from(s: &AnalysisStats) -> Self {
         SerializableStats {
             units_total: s.units_total,
+            inference_ms: s.inference_ms,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            tokens_estimated: s.tokens_estimated,
             units_cached: s.units_cached,
             units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
@@ -148,6 +160,10 @@ impl From<SerializableStats> for AnalysisStats {
     fn from(s: SerializableStats) -> Self {
         AnalysisStats {
             units_total: s.units_total,
+            inference_ms: s.inference_ms,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            tokens_estimated: s.tokens_estimated,
             units_cached: s.units_cached,
             units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
