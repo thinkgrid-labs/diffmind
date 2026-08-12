@@ -297,16 +297,22 @@ fn run_command(
                     return Ok(0);
                 }
                 for b in &books {
-                    let scope = if b.scope.is_empty() {
+                    let scope = if b.always {
+                        "always (every file)".to_string()
+                    } else if b.scope.is_empty() {
                         "whole repository".to_string()
                     } else {
                         b.scope.join(", ")
                     };
                     let severity = b.severity.map(|s| s.as_str()).unwrap_or("unset");
                     println!("  {:<24} {severity:<7} {scope}", b.id);
+                    if let Some(d) = &b.description {
+                        println!("  {:<24} {:<7} {d}", "", "");
+                    }
                 }
                 Ok(0)
             }
+            cli::RulesAction::Check => rules::check(project_root),
         },
 
         cli::Commands::Cache { action } => {
@@ -573,6 +579,39 @@ impl ProjectRules {
     }
 }
 
+/// Say so when the prompt budget cannot fit every rule set.
+///
+/// The alternative is what shipped before: a rule set stops applying and
+/// nothing anywhere says it did. The check is deliberately at the *widest*
+/// budget — depth 0, before any retry shrinks it — so this warns about the
+/// rule sets that can never apply, not about a transient squeeze on one
+/// oversized unit.
+fn warn_on_dropped_rulebooks(backend: &dyn ReviewBackend, settings: &Settings, books: &[Rulebook]) {
+    if books.is_empty() {
+        return;
+    }
+    let budget = core_engine::section_budget_bytes(
+        backend.context_tokens(),
+        settings.max_tokens as usize,
+        0,
+    );
+    let dropped = core_engine::rulebooks_dropped(books, budget);
+    if dropped.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "  !  {} rule set(s) do not fit the prompt budget ({budget} bytes) and were \
+         dropped: {}",
+        dropped.len(),
+        dropped.join(", ")
+    );
+    eprintln!(
+        "     Lowest severity is dropped first. Narrow their `scope`, shorten them, \
+         or use a backend with a larger context window."
+    );
+}
+
 pub fn build_analyzer(
     backend: Box<dyn ReviewBackend>,
     settings: &Settings,
@@ -581,6 +620,8 @@ pub fn build_analyzer(
     ticket: Option<String>,
     project: ProjectRules,
 ) -> ReviewAnalyzer {
+    warn_on_dropped_rulebooks(&*backend, settings, &project.books);
+
     let mut analyzer = ReviewAnalyzer::new(backend)
         .with_unit_grouper(unit_grouper(project_root))
         .with_languages(detect_languages(diff))

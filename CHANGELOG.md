@@ -4,8 +4,40 @@
 
 Config is not code, and reviewing it as though it were produced confident
 nonsense. Reported from the field: every file under `.claude/` came back HIGH.
+Rule sets had the mirror-image problem — they could stop applying without ever
+saying so.
 
-### Fixed
+### Fixed — rule sets
+
+- **A rule set dropped for prompt budget is now reported**, with the budget and
+  the reason. Previously it vanished silently — the failure this feature was
+  otherwise built to avoid.
+- **The lowest severity is dropped first.** Rule sets load in filename order, so
+  overflow used to shed whichever sorted last: a `high` security set lost to a
+  style guide on the letter `s`. Severity is the only ranking the author
+  declared, so it decides. Surviving sets still *render* in filename order, so
+  the cache key does not move.
+
+### Added
+
+- **`!` exclusion globs in `scope`** — `["src/**", "!src/legacy/**"]`, the way
+  CodeRabbit's `path_filters` reads. An exclusion beats every include.
+- **`always: true`** to apply a rule set to every file regardless of `scope`.
+  An empty `scope` already meant this; now it can be said out loud, and
+  `rules list` marks it.
+- **`description:`** — one line for humans, shown by `rules list`, never sent to
+  the model.
+- **`globs:` and `alwaysApply:` accepted as aliases**, so a rule set ported from
+  `.cursor/rules/` loads unedited.
+- **`diffmind rules check`** — validates every rule set and pattern rule and
+  exits non-zero, for CI. Catches parse errors, duplicate ids, identical bodies,
+  scopes that match nothing, and invalid regex in `rules.toml`.
+- **A `scope` of only `!` exclusions is now a parse error.** It matched no file
+  at all, which is a rule set that silently does no work.
+- **`examples/nextjs-app-router/`** — a complete, working rule set for a
+  React/Next.js project: three scoped `.md` rule sets and 13 regex rules.
+
+### Fixed — what gets reviewed
 
 - **Coding-agent and editor config is no longer reviewed.** `.claude/`,
   `.cursor/`, `.windsurf/`, `.aider/`, `.vscode/`, `.idea/`, `.zed/` and
