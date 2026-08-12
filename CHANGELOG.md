@@ -20,8 +20,9 @@ else's branch. Both surfaces share one engine; neither replaces the other.
 
 ### Added
 
-- **Code graph.** A tree-sitter symbol graph for Rust, TypeScript, TSX,
-  JavaScript and Python, stored in `.diffmind/graph.db` and updated incrementally
+- **Code graph.** A tree-sitter symbol graph for 13 languages — Rust,
+  TypeScript, TSX, JavaScript, Python, Go, Java, C#, Ruby, PHP, C, C++ and
+  Scala — stored in `.diffmind/graph.db` and updated incrementally
   by mtime. Replaces the regex symbol index, which could only see `pub`/`export`
   declarations and had no concept of a reference at all.
   Review context now includes **the callers of every changed symbol** — a
@@ -29,7 +30,8 @@ else's branch. Both surfaces share one engine; neither replaces the other.
   enclosing definition, referenced definitions, and the file's tests. Everything
   stays inside a byte budget, so context does not grow with the repository.
   Bodies are read from the working tree rather than stored, so a snippet can
-  never disagree with the file being reviewed.
+  never disagree with the file being reviewed. Adding a language is one entry in
+  a table; contributions welcome.
 
 - **Cross-file review units.** When a symbol and code that calls it both change
   in one diff, they are reviewed together as a single unit instead of separately.

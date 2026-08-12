@@ -36,7 +36,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **SARIF output** — inline PR annotations via GitHub Code Scanning, no bot account or token
 - **Pluggable backends** — the bundled GGUF, or your own Ollama / vLLM / LM Studio endpoint
 - **Daemon mode** — keep the model resident so reviews are near-instant
-- **Code graph** — a tree-sitter symbol graph (Rust, TypeScript, TSX, JavaScript, Python) in local SQLite. Each hunk is reviewed alongside its enclosing function, **the callers of what changed**, referenced definitions, and the file's tests — so a changed signature is judged against the code that depends on it
+- **Code graph** — a tree-sitter symbol graph across [13 languages](#supported-languages), in local SQLite. Each hunk is reviewed alongside its enclosing function, **the callers of what changed**, referenced definitions, and the file's tests — so a changed signature is judged against the code that depends on it
 - **Reproducible** — greedy decoding with a fixed seed: the same diff always reviews the same way
 - **Reviewer's cockpit** (`--tui`) — analyses on launch, shows the hunk and context behind each finding, and records accept / dismiss / wrong so the signal-to-noise ratio is measured rather than guessed
 - JSON / Markdown output, and a proper CI gate
@@ -125,6 +125,42 @@ diffmind download --model 1.5b --verify # check an existing download's checksum
 | Qwen2.5-Coder-32B    | 20.0 GB | 40 GB   | Maximum                                   |
 
 Downloads are atomic and checksummed: an interrupted download can no longer leave a truncated file that looks valid.
+
+---
+
+## Supported languages
+
+`diffmind index` builds the code graph from these. Everything else still gets
+reviewed — the diff is always read — it just arrives without graph context.
+
+| Language | Extensions |
+| ---------- | -------------------------------- |
+| Rust       | `.rs` |
+| TypeScript | `.ts`, `.mts`, `.cts` |
+| TSX        | `.tsx` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python     | `.py`, `.pyi` |
+| Go         | `.go` |
+| Java       | `.java` |
+| C#         | `.cs` |
+| Ruby       | `.rb`, `.rake` |
+| PHP        | `.php` |
+| C          | `.c`, `.h` |
+| C++        | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh` |
+| Scala      | `.scala`, `.sc` |
+
+**More coming — contributions very welcome.** Kotlin, Swift, Dart, Elixir, Zig
+and others are all straightforward additions. A language is a *single entry* in
+the `LANGUAGES` table in
+[`graph/extract.rs`](apps/tui-cli/src/graph/extract.rs): a name, its extensions,
+the grammar, and tree-sitter queries for definitions and references. Nothing
+else in the codebase needs to change, and the test suite checks every pattern
+against the real grammar — so a wrong query fails CI instead of silently
+extracting nothing.
+
+One known limit: in Ruby a paren-less call (`check`) is grammatically identical
+to a local variable, so only explicit calls — `check(...)` or `obj.check` —
+become graph edges.
 
 ---
 
