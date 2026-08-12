@@ -19,7 +19,7 @@
 
 use crate::graph::{Def, Graph};
 use core_engine::diff::{FileDiff, parse_diff};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Enclosing bodies to include before the budget is better spent elsewhere.
@@ -117,14 +117,38 @@ pub fn build_context(
     }
 
     // 3. Symbols the added lines mention but do not define here.
-    for (name, near) in referenced_symbols(&files, graph)
-        .into_iter()
-        .take(MAX_REFERENCED)
-    {
-        let Some(def) = graph
-            .definitions_of(&name, near.as_deref(), 1)
-            .into_iter()
-            .next()
+    //
+    // Candidate names are gathered from the text first and resolved in one
+    // batch. Asking the graph about each word as it was encountered meant a
+    // query per distinct word in the diff — thousands on a large branch, times
+    // every review unit — and then the six survivors were looked up a second
+    // time to get the definition that had just been discarded.
+    let candidates = referenced_names(&files);
+    let known = graph.definitions_of_names(
+        &candidates
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut by_name: HashMap<&str, Vec<&Def>> = HashMap::new();
+    for def in &known {
+        by_name.entry(def.name.as_str()).or_default().push(def);
+    }
+
+    let mut referenced_included = 0;
+    for (name, seen_in) in &candidates {
+        if referenced_included >= MAX_REFERENCED {
+            break;
+        }
+        let Some(defs) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        // A definition in the file the name was seen in is far likelier to be
+        // the referent than a same-named symbol elsewhere.
+        let Some(def) = defs
+            .iter()
+            .find(|d| &d.path == seen_in)
+            .or_else(|| defs.first())
         else {
             continue;
         };
@@ -142,6 +166,7 @@ pub fn build_context(
             break;
         }
         out.push_str(&entry);
+        referenced_included += 1;
     }
 
     // 4. The test file, which says what the code is *supposed* to do.
@@ -202,9 +227,15 @@ fn test_file_for(path: &str, project_root: &Path) -> Option<String> {
         .find(|c| project_root.join(c).is_file())
 }
 
-/// Names the added lines mention that the graph knows about, paired with the
-/// file they were seen in so lookup can prefer a local definition.
-fn referenced_symbols(files: &[FileDiff], graph: &Graph) -> Vec<(String, Option<String>)> {
+/// Candidate symbol names from the added lines, in order of first appearance,
+/// each paired with the file it was seen in so lookup can prefer a local
+/// definition.
+///
+/// Purely textual — whether the graph knows a name is decided in one batch by
+/// the caller. This used to consult the graph per word, which is what made
+/// context assembly scale with the size of the diff rather than with the number
+/// of symbols actually reported.
+fn referenced_names(files: &[FileDiff]) -> Vec<(String, String)> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
@@ -218,11 +249,7 @@ fn referenced_symbols(files: &[FileDiff], graph: &Graph) -> Vec<(String, Option<
                     if word.len() < 3 || !seen.insert(word.to_string()) {
                         continue;
                     }
-                    // A name defined in the diff's own file is already visible.
-                    if graph.definitions_of(word, None, 1).is_empty() {
-                        continue;
-                    }
-                    out.push((word.to_string(), Some(file.path.clone())));
+                    out.push((word.to_string(), file.path.clone()));
                 }
             }
         }
@@ -389,6 +416,73 @@ diff --git a/src/math.ts b/src/math.ts
         let diff =
             "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n+let x = 1;\n";
         assert!(build_context(diff, &graph, &root, 8000).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// When two files declare the same name, the one in the file being reviewed
+    /// is the referent. This preference used to live in `Graph::definitions_of`;
+    /// it moved here when name resolution became a single batched query, and it
+    /// is the kind of thing that goes missing in such a move.
+    #[test]
+    fn a_local_definition_wins_over_a_same_named_one_elsewhere() {
+        let root = project("ambiguous-ref");
+        write(
+            &root,
+            "src/a.rs",
+            "pub fn shared_helper() {\n    let from_a = 1;\n}\npub fn uses_it() {}\n",
+        );
+        write(
+            &root,
+            "src/z.rs",
+            "pub fn shared_helper() {\n    let from_z = 2;\n}\n",
+        );
+        let graph = indexed(&root);
+
+        // The diff touches z.rs and mentions the ambiguous name.
+        let diff = "\
+diff --git a/src/z.rs b/src/z.rs
++++ b/src/z.rs
+@@ -1,3 +1,3 @@
++pub fn caller() { shared_helper(); }
+";
+        let ctx = build_context(diff, &graph, &root, 8000).expect("context");
+        assert!(
+            ctx.contains("let from_z"),
+            "z.rs's own definition should be the one shown:\n{ctx}"
+        );
+        assert!(
+            !ctx.contains("let from_a"),
+            "a same-named definition in another file is not the referent:\n{ctx}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Names the graph has never heard of must not consume the referenced-symbol
+    /// budget. Resolution is batched now, so a diff full of ordinary words has to
+    /// leave room for the few that are real symbols.
+    #[test]
+    fn unknown_words_do_not_crowd_out_real_symbols() {
+        let root = project("crowded-words");
+        write(
+            &root,
+            "src/lib.rs",
+            "pub fn real_target() {\n    let m = 1;\n}\n",
+        );
+        let graph = indexed(&root);
+
+        // Plenty of noise words before the one symbol that matters.
+        let noise: String = (0..40)
+            .map(|i| format!("+    let unknown_word_{i} = {i};\n"))
+            .collect();
+        let diff = format!(
+            "diff --git a/src/use.rs b/src/use.rs\n+++ b/src/use.rs\n@@ -1,50 +1,50 @@\n{noise}+    real_target();\n"
+        );
+
+        let ctx = build_context(&diff, &graph, &root, 8000).expect("context");
+        assert!(
+            ctx.contains("Definition of `real_target`"),
+            "the one real symbol must survive a diff full of unknown words:\n{ctx}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

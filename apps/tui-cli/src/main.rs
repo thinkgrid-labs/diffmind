@@ -501,20 +501,23 @@ pub fn build_backend(choice: &BackendChoice, model_dir: &Path) -> Result<Box<dyn
             let info = download::find_model(model)
                 .ok_or_else(|| anyhow::anyhow!("unknown model '{model}'"))?;
             let model_path = model_dir.join(info.gguf_filename);
-            let tokenizer_path = model_dir.join("tokenizer.json");
+            let tokenizer_path = model_dir.join(download::TOKENIZER_FILENAME);
 
             if !model_path.exists() || !tokenizer_path.exists() {
                 anyhow::bail!(
                     "model files not found. Run `diffmind download --model {model}` first."
                 );
             }
-            // Catch a truncated download here, where the fix is obvious, rather
-            // than letting candle fail with an opaque GGUF parse error.
-            if download::looks_truncated(model_dir, info.gguf_filename) {
+            // Catch a truncated download — or weights left by a build that
+            // pinned a different revision — here, where the fix is obvious,
+            // rather than letting candle fail with an opaque GGUF parse error or
+            // silently reviewing with the wrong model.
+            if download::looks_truncated(model_dir, info) {
                 anyhow::bail!(
-                    "{} is incomplete (a previous download was interrupted).\n\
+                    "the files in {} are not the ones this build of diffmind pins \
+                     (an interrupted download, or a model fetched by another version).\n\
                      Re-download with: diffmind download --model {model} --force",
-                    info.gguf_filename
+                    model_dir.display()
                 );
             }
 
@@ -778,11 +781,31 @@ pub fn unit_grouper(project_root: &Path) -> core_engine::analyzer::UnitGrouper {
 pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> String {
     let graph = Graph::open(project_root).ok().filter(|g| !g.is_empty());
     let root = project_root.to_path_buf();
+    // Memoised on the chunk text, because the same chunk is asked about twice:
+    // the TUI wants a unit's context when the unit starts, so it can show the
+    // evidence behind a finding, and the analyzer wants it again when it builds
+    // that unit's prompt. Assembling it walks the graph and reads source files,
+    // which is far too much to pay twice for one answer.
+    //
+    // Keyed by the text itself rather than a hash of it: a collision would serve
+    // one unit the context of another, and confidently wrong context is the
+    // failure this whole module exists to avoid. The keys are the unit texts,
+    // which the caller is already holding.
+    let memo: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
     move |chunk: &str| {
-        graph
+        if let Ok(cache) = memo.lock()
+            && let Some(hit) = cache.get(chunk)
+        {
+            return hit.clone();
+        }
+        let built = graph
             .as_ref()
             .and_then(|g| rag::build_context(chunk, g, &root, budget))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(mut cache) = memo.lock() {
+            cache.insert(chunk.to_string(), built.clone());
+        }
+        built
     }
 }
 
@@ -864,11 +887,12 @@ fn review(
         let response = client
             .review(daemon::ReviewRequest {
                 diff: diff.to_string(),
-                languages: detect_languages(diff),
                 requirements: ticket.clone(),
                 max_tokens: settings.max_tokens,
                 min_confidence: settings.min_confidence,
                 triage: format!("{:?}", settings.triage).to_lowercase(),
+                temperature: settings.temperature,
+                seed: settings.seed,
                 rules: project.custom.clone(),
                 rulebooks: project.books.clone(),
                 baseline: project
@@ -985,7 +1009,7 @@ fn run_with_progress(
         diff,
         context_for,
         settings.max_tokens,
-        move |chunk, total| {
+        move |chunk, total, _unit| {
             if let Ok(mut l) = progress_label.lock() {
                 *l = format!("unit {chunk}/{total}");
             }
@@ -1031,7 +1055,7 @@ fn print_header(
 
     let model_label = match &settings.backend {
         BackendChoice::Local { model, .. } => download::find_model(model)
-            .map(|m| format!("{} · Q4_K_M · {:.1} GB", m.name, m.size_gb))
+            .map(|m| format!("{} · Q4_K_M · {:.1} GB", m.name, m.size_gb()))
             .unwrap_or_else(|| model.clone()),
         BackendChoice::Remote {
             protocol,
@@ -1486,11 +1510,21 @@ fn run_serve(
         // request, not from whatever the daemon happened to be started with —
         // otherwise `--no-cache` and friends are silently ignored, and a daemon
         // started in one repo would write another repo's cache.
+        //
+        // `settings` here is only the daemon's own startup configuration. The
+        // fields left untouched below are the ones that genuinely belong to the
+        // resident process (`backend`, and `debug`, whose output goes to the
+        // daemon's console rather than the client's terminal).
         let mut per_request = settings.clone();
         per_request.max_tokens = req.max_tokens;
         per_request.min_confidence = req.min_confidence;
         per_request.triage = core_engine::TriageMode::parse(&req.triage);
-        per_request.use_cache = req.use_cache;
+        per_request.temperature = req.temperature;
+        per_request.seed = req.seed;
+        // Re-assert the invariant `resolve_settings` establishes rather than
+        // trusting the client to have applied it: a cached answer replayed for
+        // a sampled run would be a lie about what the model produced.
+        per_request.use_cache = req.use_cache && req.temperature == 0.0;
 
         let request_root = if req.project_root.is_empty() {
             project_root.clone()
@@ -1514,7 +1548,13 @@ fn run_serve(
         // Built here rather than sent by the client: the daemon owns chunking,
         // so only the daemon knows what each chunk contains.
         let context_for = context_builder(&request_root, 8000);
-        let outcome = analyzer.analyze(&req.diff, &context_for, req.max_tokens, |_, _| {}, |_| {});
+        let outcome = analyzer.analyze(
+            &req.diff,
+            &context_for,
+            req.max_tokens,
+            |_, _, _| {},
+            |_| {},
+        );
 
         let backend_label = analyzer.backend_description();
         // Reclaim the loaded weights for the next request — the whole point of

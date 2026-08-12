@@ -269,11 +269,22 @@ impl ReviewAnalyzer {
     /// The units this analyzer would review, for a caller that needs to show a
     /// reader the hunk a finding actually came from.
     ///
-    /// Ids match those stamped onto findings, because the sizing comes from the
-    /// same backend and units are grouped per file — so triage dropping a whole
-    /// file cannot shift the ids of the files that survive.
+    /// Ids match those stamped onto findings: the sizing comes from the same
+    /// backend, unit ids are content-derived rather than positional (so triage
+    /// dropping a whole file cannot shift the ids of the files that survive),
+    /// and the same grouper runs here as in [`Self::analyze`].
+    ///
+    /// That last part is easy to lose. Merging two units mints a **new** id, so
+    /// planning without the grouper returned only the unmerged halves — and
+    /// every finding from a merged unit named an id no caller could resolve.
+    /// The TUI's evidence pane went blank for precisely the cross-file changes
+    /// the code graph exists to link.
     pub fn plan_units(&self, diff: &str, max_tokens: u32) -> Vec<crate::unit::ReviewUnit> {
-        build_units(diff, self.max_chunk_lines(max_tokens as usize))
+        let units = build_units(diff, self.max_chunk_lines(max_tokens as usize));
+        match &self.unit_grouper {
+            Some(group) => group(units),
+            None => units,
+        }
     }
 
     fn gen_options(&self, max_new_tokens: usize) -> GenOptions {
@@ -342,7 +353,12 @@ impl ReviewAnalyzer {
     /// - `context_for(chunk)` supplies the symbol context for one chunk. It is
     ///   a callback rather than a string because context must be assembled per
     ///   chunk: see [`Self::analyze_chunk`].
-    /// - `on_progress(done, total)` fires when a chunk starts.
+    /// - `on_progress(done, total, unit)` fires when a unit starts, and is
+    ///   handed the unit itself. A caller that wants to show a reader the hunk
+    ///   behind a finding should record it here rather than predict the unit
+    ///   list up front: triage and the grouper both run inside this method, and
+    ///   either can change which units exist and therefore what ids findings
+    ///   carry. It always fires before that unit's `on_chunk_result`.
     /// - `on_chunk_result(findings)` fires with each batch as it completes, so
     ///   the CLI can print before the whole diff is processed.
     ///
@@ -357,7 +373,7 @@ impl ReviewAnalyzer {
         on_chunk_result: G,
     ) -> Result<(ReviewSummary, AnalysisStats), EngineError>
     where
-        F: Fn(usize, usize),
+        F: Fn(usize, usize, &crate::unit::ReviewUnit),
         G: Fn(&[ReviewFinding]),
     {
         let files = parse_diff(diff);
@@ -410,7 +426,7 @@ impl ReviewAnalyzer {
         units.sort_by_key(|u| rulebook::group_key(&applicable_to_unit(&rulebooks, u)));
 
         for (i, unit) in units.iter().enumerate() {
-            on_progress(i + 1, units.len());
+            on_progress(i + 1, units.len(), unit);
             let books = applicable_to_unit(&rulebooks, unit);
 
             match self.analyze_chunk(&unit.text, context_for, &books, max_tokens_per_chunk, 0) {
@@ -1060,7 +1076,7 @@ diff --git a/b.rs b/b.rs
         };
 
         analyzer
-            .analyze(TWO_FILES, &context_for, 512, |_, _| {}, |_| {})
+            .analyze(TWO_FILES, &context_for, 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         let prompts = seen.lock().expect("recording backend mutex");
@@ -1088,6 +1104,117 @@ diff --git a/b.rs b/b.rs
         );
     }
 
+    const TWO_SRC_FILES: &str = "\
+diff --git a/src/a.rs b/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,2 @@
+-let old_a = 1;
++let new_a = 2;
+diff --git a/src/b.rs b/src/b.rs
++++ b/src/b.rs
+@@ -1,2 +1,2 @@
+-let old_b = 1;
++let new_b = 2;
+";
+
+    /// What the TUI's evidence pane actually relies on.
+    ///
+    /// It records each unit from `on_progress` and looks it up by a finding's
+    /// `unit_id`. That only works if a unit is announced before any finding
+    /// naming it arrives — otherwise the pane is asked for a hunk it has not
+    /// been given, and silently shows nothing.
+    #[test]
+    fn a_unit_is_announced_before_any_finding_that_names_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut analyzer =
+            ReviewAnalyzer::new(Box::new(FindingBackend { seen })).with_triage(TriageMode::Off);
+
+        // One log, both callbacks, so the interleaving is what is asserted.
+        let announced: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let violations: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        analyzer
+            .analyze(
+                TWO_SRC_FILES,
+                &|_| String::new(),
+                512,
+                |_, _, unit| {
+                    announced.lock().expect("announced").insert(unit.id.clone());
+                },
+                |findings| {
+                    let known = announced.lock().expect("announced");
+                    for f in findings {
+                        if let Some(id) = f.unit_id.as_deref()
+                            && !known.contains(id)
+                        {
+                            violations.lock().expect("violations").push(id.to_string());
+                        }
+                    }
+                },
+            )
+            .expect("analysis should succeed");
+
+        assert!(
+            !announced.lock().expect("announced").is_empty(),
+            "no unit was announced at all"
+        );
+        assert!(
+            violations.lock().expect("violations").is_empty(),
+            "findings arrived naming units that had not been announced: {:?}",
+            violations.lock().expect("violations")
+        );
+    }
+
+    /// The regression that blanked the TUI's evidence pane.
+    ///
+    /// A caller planning units up front looks a hunk up by the finding's
+    /// `unit_id`. Merging two units mints a **new** id, so a plan built without
+    /// the grouper resolved nothing for a merged unit — and a merged unit is
+    /// precisely the cross-file change the code graph exists to link, i.e. the
+    /// finding whose evidence a reviewer most needs to see.
+    ///
+    /// The TUI now takes its units from `analyze` itself rather than predicting
+    /// them, but `plan_units` is still public API and must not lie.
+    #[test]
+    fn planned_unit_ids_cover_every_unit_a_finding_can_name() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut analyzer = ReviewAnalyzer::new(Box::new(FindingBackend { seen }))
+            .with_triage(TriageMode::Off)
+            // Stands in for the code graph linking a symbol to its caller.
+            .with_unit_grouper(Box::new(|units: Vec<crate::unit::ReviewUnit>| match units
+                .split_first()
+            {
+                Some((first, rest)) => {
+                    vec![rest.iter().fold(first.clone(), |a, b| a.merged_with(b))]
+                }
+                None => units,
+            }));
+
+        let planned: HashSet<String> = analyzer
+            .plan_units(TWO_SRC_FILES, 512)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+
+        let (summary, stats) = analyzer
+            .analyze(TWO_SRC_FILES, &|_| String::new(), 512, |_, _, _| {}, |_| {})
+            .expect("analysis should succeed");
+
+        assert_eq!(stats.units_total, 1, "the grouper should have merged both");
+        let used: HashSet<&str> = summary
+            .findings
+            .iter()
+            .filter_map(|f| f.unit_id.as_deref())
+            .collect();
+        assert!(!used.is_empty(), "a model finding must record its unit");
+        for id in &used {
+            assert!(
+                planned.contains(*id),
+                "a finding names unit {id}, which the plan cannot resolve: {planned:?}"
+            );
+        }
+    }
+
     /// Two regions of one file are two units, and each finding records which
     /// unit produced it — that is what lets the reader be shown the exact hunk
     /// the model was looking at.
@@ -1108,7 +1235,7 @@ diff --git a/src/a.rs b/src/a.rs
         let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
 
         let (summary, stats) = analyzer
-            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         assert_eq!(stats.units_total, 2, "two regions, two units");
@@ -1159,7 +1286,7 @@ diff --git a/src/a.rs b/src/a.rs
             .with_triage(TriageMode::Off)
             .with_rulebooks(books);
         analyzer
-            .analyze(ONE_FILE, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(ONE_FILE, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed")
             .0
             .findings
@@ -1253,7 +1380,7 @@ diff --git a/src/auth.js b/src/auth.js
         let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
 
         let (summary, _) = analyzer
-            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         let detector_findings: Vec<_> = summary

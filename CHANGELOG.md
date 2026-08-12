@@ -1,6 +1,156 @@
 # Changelog
 
-## 0.9.0 — the reviewer's cockpit
+## [0.9.0] — 08-12-2026
+
+### Security
+
+- **Model weights are now pinned and verified.** Downloads used HuggingFace's
+  `resolve/main/…`, a moving ref, and the only checksum on record was whatever
+  digest the bytes that arrived happened to produce — so `--verify` could prove a
+  file had not rotted on disk and never that it was the right file. Each entry
+  now carries an immutable commit sha plus the expected SHA-256 and byte count,
+  checked before the download is moved into place; a mismatch refuses to install
+  rather than warning. The tokenizer is pinned the same way, since one that
+  disagrees with the model shifts every token id without failing loudly.
+  A model left behind by a build pinning a different revision is treated as
+  absent and re-fetched instead of loaded.
+
+  This closes a real gap in the reproducibility claim: the same model id could
+  previously mean different bytes on two machines, or on one machine a month
+  apart. The per-download `.receipt.json` sidecars are gone — the expectation
+  ships in the binary, so the "no checksum on record" state no longer exists.
+  Existing downloads are verified against the new pins on next use; the current
+  files match, so no re-download is expected.
+
+### Fixed
+
+- **A non-ASCII path in a diff header could abort the process.** The
+  `diff --git a/… b/…` parser sliced the line at a byte midpoint without a
+  character-boundary check, so a rename involving a non-ASCII filename — routine
+  with `core.quotePath=false`, or in any diff piped to `--stdin` — panicked
+  instead of reviewing. The same arithmetic was one byte off, so the branch had
+  never matched anything and every correct answer came from the fallback below
+  it. Now fixed rather than removed: a `diff --git` line resolves on its own,
+  which matters for binary files and mode changes, where no `+++ b/…` follows to
+  correct it.
+
+- **A non-ASCII identifier could abort the detector.** `references_identifier`
+  advanced by one *byte* past a match, so a name whose first character is
+  multi-byte — `const élan = 1`, which `extract_declared_name` collects because
+  `char::is_alphanumeric` is Unicode-aware — landed mid-codepoint and panicked
+  the process on the next search. The same byte arithmetic also read a UTF-8
+  continuation byte as a word boundary, so `élan` looked like a standalone
+  reference inside `béélan`. Both now work in characters.
+
+- **A diff with no `diff --git` lines was parsed as one merged file.** Piping
+  `diff -u`, `git format-patch` or a review tool's output to `--stdin` gives no
+  `diff --git` line, and nothing else closed the previous file — so the second
+  file's `+++` merely *renamed* the first, every hunk in the diff collapsed under
+  the last path seen, and the pre-filter dropped the paths entirely (which also
+  meant lockfiles and generated files in a piped diff were never filtered). The
+  `--- old` / `+++ new` / `@@` sequence is now recognised as a file boundary in
+  the parser, the pre-filter and unit splitting alike.
+
+  Relatedly, `--- ` and `+++ ` were treated as path lines even *inside* a hunk,
+  where they are content: a removed `-- note` in SQL, Lua or Haskell renders as
+  `--- note`, so it was dropped from the hunk and its `+++` twin renamed the file
+  to the comment's own text. Path lines are now only read outside a hunk.
+
+- **A suppression comment with a written reason silently stopped suppressing.**
+  `// diffmind-ignore false positive, validated upstream` parsed every word of
+  the reason as a rule ID, matched nothing, and let the finding straight
+  through. Rule IDs are now read up to the first word that is not shaped like
+  one, and the rest is treated as prose, so a bare reason means "all rules" and
+  `// diffmind-ignore DM002 -- the caller restores it` still scopes to `DM002`.
+  A `:` after the marker is punctuation. If you use single-lowercase-word IDs in
+  `rules.toml` (`id = "todo"`), prefix or hyphenate them — such a word now reads
+  as prose, which over-suppresses on that line rather than under-suppressing.
+
+- **The TUI's evidence pane was empty for cross-file findings.** It planned the
+  review units itself to show the hunk behind a finding, but that plan ran
+  before unit grouping and triage, both of which change which units exist and
+  therefore what IDs findings carry — so a merged unit, exactly the cross-file
+  change the code graph exists to link, resolved to nothing. Units now come from
+  the analyzer as it reviews them, so the pane cannot disagree with the run.
+
+- **The blast radius collapsed to one caller.** `callers_of` limited reference
+  rows and deduplicated afterwards, so a function calling a changed symbol
+  several times consumed the entire budget: three callers of six calls each,
+  asking for three, returned one. Review context now sees the callers it was
+  meant to. Results are also ordered — tightest enclosing scope first — where an
+  unordered `LIMIT` previously returned whatever the query planner chose, so the
+  same repository could produce different context from run to run.
+
+- **A brace in the model's preamble threw away the whole unit.** JSON extraction
+  tried the first `{` or `[` in the output and gave up if it was not valid,
+  rather than looking further along — so `Looking at the diff {specifically
+  auth.rs}, here is the review: {…}` yielded nothing and the unit was counted
+  unparseable. A rejected opener is now skipped; only a genuinely unterminated
+  one stops the scan, since anything after it is nested inside it. Affects the
+  remote backends (Ollama, OpenAI-compatible), whose decoding cannot be
+  constrained and which are therefore the likeliest to add a preamble.
+
+- **`--seed` and `--temperature` were ignored whenever a daemon was running.**
+  Neither was part of the daemon protocol, so a served review used whatever
+  sampling `diffmind serve` had been started with, and the same diff could
+  produce different findings depending on whether a daemon happened to be up.
+  Both are now per-request. The daemon also re-asserts that caching is off above
+  temperature 0 rather than trusting the client to have done so.
+
+### Internal
+
+- **End-to-end coverage for `--stdin`.** `apps/tui-cli/tests/stdin_pipeline.rs`
+  runs the real binary with a diff on stdin and asserts on stdout and the exit
+  code, with inference supplied by a stub `openai-compatible` endpoint rather
+  than the bundled model — so no 1.1 GB download is a test dependency, and the
+  path exercised is a shipped one rather than a test-only seam.
+  The stub answers each request about whichever file it can see in the prompt,
+  and records the prompts, so the tests can assert what the model was *shown* and
+  not merely what came back.
+
+  This is the coverage whose absence let one defect live in four places at once:
+  each copy had unit tests, and none of them tested the four together. Reverting
+  all four fixes now fails four of the six new tests.
+
+### Performance
+
+All three of these ran before a single token was generated, so they were paid on
+every review — including one that turned out to be fully cached.
+
+- **The code graph is no longer queried per line.** Deciding whether two units
+  were related asked the graph for the enclosing symbol of every line in a
+  unit's span, which for a 1500-line unit was 1500 queries. One query for the
+  span, resolved in memory: **17x faster** on that unit (122ms → 7ms), with a
+  byte-identical result. Still the innermost declaration per line — taking every
+  overlapping one would have been cheaper again, but it would make any two units
+  inside the same module look related.
+
+- **Referenced symbols resolve in one batch instead of one query per word.**
+  Context assembly asked the graph about every distinct word in the diff as it
+  encountered it, then looked the survivors up a second time. On a diff with
+  ~1600 candidate words that was ~1600 queries; it is now a handful of batched
+  ones, **9.7x faster**, resolving the same definitions.
+
+- **Context is assembled once per unit, not twice.** The TUI asks for a unit's
+  context when the unit starts, and the analyzer asks again when it builds that
+  unit's prompt. The builder now memoises on the chunk text, so the second ask
+  costs nothing (3.4ms → 9µs). Keyed by the text itself rather than a hash: a
+  collision would hand one unit another's context, and confidently wrong context
+  is the failure the whole module exists to prevent.
+
+### Changed
+
+- `Graph::definitions_of` is replaced by `definitions_of_names` (batched) and
+  `declarations_overlapping` (span-based). The "prefer a definition in this
+  file" rule moved to `rag`, where the file being reviewed is known.
+- `ReviewAnalyzer::analyze`'s progress callback takes the unit being reviewed:
+  `Fn(usize, usize)` → `Fn(usize, usize, &ReviewUnit)`. Callers that need to
+  show a reader the hunk behind a finding should record it here rather than
+  predicting the unit list with `plan_units`.
+- **Daemon protocol changed** — `ReviewRequest` gains `temperature` and `seed`
+  and drops the unused `languages` field. The version gate already refuses a
+  daemon from another build; run `diffmind serve --stop` after upgrading.
+
 
 diffmind was built as a gate: run it, get a verdict, pass or fail. This release
 adds the other half — a place to *sit* while deciding what to say about someone

@@ -245,7 +245,8 @@ fn split_files(diff: &str) -> Vec<RawFile> {
         }
     }
 
-    for line in diff.lines() {
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().copied().enumerate() {
         if line.starts_with("diff --git ") {
             flush(&mut files, &mut hunk);
             files.push(RawFile {
@@ -254,6 +255,24 @@ fn split_files(diff: &str) -> Vec<RawFile> {
                 hunks: Vec::new(),
             });
             continue;
+        }
+
+        // A `--- old` / `+++ new` / `@@ …` sequence with no `diff --git` above
+        // it is the only file boundary a plain `diff -u` provides. Without this,
+        // a piped multi-file diff produced one anonymous unit spanning every
+        // file, and a finding in it could not be anchored to a path at all.
+        // See `prefilter::starts_file_header_pair`.
+        if crate::diff::starts_file_header_pair(&lines, i)
+            && (files.is_empty()
+                || hunk.is_some()
+                || files.last().is_some_and(|f| !f.hunks.is_empty()))
+        {
+            flush(&mut files, &mut hunk);
+            files.push(RawFile {
+                path: String::new(),
+                header: Vec::new(),
+                hunks: Vec::new(),
+            });
         }
 
         if line.starts_with("@@") {
@@ -491,6 +510,36 @@ rename to new.rs
             !units[0].covers("src/other.rs", 10),
             "coverage is per file, not per line number"
         );
+    }
+
+    /// A piped diff has no `diff --git` lines, and every unit still has to name
+    /// a file — anchoring drops a finding whose path it cannot resolve, so an
+    /// anonymous unit is a unit whose findings are thrown away.
+    #[test]
+    fn a_plain_diff_yields_one_named_unit_per_file() {
+        let diff = "\
+--- a/src/one.rs
++++ b/src/one.rs
+@@ -1,2 +1,2 @@
+-let a = 1;
++let a = 2;
+--- a/src/two.rs
++++ b/src/two.rs
+@@ -1,2 +1,2 @@
+-let b = 1;
++let b = 2;
+";
+        let units = build_units(diff, 1000);
+        assert_eq!(units.len(), 2, "two files, two units");
+
+        let files: Vec<&str> = units.iter().map(|u| u.file()).collect();
+        assert_eq!(files, ["src/one.rs", "src/two.rs"]);
+
+        // Each unit carries only its own content, and its own header.
+        assert!(units[0].text.contains("+let a = 2;"));
+        assert!(!units[0].text.contains("+let b = 2;"));
+        assert!(units[1].text.contains("+++ b/src/two.rs"));
+        assert_ne!(units[0].id, units[1].id);
     }
 
     #[test]

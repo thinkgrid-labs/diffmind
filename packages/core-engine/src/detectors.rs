@@ -341,33 +341,42 @@ pub fn extract_declared_name(line: &str) -> Option<String> {
 ///
 /// Member accesses (`self.name`, `opts.name`) are excluded: they read a field,
 /// not the removed local, and were a large source of false positives.
+///
+/// Everything here works in characters rather than bytes, because `name` can
+/// legitimately be non-ASCII — [`extract_declared_name`] collects it with
+/// `char::is_alphanumeric`, which is Unicode-aware, so `const élan = 1` yields
+/// `élan`. Byte arithmetic got that wrong twice over: advancing by one byte past
+/// a multi-byte first character landed mid-codepoint and panicked the next
+/// slice, and comparing the neighbouring *byte* against ASCII treated a UTF-8
+/// continuation byte as a word boundary — so `élan` looked like a standalone
+/// reference inside `béélan`.
 pub fn references_identifier(text: &str, name: &str) -> bool {
-    let bytes = text.as_bytes();
-    let name_len = name.len();
-    let mut start = 0;
+    if name.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
 
-    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(name) {
+        let abs = search_from + pos;
+        let end = abs + name.len();
 
-    while let Some(pos) = text[start..].find(name) {
-        let abs = start + pos;
-        let end = abs + name_len;
+        // `find` reports a char boundary and `name` matched whole, so both
+        // slices split cleanly.
+        let before = text[..abs].chars().next_back();
+        let after = text[end..].chars().next();
 
-        // Byte indexing is safe here: `find` returns a char boundary, and the
-        // neighbours are only compared against ASCII. The previous version
-        // mixed this byte offset with `chars().nth()`, which read the wrong
-        // character on any line containing non-ASCII text.
-        let before = if abs == 0 { None } else { Some(bytes[abs - 1]) };
-        let after = bytes.get(end).copied();
+        let standalone = before.is_none_or(|c| !is_ident(c)) && after.is_none_or(|c| !is_ident(c));
+        let is_member_access = before == Some('.');
 
-        let boundary_before = before.is_none_or(|b| !is_ident_byte(b));
-        let boundary_after = after.is_none_or(|b| !is_ident_byte(b));
-        let is_member_access = before == Some(b'.');
-
-        if boundary_before && boundary_after && !is_member_access {
+        if standalone && !is_member_access {
             return true;
         }
-        start = abs + 1;
-        if start >= text.len() {
+
+        // Step past this occurrence's first character, not its first byte.
+        let step = text[abs..].chars().next().map_or(1, char::len_utf8);
+        search_from = abs + step;
+        if search_from >= text.len() {
             break;
         }
     }
@@ -677,6 +686,68 @@ diff --git a/src/a.ts b/src/a.ts
         assert!(references_identifier("// ✅ check timeout now", "timeout"));
         assert!(!references_identifier("let timeoutValue = 1;", "timeout"));
         assert!(!references_identifier("self.timeout", "timeout"));
+    }
+
+    /// A non-ASCII *identifier*, not merely a non-ASCII line. `is_alphanumeric`
+    /// is Unicode-aware, so these names are real and reachable.
+    #[test]
+    fn a_non_ascii_identifier_is_matched_by_character_not_by_byte() {
+        assert!(references_identifier("return élan;", "élan"));
+        assert!(references_identifier("f(élan)", "élan"));
+
+        // Part of a longer identifier is not a reference to it. The old
+        // byte-wise boundary check saw a UTF-8 continuation byte, decided that
+        // was a word boundary, and said yes.
+        assert!(
+            !references_identifier("béélan = 1;", "élan"),
+            "`élan` inside `béélan` is not a standalone reference"
+        );
+        assert!(!references_identifier("élanor()", "élan"));
+
+        // A member access is a field read, as in the ASCII case — and reaching
+        // this branch is what used to advance by one byte into the middle of
+        // `é` and abort the process on the next search.
+        assert!(!references_identifier("return this.élan;", "élan"));
+        assert!(!references_identifier("a.élan + b.élan", "élan"));
+    }
+
+    /// The panic, end to end. `--stdin` or `core.quotePath=false` is not needed
+    /// here: an identifier is enough, and a review that aborts mid-run reports
+    /// nothing at all.
+    #[test]
+    fn a_non_ascii_declaration_does_not_abort_the_detector() {
+        let diff = "\
+diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -1,4 +1,3 @@
+ function f(opts) {
+-  const élan = 30;
+   return opts.élan;
+ }
+";
+        let findings = detect_removed_used_variables(&parse_diff(diff));
+        assert!(
+            findings.is_empty(),
+            "opts.élan is a field read, exactly as opts.timeout is: {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_non_ascii_declaration_is_still_flagged() {
+        let diff = "\
+diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -1,4 +1,3 @@
+ function f() {
+-  const élan = 30;
+   return élan;
+ }
+";
+        let findings = detect_removed_used_variables(&parse_diff(diff));
+        assert_eq!(findings.len(), 1, "got: {findings:#?}");
+        assert!(findings[0].issue.contains("élan"));
     }
 
     #[test]

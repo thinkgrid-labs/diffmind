@@ -147,14 +147,47 @@ fn parse_directive(text: &str) -> Option<Directive> {
 
     // Everything up to a closing comment token is the rule list.
     let rest = rest.split("*/").next().unwrap_or(rest);
+    // `// diffmind-ignore: DM001` reads naturally; the colon is punctuation.
+    let rest = rest.trim_start().strip_prefix(':').unwrap_or(rest);
+
+    // Rule ids first, then prose. Everything from the first word that is not
+    // shaped like a rule id is the author's reason for the suppression, not a
+    // rule — see `looks_like_rule_id`.
     let rules: Vec<String> = rest
         .split([',', ' ', '\t'])
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && s.chars().next().is_some_and(|c| c.is_alphanumeric()))
-        .map(|s| s.to_string())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .take_while(|s| looks_like_rule_id(s))
+        .map(str::to_string)
         .collect();
 
     Some(Directive { scope, rules })
+}
+
+/// Could this word be a rule id, or is it part of a written explanation?
+///
+/// Writing *why* a finding is being suppressed is the most natural thing to put
+/// after the marker, and it used to silently break the directive: every word of
+/// `// diffmind-ignore false positive, validated upstream` was read as a rule
+/// id, none of them matched anything, and the suppression quietly did nothing.
+///
+/// Every id diffmind issues carries a separator, a digit, or a capital —
+/// `DM001`, `DM900.quality`, `rulebook.api`, `custom.no-console` — and the
+/// kebab-case convention covers a hand-written `id` in `rules.toml`. A bare
+/// lowercase word is prose. Guessing wrong here only ever over-suppresses on a
+/// line the author already marked, which is the safe direction: the alternative
+/// is a directive that looks right and does nothing.
+fn looks_like_rule_id(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && token
+            .chars()
+            .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase() || matches!(c, '.' | '-' | '_'))
 }
 
 // ─── Baseline ────────────────────────────────────────────────────────────────
@@ -351,6 +384,60 @@ diff --git a/a.ts b/a.ts
 
         let other = finding("a.ts", 10, "DM002");
         assert!(!round_tripped.contains(&other));
+    }
+
+    /// Writing down *why* something is suppressed is the most natural thing to
+    /// do, and it used to silently disable the directive: every word of the
+    /// reason was parsed as a rule id, matched nothing, and the finding came
+    /// straight back with no indication anything was wrong.
+    #[test]
+    fn a_written_reason_does_not_break_the_directive() {
+        let with = |comment: &str| {
+            let diff = format!(
+                "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1,2 @@\n+const x = 1; {comment}\n"
+            );
+            InlineSuppressions::from_diff(&parse_diff(&diff))
+        };
+
+        // A bare reason means "all rules", exactly as a bare marker does.
+        assert!(
+            with("// diffmind-ignore false positive, x is validated upstream")
+                .is_suppressed(&finding("a.ts", 1, "DM900.quality"))
+        );
+
+        // A rule id followed by a reason still scopes to that rule.
+        let scoped = with("// diffmind-ignore DM002 -- the caller restores it");
+        assert!(scoped.is_suppressed(&finding("a.ts", 1, "DM002")));
+        assert!(
+            !scoped.is_suppressed(&finding("a.ts", 1, "DM001")),
+            "the reason must not widen the directive to every rule"
+        );
+    }
+
+    #[test]
+    fn rule_ids_of_every_shape_are_recognised() {
+        for id in [
+            "DM001",
+            "DM900.quality",
+            "rulebook.api",
+            "custom.no-console",
+        ] {
+            assert!(looks_like_rule_id(id), "{id} should read as a rule id");
+        }
+        // A hand-written id from rules.toml, by the documented convention.
+        assert!(looks_like_rule_id("no-console"));
+
+        for prose in ["false", "positive", "upstream", "--", "(intentional)"] {
+            assert!(!looks_like_rule_id(prose), "{prose} should read as prose");
+        }
+    }
+
+    #[test]
+    fn a_colon_after_the_marker_is_punctuation_not_a_rule() {
+        let diff = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1,2 @@\n+const x = 1; // diffmind-ignore: DM001\n";
+        let s = InlineSuppressions::from_diff(&parse_diff(diff));
+        assert!(s.is_suppressed(&finding("a.ts", 1, "DM001")));
+        assert!(!s.is_suppressed(&finding("a.ts", 1, "DM002")));
     }
 
     #[test]

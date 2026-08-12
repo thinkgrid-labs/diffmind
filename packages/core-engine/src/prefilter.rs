@@ -265,7 +265,8 @@ pub fn prefilter(diff: &str, opts: &PrefilterOptions) -> (String, PrefilterRepor
     let mut file = FileState::default();
     let mut hunk = HunkState::default();
 
-    for line in diff.lines() {
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().copied().enumerate() {
         if line.starts_with("diff --git ") {
             flush_file(&mut out, &mut report, &mut file, &mut hunk);
             file.classify(&header_path(line), opts);
@@ -273,9 +274,28 @@ pub fn prefilter(diff: &str, opts: &PrefilterOptions) -> (String, PrefilterRepor
             continue;
         }
 
+        // A `--- old` / `+++ new` pair opens a file when nothing else has.
+        //
+        // `git diff` announces each file with a `diff --git` line, so the pair
+        // that follows belongs to a file already open. A plain `diff -u` — or
+        // anything piped to `--stdin` — has no such line, and then this pair is
+        // the only thing separating one file from the next. Without recognising
+        // it, the first file's header was dropped (leaving hunks that could not
+        // be attributed to any path) and, in a multi-file diff, the second
+        // file's header arrived while a hunk was open and was counted as `-` and
+        // `+` content lines — silently corrupting both files.
+        let opens_a_file = crate::diff::starts_file_header_pair(&lines, i)
+            && (file.header.is_empty() || !hunk.lines.is_empty());
+        if opens_a_file {
+            flush_file(&mut out, &mut report, &mut file, &mut hunk);
+        }
+
         // Header lines belong to the file, not to any hunk, and are replayed
         // only if some hunk of that file survives.
-        if hunk.lines.is_empty() && !file.header.is_empty() && is_file_header_line(line) {
+        if hunk.lines.is_empty()
+            && (opens_a_file || !file.header.is_empty())
+            && is_file_header_line(line)
+        {
             // `+++ b/path` is the authoritative path; re-classify against it.
             if let Some(rest) = line.strip_prefix("+++ ") {
                 let p = rest.trim();
@@ -725,6 +745,90 @@ index 0000000..1234567
             out, diff,
             "a diff with no noise in it must survive untouched"
         );
+    }
+
+    /// `git diff main...HEAD | diffmind --stdin` is documented, but a diff can
+    /// reach stdin from `diff -u`, `git format-patch`, or a code-review tool,
+    /// and then there is no `diff --git` line at all.
+    ///
+    /// Both halves of this used to be broken: the first file's header was
+    /// dropped entirely, and the second file's header arrived while a hunk was
+    /// open and was counted as removed/added *content* — so two files became one
+    /// corrupted hunk with no path attached to either.
+    #[test]
+    fn a_plain_diff_with_no_git_headers_keeps_its_files_apart() {
+        let diff = "\
+--- a/src/one.rs
++++ b/src/one.rs
+@@ -1,2 +1,2 @@
+-let a = 1;
++let a = 2;
+--- a/src/two.rs
++++ b/src/two.rs
+@@ -1,2 +1,2 @@
+-let b = 1;
++let b = 2;
+";
+        let (out, report) = count(diff, &opts());
+
+        assert_eq!(report.files_total, 2, "two files, not one");
+        assert_eq!(report.hunks_total, 2);
+        assert_eq!(report.hunks_kept, 2);
+        assert_eq!(out, diff, "a clean plain diff must survive untouched");
+
+        // The paths have to reach the model, or no finding can be anchored.
+        assert!(out.contains("+++ b/src/one.rs"));
+        assert!(out.contains("+++ b/src/two.rs"));
+
+        // And the second file's header must not have been eaten as content.
+        let files = crate::diff::parse_diff(&out);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/one.rs", "src/two.rs"]);
+    }
+
+    /// Classification works off the `+++` path, so the noise rules apply to a
+    /// piped diff exactly as they do to one diffmind ran itself.
+    #[test]
+    fn a_plain_diff_is_still_filtered_by_path() {
+        let diff = "\
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1,2 +1,2 @@
+-  integrity: sha512-aaa
++  integrity: sha512-bbb
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -1,2 +1,2 @@
+-let token = None;
++let token = Some(secret);
+";
+        let (out, report) = count(diff, &opts());
+        assert_eq!(report.dropped.get(&DropReason::Lockfile), Some(&1));
+        assert!(!out.contains("pnpm-lock.yaml"));
+        assert!(out.contains("+let token = Some(secret);"));
+        assert!(
+            out.contains("+++ b/src/auth.rs"),
+            "the surviving file still needs its header"
+        );
+    }
+
+    /// The pair detection must not fire on ordinary content. A removed SQL
+    /// comment renders as `--- note`, which is why the `@@` is required too.
+    #[test]
+    fn a_removed_sql_comment_is_not_mistaken_for_a_file_header() {
+        let diff = "\
+diff --git a/q.sql b/q.sql
++++ b/q.sql
+@@ -1,4 +1,4 @@
+ select 1;
+--- old note
++++ new note
+ select 2;
+";
+        let (out, report) = count(diff, &opts());
+        assert_eq!(report.files_total, 1, "one file, not two");
+        assert_eq!(report.hunks_total, 1);
+        assert_eq!(out, diff, "content must pass through untouched");
     }
 
     #[test]

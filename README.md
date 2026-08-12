@@ -360,15 +360,23 @@ is opt-in.
 
 Models download to `~/.diffmind/models/` — all Qwen2.5-Coder, Q4_K_M quantised.
 Inference runs on the Apple Silicon GPU via Metal where available, and on CPU
-(with Accelerate/BLAS) everywhere else. Downloads are atomic and checksummed, so
-an interrupted download cannot leave a truncated file that looks valid.
+(with Accelerate/BLAS) everywhere else.
+
+Every download is **pinned to an immutable commit and verified against a SHA-256
+that ships in the binary**, before the file is moved into place. Writes are
+atomic, so an interrupted download cannot leave a truncated file that looks
+valid — and weights that are not byte-for-byte what this build expects are
+refused rather than loaded. `diffmind download --verify` re-checks an existing
+download against the same pins. This is what makes "the same diff produces the
+same review" true across machines rather than merely likely: a model id names
+exact bytes, not whatever a branch points at today.
 
 | Model | Size | Min RAM | Use for |
 | -------------------- | ------- | ------- | ----------------------------------- |
-| Qwen2.5-Coder-0.5B   | 0.4 GB  | 2 GB    | CI on small runners, lint-grade     |
+| Qwen2.5-Coder-0.5B   | 0.5 GB  | 2 GB    | CI on small runners, lint-grade     |
 | Qwen2.5-Coder-1.5B ★ | 1.1 GB  | 4 GB    | Default — balanced                  |
 | Qwen2.5-Coder-7B     | 4.7 GB  | 10 GB   | Noticeably better security analysis |
-| Qwen2.5-Coder-32B    | 20.0 GB | 40 GB   | Maximum, if you have the machine    |
+| Qwen2.5-Coder-32B    | 19.9 GB | 40 GB   | Maximum, if you have the machine    |
 
 `3b` and `14b` also exist. `diffmind download` gives an interactive picker with
 a hardware check; `--model 1.5b --verify` checks an existing download.

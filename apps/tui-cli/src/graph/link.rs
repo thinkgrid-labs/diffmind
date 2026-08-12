@@ -98,9 +98,25 @@ fn profile(unit: &ReviewUnit, graph: &Graph) -> Profile {
     let mut mentions = HashSet::new();
 
     // Anything the graph knows is declared over the unit's changed span.
+    //
+    // One query for the span, then each line resolved against the result. This
+    // used to ask the graph per line, so a unit spanning 400 lines cost 400
+    // queries — and this runs for every unit of every review, before a single
+    // token is generated.
+    //
+    // Still the *innermost* declaration per line, deliberately. Taking every
+    // overlapping declaration instead would be cheaper still, but it would add
+    // enclosing modules and impl blocks to `declares`, and then any two units
+    // inside `mod utils` would look related to each other.
+    let candidates = graph.declarations_overlapping(unit.file(), unit.new_start, unit.new_end);
     for line in unit.new_start..=unit.new_end {
-        if let Some(def) = graph.enclosing(unit.file(), line) {
-            declares.insert(def.name);
+        // `candidates` is ordered innermost-first, so the first hit is the one
+        // `enclosing` would have returned.
+        if let Some(def) = candidates
+            .iter()
+            .find(|d| d.start_line <= line && d.end_line >= line)
+        {
+            declares.insert(def.name.clone());
         }
     }
 
