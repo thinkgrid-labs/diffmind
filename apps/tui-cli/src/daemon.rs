@@ -589,6 +589,88 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Everything added to this protocol carries `#[serde(default)]`, which is
+    /// what lets an older daemon accept a newer request — and also what would
+    /// let a renamed or unserializable field silently arrive empty.
+    ///
+    /// Both failures here are invisible: rule sets would quietly stop applying
+    /// on the daemon path, and every daemon-served review would report zero
+    /// cost, which is the number Phase 2 is measured on.
+    #[test]
+    fn rule_sets_and_cost_survive_the_wire() {
+        let server = Server::bind(0, Duration::from_secs(30)).unwrap();
+        let port = server.port().unwrap();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || {
+            server
+                .run(|req| {
+                    // Echo what arrived, so the assertions below see the
+                    // deserialized request rather than the one we constructed.
+                    let seen = req
+                        .rulebooks
+                        .first()
+                        .map(|b| format!("{}|{}", b.id, b.body))
+                        .unwrap_or_else(|| "NO RULEBOOKS".into());
+                    Response::Ok(Box::new(ReviewResponse {
+                        summary: ReviewSummary {
+                            positives: vec![seen],
+                            ..Default::default()
+                        },
+                        stats: SerializableStats {
+                            units_total: 3,
+                            inference_ms: 1234,
+                            prompt_tokens: 500,
+                            completion_tokens: 60,
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                        backend: "test".into(),
+                    }))
+                })
+                .unwrap();
+        });
+
+        let client = Client {
+            info: info(port, &token),
+        };
+        let response = client
+            .review(ReviewRequest {
+                diff: "d".into(),
+                languages: vec![],
+                requirements: None,
+                max_tokens: 128,
+                min_confidence: 0.0,
+                triage: "off".into(),
+                rules: vec![],
+                rulebooks: vec![core_engine::Rulebook {
+                    id: "api".into(),
+                    scope: vec!["src/api/**".into()],
+                    severity: Some(core_engine::Severity::High),
+                    body: "- Handlers return ApiError.".into(),
+                }],
+                baseline: None,
+                use_cache: false,
+                project_root: ".".into(),
+            })
+            .expect("review should round-trip");
+
+        assert_eq!(
+            response.summary.positives,
+            vec!["api|- Handlers return ApiError."],
+            "the rule set must reach the daemon, or it silently stops applying"
+        );
+
+        let stats: AnalysisStats = response.stats.into();
+        assert_eq!(stats.inference_ms, 1234);
+        assert_eq!(stats.prompt_tokens, 500);
+        assert_eq!(stats.completion_tokens, 60);
+        assert!(stats.tokens_estimated);
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
     #[test]
     fn a_bad_token_is_refused_and_never_reaches_the_handler() {
         // A short idle timeout so the server winds itself down promptly.

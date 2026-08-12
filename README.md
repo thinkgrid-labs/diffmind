@@ -56,7 +56,7 @@ Auto-detects your OS and CPU architecture, verifies the SHA-256 checksum, and in
 Pin a specific version — note that the variable goes on the **`bash`** side of the pipe, not the `curl` side:
 
 ```bash
-curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | VERSION=v0.8.0 bash
+curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | VERSION=v0.9.0 bash
 ```
 
 ### Windows
@@ -190,7 +190,7 @@ Commit `.diffmind/baseline.json`. Future runs report only new issues. The baseli
 ### GitHub Action
 
 ```yaml
-- uses: thinkgrid-labs/diffmind@v0.8.0
+- uses: thinkgrid-labs/diffmind@v0.9.0
   with:
     model: 1.5b
     fail-on: high
@@ -199,7 +199,7 @@ Commit `.diffmind/baseline.json`. Future runs report only new issues. The baseli
 That caches the model, installs the binary, reviews the PR diff, and uploads SARIF so findings appear inline on the diff. For a PR comment instead:
 
 ```yaml
-- uses: thinkgrid-labs/diffmind@v0.8.0
+- uses: thinkgrid-labs/diffmind@v0.9.0
   with:
     format: markdown
     comment: true
@@ -238,7 +238,7 @@ Or via [pre-commit](https://pre-commit.com):
 ```yaml
 repos:
   - repo: https://github.com/thinkgrid-labs/diffmind
-    rev: v0.8.0
+    rev: v0.9.0
     hooks:
       - id: diffmind
 ```
