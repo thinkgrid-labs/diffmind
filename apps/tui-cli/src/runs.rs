@@ -308,6 +308,9 @@ pub fn ensure_gitignore(project_root: &Path) {
 cache/
 runs/
 models/
+graph.db
+graph.db-wal
+graph.db-shm
 symbols.json
 daemon.json
 ";

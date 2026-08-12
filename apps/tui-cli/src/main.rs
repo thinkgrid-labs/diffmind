@@ -22,8 +22,8 @@ mod config;
 mod daemon;
 mod download;
 mod git;
+mod graph;
 mod hooks;
-mod indexer;
 mod output;
 mod rag;
 mod rules;
@@ -32,7 +32,7 @@ mod settings;
 mod tui;
 
 use crate::cli::OutputFormat;
-use crate::indexer::Indexer;
+use crate::graph::Graph;
 use crate::settings::{BackendChoice, Settings};
 
 /// Exit codes. Distinguishing "found problems" from "could not run" is what
@@ -175,18 +175,22 @@ fn run_command(
         }
 
         cli::Commands::Index { rebuild } => {
-            let mut indexer = Indexer::new(project_root.to_path_buf())?;
-            let existing = if rebuild {
-                None
-            } else {
-                Indexer::load(project_root)
-            };
-            let index = indexer.build_index(existing)?;
-            indexer.save(&index)?;
+            if rebuild {
+                let _ = std::fs::remove_file(Graph::path(project_root));
+            }
+            let mut graph = Graph::open(project_root)?;
+            let spinner = make_spinner("Indexing...", false);
+            let stats = graph.index(project_root, &|n| {
+                spinner.set_message(format!("Indexing... {n} files"))
+            })?;
+            spinner.finish_and_clear();
+            runs::ensure_gitignore(project_root);
+
+            let (files, defs, refs) = graph.counts();
             println!(
-                "Index updated: {} symbols across {} files",
-                index.symbol_count(),
-                index.file_mtimes.len()
+                "Indexed {files} file(s): {defs} definitions, {refs} references \
+                 ({} reparsed, {} unchanged, {} removed)",
+                stats.files_indexed, stats.files_unchanged, stats.files_removed
             );
             Ok(0)
         }
@@ -570,6 +574,7 @@ pub fn build_analyzer(
     project: ProjectRules,
 ) -> ReviewAnalyzer {
     let mut analyzer = ReviewAnalyzer::new(backend)
+        .with_unit_grouper(unit_grouper(project_root))
         .with_languages(detect_languages(diff))
         .with_custom_rules(project.custom)
         .with_rulebooks(project.books)
@@ -720,12 +725,23 @@ fn read_head(path: &Path) -> std::io::Result<String> {
 /// a symbol lookup rather than a re-read of `symbols.json`. Returning a closure
 /// (instead of one context string for the whole diff) is what keeps each
 /// chunk's cache key independent of the other files in the diff.
+/// Merge units the code graph says are two halves of one change. Without a
+/// graph this is the identity function, so behaviour is unchanged.
+pub fn unit_grouper(project_root: &Path) -> core_engine::analyzer::UnitGrouper {
+    let graph = Graph::open(project_root).ok().filter(|g| !g.is_empty());
+    Box::new(move |units| match &graph {
+        Some(g) => graph::link_related(units, g),
+        None => units,
+    })
+}
+
 pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> String {
-    let index = Indexer::load(project_root);
+    let graph = Graph::open(project_root).ok().filter(|g| !g.is_empty());
+    let root = project_root.to_path_buf();
     move |chunk: &str| {
-        index
+        graph
             .as_ref()
-            .and_then(|index| rag::build_context(chunk, index, budget))
+            .and_then(|g| rag::build_context(chunk, g, &root, budget))
             .unwrap_or_default()
     }
 }
