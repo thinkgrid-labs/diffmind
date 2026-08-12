@@ -1,4 +1,4 @@
-# Diffmind — a code review gate you can actually keep
+# Diffmind — local-first AI code review, in your terminal
 
 [![CI](https://github.com/thinkgrid-labs/diffmind/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkgrid-labs/diffmind/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/thinkgrid-labs/diffmind)](https://github.com/thinkgrid-labs/diffmind/releases/latest)
@@ -552,12 +552,16 @@ work to it.
 1. **Parse** — the diff is turned into per-file hunks with correct before and
    after line numbers.
 2. **Filter** — lockfiles, `linguist-generated` paths, `@generated` banners,
-   minified bundles, assets, snapshots, your `ignore` globs and whitespace-only
-   hunks are dropped. This is free, usually removes most of a real branch, and
-   the counts are shown instead of hidden:
+   minified bundles, assets, snapshots, documentation, coding-agent and editor
+   config (`.claude/`, `.cursor/`, `.vscode/`, …), ignore files and formatter
+   settings, your `ignore` globs, and whitespace-only hunks are dropped. This is
+   free, usually removes most of a real branch, and the counts are shown instead
+   of hidden:
    `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
    Whitespace inside a string still counts as a real change, and indentation is
-   never dropped in Python or YAML.
+   never dropped in Python or YAML. Tests are *not* filtered — a test that
+   asserts nothing is worth catching. Docs can be reopened with
+   `--include-docs`.
 3. **Fixed rules** — `DM001`, `DM002` and your regex rules. No model involved.
 4. **Context** — built for each review from `.diffmind/graph.db`: the function
    the hunk is in, the callers of every changed symbol, the definitions it
@@ -601,6 +605,7 @@ cache          = true
 temperature    = 0.0        # 0 = greedy and reproducible
 max_tokens     = 1024
 ignore         = ["**/legacy/**", "*.generated.ts"]   # on top of the built-in noise rules
+include_docs   = false      # review .md/.rst/.txt too; off by default
 
 [backend]
 kind        = "local"       # or "ollama" / "openai-compatible"

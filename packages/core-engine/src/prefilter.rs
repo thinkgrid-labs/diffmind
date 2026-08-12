@@ -29,6 +29,12 @@ pub enum DropReason {
     Snapshot,
     /// Whitespace-only or pure-reformat change.
     Reformat,
+    /// Prose, not code. Reviewing it means asking a model primed for CVEs to
+    /// find them in English, which it will oblige.
+    Docs,
+    /// Configuration that carries no program logic: coding-agent and editor
+    /// directories, ignore files, linter and formatter settings.
+    ToolConfig,
     /// Matched a glob from `.diffmind/config.toml`.
     UserIgnored,
 }
@@ -42,6 +48,8 @@ impl DropReason {
             DropReason::Asset => "assets",
             DropReason::Snapshot => "snapshots",
             DropReason::Reformat => "formatting",
+            DropReason::Docs => "docs",
+            DropReason::ToolConfig => "tool config",
             DropReason::UserIgnored => "ignored",
         }
     }
@@ -88,6 +96,13 @@ pub struct PrefilterOptions {
     pub generated_paths: HashSet<String>,
     /// User globs from `.diffmind/config.toml`.
     pub ignore_globs: Vec<String>,
+    /// Review documentation as if it were code. Off by default.
+    ///
+    /// The escape hatch exists because dropping prose is a judgement, not a
+    /// fact: a team whose `docs/` carries API contracts may genuinely want it
+    /// read. Tool config has no such switch — it is never the reviewer's
+    /// business.
+    pub include_docs: bool,
 }
 
 /// Filenames that are always a lockfile, regardless of directory.
@@ -108,6 +123,58 @@ const LOCKFILE_NAMES: &[&str] = &[
     "pubspec.lock",
     "gradle.lockfile",
 ];
+
+/// Prose extensions. A model told to hunt for vulnerabilities will find them in
+/// a README if you let it.
+const DOC_EXTS: &[&str] = &[
+    "md", "mdx", "markdown", "rst", "txt", "adoc", "asciidoc", "org", "tex",
+];
+
+/// Top-level directories owned by a coding agent or an editor. Nothing under
+/// them is program logic, and `.claude/` in particular is instructions written
+/// *for* a model — feeding them to one invites it to follow them.
+const TOOL_CONFIG_DIRS: &[&str] = &[
+    ".claude",
+    ".cursor",
+    ".windsurf",
+    ".aider",
+    ".vscode",
+    ".idea",
+    ".zed",
+    ".fleet",
+];
+
+/// Declarative config with no logic in it. Ignore files are matched by shape
+/// (`.<something>ignore`) rather than listed, which covers `.helmignore`,
+/// `.vercelignore` and whatever the next tool invents.
+const TOOL_CONFIG_NAMES: &[&str] = &[
+    ".gitattributes",
+    ".gitmodules",
+    ".editorconfig",
+    ".cursorrules",
+    ".npmrc",
+    ".nvmrc",
+    ".browserslistrc",
+    ".prettierrc",
+    ".eslintrc",
+    ".stylelintrc",
+];
+
+/// True for `.gitignore`, `.dockerignore`, `.prettierignore`, and the rest of
+/// the family.
+fn is_ignore_file(base: &str) -> bool {
+    base.starts_with('.') && base.ends_with("ignore") && base.len() > "ignore".len() + 1
+}
+
+/// `.prettierrc.json`, `.eslintrc.yml` — the same config with a format suffix.
+///
+/// Deliberately does not match `prettier.config.js` or `eslint.config.js`:
+/// those are executable JavaScript, and a bug in one is a real bug.
+fn is_suffixed_rc(base: &str) -> bool {
+    TOOL_CONFIG_NAMES
+        .iter()
+        .any(|name| base.starts_with(&format!("{name}.")))
+}
 
 const ASSET_EXTS: &[&str] = &[
     "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "woff", "woff2", "ttf", "eot", "mp4",
@@ -147,7 +214,22 @@ fn classify_path(path: &str, opts: &PrefilterOptions) -> Option<DropReason> {
         return Some(DropReason::Lockfile);
     }
 
+    // Checked before the docs rule so `.claude/skills/foo.md` is reported as
+    // tool config — the reason a reviewer would actually act on — rather than
+    // as prose that happens to live there.
+    let first_segment = path.split('/').next().unwrap_or("");
+    if TOOL_CONFIG_DIRS.contains(&first_segment)
+        || TOOL_CONFIG_NAMES.contains(&base)
+        || is_ignore_file(base)
+        || is_suffixed_rc(base)
+    {
+        return Some(DropReason::ToolConfig);
+    }
+
     let ext = extension(path);
+    if !opts.include_docs && DOC_EXTS.contains(&ext) {
+        return Some(DropReason::Docs);
+    }
     if base.ends_with(".min.js") || base.ends_with(".min.css") || ext == "map" {
         return Some(DropReason::Minified);
     }
@@ -510,6 +592,104 @@ diff --git a/src/auth.rs b/src/auth.rs
         assert_eq!(report.dropped.get(&DropReason::Lockfile), Some(&1));
         // The number the reviewer actually reads.
         assert_eq!(report.reason_summary(), "lockfiles");
+    }
+
+    /// Agent instructions are imperative English about credentials, commands
+    /// and permissions — the exact shape that reads as a security emergency to
+    /// a reviewer prompt. Every one of these came back HIGH before they were
+    /// dropped.
+    #[test]
+    fn coding_agent_and_editor_config_never_reaches_the_model() {
+        for path in [
+            ".claude/skills/deploy.md",
+            ".claude/settings.json",
+            ".cursor/rules.mdc",
+            ".vscode/settings.json",
+            ".idea/workspace.xml",
+            ".windsurf/config.json",
+        ] {
+            assert_eq!(
+                classify_path(path, &opts()),
+                Some(DropReason::ToolConfig),
+                "{path} should be dropped as tool config"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_files_and_formatter_config_are_dropped() {
+        for path in [
+            ".gitignore",
+            ".dockerignore",
+            ".prettierignore",
+            ".eslintignore",
+            ".helmignore",
+            "packages/web/.gitignore",
+            ".editorconfig",
+            ".prettierrc",
+            ".prettierrc.json",
+            ".eslintrc.yml",
+            ".gitattributes",
+        ] {
+            assert_eq!(
+                classify_path(path, &opts()),
+                Some(DropReason::ToolConfig),
+                "{path} should be dropped as tool config"
+            );
+        }
+    }
+
+    /// A config file that is really a program still gets reviewed: a bug in
+    /// `eslint.config.js` is a bug, not a preference.
+    #[test]
+    fn executable_config_is_still_code() {
+        for path in ["eslint.config.js", "prettier.config.js", "vite.config.ts"] {
+            assert_eq!(classify_path(path, &opts()), None, "{path} is real code");
+        }
+    }
+
+    /// `.gitignore` is dropped; `gitignore.rs` is a source file that merely
+    /// sounds like one.
+    #[test]
+    fn the_ignore_file_rule_needs_a_leading_dot_and_nothing_after() {
+        assert_eq!(classify_path("src/gitignore.rs", &opts()), None);
+        assert_eq!(classify_path("src/ignore.rs", &opts()), None);
+        assert_eq!(classify_path(".ignore", &opts()), None, "bare .ignore");
+    }
+
+    #[test]
+    fn docs_are_dropped_by_default_and_kept_when_asked_for() {
+        let readme = "README.md";
+        assert_eq!(classify_path(readme, &opts()), Some(DropReason::Docs));
+
+        let including = PrefilterOptions {
+            include_docs: true,
+            ..PrefilterOptions::default()
+        };
+        assert_eq!(classify_path(readme, &including), None);
+
+        // The switch is about prose only — tool config has no opt-in.
+        assert_eq!(
+            classify_path(".claude/CLAUDE.md", &including),
+            Some(DropReason::ToolConfig),
+        );
+    }
+
+    /// Tests are code, and a test that asserts nothing is worth catching.
+    #[test]
+    fn test_files_are_reviewed_like_any_other_source() {
+        for path in [
+            "src/auth.test.ts",
+            "tests/integration_test.rs",
+            "spec/models/user_spec.rb",
+            "src/__tests__/login.tsx",
+        ] {
+            assert_eq!(
+                classify_path(path, &opts()),
+                None,
+                "{path} must be reviewed"
+            );
+        }
     }
 
     #[test]

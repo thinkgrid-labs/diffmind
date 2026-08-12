@@ -115,6 +115,11 @@ pub struct Cli {
     #[arg(long)]
     pub seed: Option<u64>,
 
+    /// Review documentation (.md, .rst, .txt) too. Skipped by default —
+    /// a reviewer prompt finds vulnerabilities in prose.
+    #[arg(long)]
+    pub include_docs: bool,
+
     /// Skip the on-disk result cache for this run
     #[arg(long)]
     pub no_cache: bool,
