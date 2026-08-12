@@ -119,6 +119,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// Do not refresh the code graph before reviewing. Faster, but findings are
+    /// judged against whatever the graph last saw.
+    #[arg(long)]
+    pub no_index: bool,
+
     /// Ignore `.diffmind/baseline.json` for this run
     #[arg(long)]
     pub no_baseline: bool,

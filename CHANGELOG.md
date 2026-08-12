@@ -30,7 +30,9 @@ else's branch. Both surfaces share one engine; neither replaces the other.
   enclosing definition, referenced definitions, and the file's tests. Everything
   stays inside a byte budget, so context does not grow with the repository.
   Bodies are read from the working tree rather than stored, so a snippet can
-  never disagree with the file being reviewed. Adding a language is one entry in
+  never disagree with the file being reviewed. The graph refreshes itself
+  incrementally before every review (~0.1s on 647 unchanged files) and builds on
+  first use, so it can never fall behind the code; `--no-index` opts out. Adding a language is one entry in
   a table; contributions welcome.
 
 - **Cross-file review units.** When a symbol and code that calls it both change
