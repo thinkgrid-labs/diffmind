@@ -1,4 +1,4 @@
-//! The reviewer's cockpit.
+//! Interactive review — the terminal UI behind `diffmind --tui`.
 //!
 //! This is the surface the whole tool is for: not a report, but a place to sit
 //! while deciding what to say about someone else's branch. Three things follow

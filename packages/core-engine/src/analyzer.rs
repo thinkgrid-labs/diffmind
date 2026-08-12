@@ -32,6 +32,14 @@ const MAX_CHUNK_LINES: usize = 1200;
 /// How many times a chunk may be halved when its prompt overruns the window.
 const MAX_SPLIT_DEPTH: u32 = 4;
 
+/// Ceiling on either optional prompt section. Past this the model's attention is
+/// the binding constraint rather than the window.
+const MAX_SECTION_BYTES: usize = 12_000;
+/// Floor for an optional section, below which it is not worth carrying.
+const MIN_SECTION_BYTES: usize = 400;
+/// Ticket text is a fixed brief, not something that grows with the diff.
+const MAX_REQUIREMENTS_BYTES: usize = 2000;
+
 /// Triage only pays for itself once a diff spans enough files that skipping
 /// some saves more than the extra inference pass costs.
 const TRIAGE_MIN_FILES: usize = 6;
@@ -63,6 +71,9 @@ pub struct AnalysisStats {
     pub units_cached: usize,
     /// Units whose output could not be parsed even after repair.
     pub units_unparseable: usize,
+    /// Units skipped because no amount of splitting fit them in the window.
+    /// Distinct from `units_unparseable`: the model was never asked.
+    pub units_too_large: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -312,25 +323,55 @@ impl ReviewAnalyzer {
         (available / TOKENS_PER_DIFF_LINE).clamp(MIN_CHUNK_LINES, MAX_CHUNK_LINES)
     }
 
-    fn build_prompt(&self, diff: &str, context: &str, rulebooks: &[&Rulebook]) -> Prompt {
+    fn build_prompt(
+        &self,
+        diff: &str,
+        context: &str,
+        rulebooks: &[&Rulebook],
+        max_new_tokens: usize,
+        depth: u32,
+    ) -> Prompt {
+        let budget = self.section_budget_bytes(max_new_tokens, depth);
         review_prompt(&ReviewPromptInput {
             diff,
             context,
             languages: self.languages.as_deref(),
             requirements: self.requirements.as_deref(),
             rulebooks,
-            max_context_bytes: self.context_budget_bytes(),
-            max_requirements_bytes: 2000,
-            max_rules_bytes: self.context_budget_bytes(),
+            max_context_bytes: budget,
+            max_requirements_bytes: budget.min(MAX_REQUIREMENTS_BYTES),
+            max_rules_bytes: budget,
         })
     }
 
-    /// Byte budget for the RAG/context section, scaled to the window rather
-    /// than pinned at the 2 KB a 4K window demanded.
-    fn context_budget_bytes(&self) -> usize {
-        let ctx = self.backend.context_tokens();
-        // Roughly a sixth of the window, three bytes per token.
-        ((ctx / 6) * 3).clamp(1500, 12_000)
+    /// Byte budget for each of the prompt's optional sections — the symbol
+    /// context and the project rules — at recursion `depth`.
+    ///
+    /// Two properties, both learned the hard way.
+    ///
+    /// **The diff keeps at least half the window.** These sections used to be
+    /// sized from the window alone, so a large `.diffmind/rules/` could claim
+    /// 12 KB and the context another 12 KB regardless of what was left for the
+    /// thing actually under review.
+    ///
+    /// **The budget shrinks with depth.** When a prompt overruns, the analyzer
+    /// halves the *diff* and retries — which cannot help when the fixed sections
+    /// are what overran. A big enough rule set therefore failed identically at
+    /// every recursion level and gave up at the depth cap, having never had a
+    /// chance. Shrinking here is what makes the retry mean something.
+    /// [`crate::prompt`] drops whole rule sets that no longer fit rather than
+    /// truncating one mid-sentence, so this degrades to "fewer rules", then to
+    /// "no rules" — never to half a rule that reads like a complete one.
+    fn section_budget_bytes(&self, max_new_tokens: usize, depth: u32) -> usize {
+        let available = self
+            .backend
+            .context_tokens()
+            .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
+        // Half of what is left, shared by the two sections, at ~3 bytes a token.
+        let share = ((available / 4) * 3).min(MAX_SECTION_BYTES);
+        // The floor never exceeds the share, or a window too small to afford it
+        // would be pushed further over by the very thing meant to protect it.
+        (share >> depth.min(16)).max(MIN_SECTION_BYTES.min(share))
     }
 
     /// True when the prompt fits the window with room for the response.
@@ -458,6 +499,16 @@ impl ReviewAnalyzer {
                     }
                     stats.units_unparseable += 1;
                 }
+                // Counted and skipped, not fatal. A hunk nobody can fit in the
+                // window is a fact about that hunk; failing the run over it
+                // would throw away every other unit's findings — including the
+                // deterministic ones, which never needed a model at all.
+                Err(EngineError::UnitTooLarge(why)) => {
+                    if self.debug {
+                        eprintln!("[debug] unit {} ({}) skipped: {why}", i + 1, unit.file());
+                    }
+                    stats.units_too_large += 1;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -573,15 +624,15 @@ impl ReviewAnalyzer {
         }
 
         let context = context_for(chunk);
-        let prompt = self.build_prompt(chunk, &context, rulebooks);
+        let prompt = self.build_prompt(chunk, &context, rulebooks, max_tokens as usize, depth);
 
         if !self.prompt_fits(&prompt, max_tokens as usize) {
             if depth >= MAX_SPLIT_DEPTH {
-                return Err(EngineError::ForwardError(
-                    "a single diff hunk is too large for the model's context window even after \
-                     splitting; review that file on its own"
-                        .into(),
-                ));
+                return Err(EngineError::UnitTooLarge(format!(
+                    "still {} bytes of diff after {MAX_SPLIT_DEPTH} splits, with every \
+                     optional section already at its minimum",
+                    chunk.len()
+                )));
             }
             // Halve and recurse rather than truncate: silently dropping half a
             // hunk means silently not reviewing it. Each half re-derives its own

@@ -5,42 +5,59 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
-**Diffmind reviews a `git diff` and reports security issues, bugs and quality
-problems** — from a single binary, on your machine, with no API key and no
-network. It runs as a CI gate, a git hook, or an interactive terminal cockpit
-for whoever has to review the branch.
+### *Local AI code review, in your terminal. Run it as a CI gate, a git hook, or an interactive review. One Rust binary, no API key.*
 
-The hard part of an automated reviewer is not producing findings. It is
-producing them *the same way twice*, keeping false positives from accumulating
-until someone deletes the job, and doing it cheaply enough to run on every push.
-That is what this is built around.
+**Diffmind reviews a `git diff` and reports security issues, bugs and quality
+problems** — on your machine, with no API key and no network. All three ways of
+running it share one engine, so what fails your build is the same thing you read
+in the terminal.
+
+It does not look at the diff alone. Diffmind builds **its own code graph** of
+your repository — tree-sitter, 13 languages, a SQLite file inside your repo — so
+a changed function is checked against the code that calls it, not just the
+twenty lines around it. Other tools sell this index as a separate product. Here
+it is one command, `diffmind index`, and it is free.
+
+The model is a setting, not a fixed part. **A local model is the default and
+stays the default** — bundled, offline, free every run. Point diffmind at your
+own Ollama or vLLM server if you want a bigger one, and frontier models are
+coming as an opt-in, for the diffs worth paying for.
+
+The hard part of an automated reviewer is not finding problems. It is finding
+them *the same way twice*, keeping false alarms low enough that nobody deletes
+the job, and staying cheap enough to run on every push. That is what this is
+built around.
 
 ---
 
 ## When diffmind is the right tool
 
-Reach for it when you need review that is:
+Use it when you need review that is:
 
-- **Reproducible** — greedy decoding at a fixed seed with a constrained JSON
-  decoder. The same diff reviews the same way every time. A gate that flags a
-  line on Tuesday and not on Wednesday gets deleted within a month.
-- **Free per run** — no per-token bill, so it can run on every push, on every
-  fork's PR, on a repo with no budget.
-- **Offline and secretless** — nothing leaves the machine. No API key in CI, no
-  bot account, no third-party data processor to get approved.
-- **Stateful** — a baseline, inline suppressions, stable rule IDs and a
-  recorded accept/wrong ratio. Review debt that a team carries for two years
-  needs somewhere to live.
+- **Repeatable** — greedy decoding at a fixed seed, with a constrained JSON
+  decoder. The same diff gets the same review every time. A gate that flags a
+  line on Tuesday but not on Wednesday gets deleted within a month.
+- **Free to run** — no per-token bill, so it can run on every push, on every
+  fork's PR, and on a repo with no budget.
+- **Offline, no secrets** — nothing leaves the machine. No API key in CI, no bot
+  account, no outside company to get approved first.
+- **Persistent** — a baseline, inline suppressions, fixed rule IDs and a
+  recorded accept/wrong ratio. A team carries review debt for years, so it needs
+  somewhere to live.
 
-### When to use something else
+### About model size
 
-Diffmind runs local models by default. **It is not smarter than a frontier
-model, and does not try to be.** If you want the deepest possible read of one
-tricky diff and you have an interactive agent and a budget, use those — they
-will find things diffmind will not.
+Diffmind is not a model. It is everything around one — the diff parser, the code
+graph, the context budget, the suppression system, the run history, the gate.
+**The default 1.5B model is not as smart as a frontier model, and does not
+pretend to be.** But the model is the easy part to swap. The rest is the part you
+did not want to build.
 
-The intended shape is both: an agent when you are thinking hard about a single
-change, and diffmind on the other several hundred, unattended, for free.
+So model size is a setting, not a limit. Run the bundled model on all several
+hundred diffs for free. Point at a 14B on your own machine for the ones that
+matter. When hosted models arrive, pay only for the diff that is worth it.
+What never changes is where findings are stored, how you silence them, and how
+the gate behaves.
 
 ---
 
@@ -48,21 +65,21 @@ change, and diffmind on the other several hundred, unattended, for free.
 
 Findings are not all worth the same, and the output says which is which.
 
-**Deterministic findings** — no model involved. Commented-out code (`DM001`),
-a declaration removed while still referenced (`DM002`), your own regex rules
-(`custom.<slug>`). These are pattern-true: they cost nothing, never vary, and
-you can gate on them without thinking about it.
+**Deterministic findings** — no model involved. Commented-out code (`DM001`), a
+declaration deleted while something still uses it (`DM002`), and your own regex
+rules (`custom.<slug>`). These match a pattern or they don't: they cost nothing,
+never change between runs, and you can block on them without worrying.
 
-**Model findings** (`DM900.<category>`) — a model's judgement on a hunk, given
-the enclosing function, the callers of what changed, referenced definitions and
-the file's tests. Depth scales with the model you run: the default 1.5B is a
-lint-grade reviewer that catches obvious mistakes; a 14B behind Ollama reads
-much more like a colleague. Both are worth reading. Neither is worth trusting
-blindly, which is why the cockpit records when they are wrong.
+**Model findings** (`DM900.<category>`) — the model's opinion on a hunk, after
+being shown the function it sits in, the callers of what changed, the
+definitions it refers to, and the file's tests. How good they are depends on the
+model: the default 1.5B catches obvious mistakes, like a linter; a 14B behind
+Ollama reads more like a teammate. Both are worth reading. Neither is worth
+trusting blindly, which is why interactive review records when they are wrong.
 
-The split is deliberate. **Set `--fail-on` for the tier you trust** — many teams
-gate on high-severity deterministic findings and let model findings report
-without blocking.
+The split is on purpose. **Set `--fail-on` for the tier you trust** — many teams
+block on high-severity deterministic findings and let model findings show up
+without failing the build.
 
 ---
 
@@ -95,6 +112,7 @@ Windows: download `diffmind-x86_64-pc-windows-msvc.zip` from
 diffmind download          # one-time model download (~1.1 GB)
 diffmind index             # build the code graph — recommended, big context win
 diffmind                   # review this branch against the repo's default branch
+diffmind --tui             # same review, stepped through in the terminal
 ```
 
 ```bash
@@ -103,7 +121,7 @@ diffmind --staged                # just what's staged
 diffmind v1.2.0..HEAD            # an explicit revision range
 diffmind src/auth/               # just these paths
 diffmind v1.2.0..HEAD src/api/   # a range, narrowed to paths
-diffmind --tui                   # the reviewer's cockpit
+diffmind --tui                   # interactive review
 ```
 
 The base branch is read from `origin/HEAD`, falling back to whichever of
@@ -112,19 +130,58 @@ A bare `a..b` argument is recognised as a revision range without `--range`; the
 detection is strict, so `diffmind ../lib` and a file genuinely named `a..b` are
 still treated as paths.
 
+**There is really only one command.** `diffmind` on its own does the review.
+Everything else is either setup you run once (`download`, `index`,
+`install-hooks`, `rules init`) or upkeep you run now and then (`baseline`,
+`stats`, `cache`, `serve`). You do not have to configure anything before the
+first review works.
+
 ---
 
-## Language support
+## The code graph
 
-Two things here are language-specific, and only one of them limits you.
+Most diff reviewers only see a hunk and a filename. Diffmind indexes the
+repository first, so when it reviews a changed function it also sees the code
+that calls it. That is the difference between "this line looks wrong" and "this
+signature change breaks three callers".
 
-**Review itself works on any text diff** — any language, plus config files, SQL
-migrations, shell scripts. The model reads the hunk; the deterministic detectors
-and your regex rules run on added lines regardless of extension.
+`diffmind index` scans the repo with tree-sitter and saves definitions and
+references into `.diffmind/graph.db`, a normal SQLite file. Each review asks it
+four questions:
 
-**The code graph is the part that needs a grammar.** It supplies the enclosing
-definition, the callers of a changed symbol, and referenced definitions —
-tree-sitter parsers, 13 languages:
+| Question | What you get |
+| --- | --- |
+| Which function contains this line? | The whole function, so a hunk is never read alone |
+| What does this hunk define? | The symbols that changed |
+| **What calls this symbol?** | Who breaks if it changes — a regex index cannot answer this at all |
+| Where is this name defined? | The helpers and types the hunk uses |
+
+Three things keep it reliable:
+
+- **It does not store code.** A definition only stores a line range; the source
+  is read from your files when needed. So the database can never show a snippet
+  that no longer matches the file being reviewed.
+- **It only re-reads what changed.** Re-indexing checks file times and re-parses
+  just those files. `node_modules`, `target`, `dist`, `.venv` and similar are
+  skipped. `diffmind index --rebuild` starts fresh, and if the schema changes it
+  rebuilds itself instead of reading a format it does not understand.
+- **It stays local.** No server, no hosted index, no account, nothing to log in
+  to. It is gitignored by default, and you can rebuild it any time.
+
+Reference patterns stay narrow on purpose — function calls, constructors, type
+names. If it recorded every identifier, "what calls this" would return half the
+repo, and an answer that includes everything is as useless as no answer.
+
+### Languages
+
+Two things depend on the language, and only one of them limits you.
+
+**The review works on any text diff** — any language, plus config files, SQL
+migrations and shell scripts. The model reads the hunk, and the fixed rules and
+your regex rules run on added lines no matter the file type.
+
+**Only the code graph needs a parser.** Its four questions are answered by
+tree-sitter, and diffmind ships 13 of them:
 
 | Language | Extensions |
 | ---------- | -------------------------------- |
@@ -142,14 +199,14 @@ tree-sitter parsers, 13 languages:
 | C++        | `.cpp` `.cc` `.cxx` `.hpp` `.hh` |
 | Scala      | `.scala` `.sc` |
 
-Each gets definitions, references and callers. Files outside the table are still
-reviewed — with their hunk, their test file when it is conventionally named, and
-your rule sets — just without caller context, so a changed signature is judged on
-its own rather than against the code that depends on it.
+Each of these gets definitions, references and callers. Files not in the table
+are still reviewed — you get the hunk, the test file if it follows the usual
+naming, and your rule sets — but without caller information, so a changed
+signature is judged on its own instead of against the code that uses it.
 
 Adding a language is one entry in the `LANGS` table in
-[`apps/tui-cli/src/graph/extract.rs`](apps/tui-cli/src/graph/extract.rs) —
-contributions welcome.
+[`apps/tui-cli/src/graph/extract.rs`](apps/tui-cli/src/graph/extract.rs). Pull
+requests welcome.
 
 ---
 
@@ -183,7 +240,8 @@ git diff origin/main...HEAD | diffmind --stdin --format sarif --output diffmind.
 | `1`  | Findings at or above `--fail-on`                 |
 | `2`  | diffmind itself failed (bad flag, missing model) |
 
-`1` and `2` are distinct, so a crashed binary never looks like a failed review.
+`1` and `2` are different on purpose, so a crash never looks like a failed
+review.
 
 ### Git hooks
 
@@ -192,21 +250,61 @@ diffmind install-hooks --hook pre-push --min-severity high
 diffmind install-hooks --hook pre-commit
 ```
 
-The generated hook exits 0 when diffmind isn't installed, so it never blocks a
-teammate who hasn't set it up, and refuses to overwrite a hook it didn't write
-unless you pass `--force`. Also available through
+The hook it writes exits 0 if diffmind is not installed, so it never blocks a
+teammate who has not set it up, and it will not overwrite a hook it did not
+write unless you pass `--force`. Also available through
 [pre-commit](https://pre-commit.com) — `repo: https://github.com/thinkgrid-labs/diffmind`, `id: diffmind`.
 
 ---
 
-## The cockpit — `diffmind --tui`
+## Interactive review — `diffmind --tui`
 
-The gate is public and must be conservative. The cockpit is private, so it can
-afford to show you more.
+The CI gate is public, so it has to be careful about what it reports. This runs
+on your own machine, so it can show you everything.
 
-Analysis starts on launch. Each finding shows the **actual hunk the model
-reviewed** and the **context it was given** — a finding you cannot check is one
-you will eventually stop reading.
+It starts reviewing as soon as it opens. Each finding shows the **exact hunk the
+model read** and the **context it was given** — because if you cannot check a
+finding, sooner or later you stop reading them.
+
+```text
+┌Status────────────────────────────────────────────────────────────────────────┐
+│ diffmind  9 findings — a accept · d dismiss · w wrong                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Findings (9)────────────────┐┌Detail──────────────────────────────────────────┐
+│> HIGH src/auth/token.rs:47 ││ Severity   HIGH                                │
+│  HIGH …pi/handlers.rs:214  ││ Category   Security                            │
+│✓ MED  src/db/pool.rs:112   ││ Location   src/auth/token.rs:47                │
+│✗ MED  src/api/users.rs:88  ││ Rule       DM900.security                      │
+│· LOW  src/util/fmt.rs:12   ││ Confidence 78%                                 │
+│  LOW  src/db/pool.rs:130   ││                                                │
+│                            ││ Issue                                          │
+│                            ││ validate_token() now returns true for an       │
+│                            ││ empty string. login() and refresh() both       │
+│                            ││ gate on it.                                    │
+│                            ││                                                │
+│                            ││ Suggested fix                                  │
+│                            ││ Reject empty input before the length check.    │
+│                            ││                                                │
+│                            ││ The diff it reviewed                           │
+│                            ││  -pub fn validate_token(t: &str) -> bool {     │
+│                            ││  +pub fn validate_token(t: &str, strict: bool) │
+│                            ││  -    !t.is_empty()                            │
+│                            ││  +    t.len() >= 0                             │
+│                            ││                                                │
+│                            ││ Context it was given                           │
+│                            ││  callers: login() src/auth/session.rs:22       │
+│                            ││           refresh() src/auth/session.rs:40     │
+│                            ││                                                │
+│                            ││ Suppress with:  // diffmind-ignore-next-line   │
+│                            ││                 DM900.security                 │
+└────────────────────────────┘└────────────────────────────────────────────────┘
+ [j/k] Move · [a] Accept+copy · [d] Dismiss · [w] Wrong · [r] Re-run · [q] Quit
+```
+
+The left panel lists the findings, marked with the answer you gave (`✓` accept,
+`✗` wrong, `·` dismiss). The right panel shows the proof. This is not a summary
+of a review that ran somewhere else — it is the review, and the keys below save
+straight to `.diffmind/`.
 
 | Key | Action |
 | --------------- | -------------------------------------------------------- |
@@ -218,19 +316,19 @@ you will eventually stop reading.
 | `r`             | Re-run |
 | `q`             | Quit |
 
-Verdicts are written through immediately, so closing the terminal mid-triage
-loses nothing. Accept copies via **OSC 52**, the terminal's own clipboard
-escape — no dependency, and it works over SSH. tmux and screen need clipboard
-passthrough; if the copy fails you are told, so you never believe you have
-copied something you have not.
+Your answers are saved the moment you press the key, so closing the terminal
+halfway through loses nothing. Accept copies the comment using **OSC 52**, the
+terminal's own clipboard feature — no extra tool needed, and it works over SSH.
+tmux and screen need clipboard passthrough turned on; if the copy fails you are
+told, so you never think you copied something when you did not.
 
 ---
 
 ## Keeping the gate alive
 
-Noise is this category's failure mode. One false positive that cannot be
-silenced is how a review job gets deleted. Every finding therefore carries a
-stable rule ID, shown in the output, so you can silence exactly one thing.
+Noise is what kills tools like this. One false alarm that nobody can turn off
+is how a review job ends up deleted. So every finding has a fixed rule ID, shown
+in the output, and you can turn off exactly that one thing.
 
 ### Inline
 
@@ -243,12 +341,12 @@ const x = 1; // diffmind-ignore
 /* diffmind-ignore-file DM900.maintainability */
 ```
 
-Listing no rule IDs suppresses everything at that location. `DM900` suppresses
-every model category without listing each one.
+If you list no rule IDs, everything at that spot is silenced. `DM900` silences
+every model category at once, so you do not have to list them one by one.
 
 ### Baseline
 
-Adopting a reviewer on an existing codebase shouldn't mean fixing everything
+Adding a reviewer to an existing codebase should not mean fixing everything
 first.
 
 ```bash
@@ -257,13 +355,13 @@ diffmind baseline show
 diffmind baseline clear
 ```
 
-Commit `.diffmind/baseline.json`; future runs report only new issues. The
-baseline keys on a content fingerprint rather than a line number, so it survives
-unrelated edits above the finding.
+Commit `.diffmind/baseline.json`, and later runs report only new issues. The
+baseline matches on the content of the finding, not the line number, so editing
+unrelated lines above it does not break it.
 
-### Measuring whether it earns its keep
+### Checking whether it is worth keeping
 
-Every review is filed to `.diffmind/runs/<sha>/`. `diffmind stats` reads them
+Every review is saved to `.diffmind/runs/<sha>/`. `diffmind stats` reads them
 back:
 
 ```
@@ -280,29 +378,30 @@ back:
       3  rulebook.house-style
 ```
 
-The **accept-to-wrong ratio** is the number that decides whether to keep running
-it — a reviewer who cannot measure noise will just quietly stop running the
-reviewer. Verdicts come from the cockpit. Dismissals are excluded: choosing not
-to raise a correct observation is not the tool being wrong.
+The **accept-to-wrong ratio** is the number that tells you whether to keep using
+it. A team that cannot measure the noise will just quietly stop running the
+tool. The answers come from interactive review. Dismissals do not count against
+it: deciding a correct point is not worth raising is not the tool being wrong.
 
-Run snapshots are overwritten when a sha is reviewed again; verdicts are
-append-only and survive `diffmind stats --clear`, because the ratio is only
-meaningful over months.
+Saved runs are overwritten when the same commit is reviewed again. Your answers
+are only ever added to, and survive `diffmind stats --clear`, because the ratio
+only means something over months.
 
-Diffmind writes `.diffmind/.gitignore` covering `runs/`, `cache/`, `models/`,
-`graph.db` and `daemon.json` — your review notes stay private, while `rules/`,
-`rules.toml`, `config.toml` and `baseline.json` remain committable. Your
-repository's own `.gitignore` is never touched.
+Diffmind writes its own `.diffmind/.gitignore` covering `runs/`, `cache/`,
+`models/`, `graph.db` and `daemon.json`, so your review notes stay private, while
+`rules/`, `rules.toml`, `config.toml` and `baseline.json` can still be committed.
+Your repository's own `.gitignore` is never touched.
 
 ---
 
 ## Your team's standards
 
-### Prose rules — `.diffmind/rules/*.md`
+### Written rules — `.diffmind/rules/*.md`
 
-Rules that need judgement rather than a pattern. Committed to the repo and read
-by the model on every review, so review culture becomes a versioned artifact
-instead of tacit knowledge.
+For rules that need judgement instead of a pattern. They live in the repo and
+the model reads them on every review, so the things your team keeps repeating in
+PR comments become a file anyone can read, instead of knowledge only the senior
+people carry.
 
 ```markdown
 ---
@@ -317,25 +416,26 @@ severity: high
 - Reject changes that widen a response struct without a version bump.
 ```
 
-`scope` globs the files a rule set governs (omit for the whole repo); `severity`
-is a **ceiling** for findings attributed to it, never a promotion; `id` defaults
-to the file stem. Scaffold with `diffmind rules init`, check what loads with
+`scope` is a glob for the files the rule set applies to (leave it out for the
+whole repo). `severity` is a **maximum** for findings from that rule set — it can
+lower a finding's severity but never raise it. `id` defaults to the filename.
+Create a starter file with `diffmind rules init`, and see what loads with
 `diffmind rules list`.
 
-A finding attributed to a rule set gets the ID `rulebook.<id>` and suppresses
-like any other. An attribution naming a rule set that does not govern that file
-is discarded — a small model will invent a plausible name, and an invented one
-could never be suppressed.
+A finding from a rule set gets the ID `rulebook.<id>` and can be silenced like
+any other. If the model credits a rule set that does not apply to that file, the
+credit is dropped — a small model will make up a name that sounds right, and a
+made-up name could never be silenced.
 
-Rule bodies go in the *stable* half of the prompt and units are grouped by which
-rule sets govern them, so every unit in a group sends a byte-identical prefix.
-That is what keeps prompt-prefix caching possible. A rule set that fails to
-parse is reported and skipped, never silently ignored.
+Rule text goes in the *unchanging* part of the prompt, and reviews are grouped by
+which rule sets apply, so every review in a group starts with an identical
+prefix. That is what makes prompt-prefix caching possible later. A rule set that
+fails to parse is reported and skipped, never ignored quietly.
 
 ### Pattern rules — `.diffmind/rules.toml`
 
-Regex, matched against added lines before the model runs: instant,
-deterministic, zero inference cost.
+Regex, checked against added lines before the model runs: instant, always the
+same, and free.
 
 ```toml
 [[rule]]
@@ -355,21 +455,32 @@ message.
 
 ## Models and backends
 
-**The local model is the default and stays the default.** Everything else here
-is opt-in.
+**The local model is the default and stays the default.** Everything else is
+opt-in. There are three levels, in this order on purpose:
+
+| Level | What runs | Same result every time | Cost per run | Status |
+| --- | --- | --- | --- | --- |
+| **Built-in local** | Qwen2.5-Coder GGUF inside diffmind, Metal or CPU | ✅ pinned weights, greedy + constrained decoding | free | **default** |
+| **Your own server** | Ollama, vLLM, LM Studio, anything OpenAI-compatible | ✗ | free — your own hardware | shipped |
+| **Frontier, hosted** | your key, your provider | ✗ | per token | planned, opt-in |
+
+Making a hosted model the default would break the whole idea. No key, no
+network and no per-token bill is exactly why this can run on every push, on
+every fork's PR, and in a repo with no budget. Hosted models are for the diff
+you *choose* to spend money on — never the normal case.
 
 Models download to `~/.diffmind/models/` — all Qwen2.5-Coder, Q4_K_M quantised.
 Inference runs on the Apple Silicon GPU via Metal where available, and on CPU
 (with Accelerate/BLAS) everywhere else.
 
-Every download is **pinned to an immutable commit and verified against a SHA-256
-that ships in the binary**, before the file is moved into place. Writes are
-atomic, so an interrupted download cannot leave a truncated file that looks
-valid — and weights that are not byte-for-byte what this build expects are
-refused rather than loaded. `diffmind download --verify` re-checks an existing
-download against the same pins. This is what makes "the same diff produces the
-same review" true across machines rather than merely likely: a model id names
-exact bytes, not whatever a branch points at today.
+Every download is **locked to a fixed commit and checked against a SHA-256 that
+ships inside the binary** before the file is put in place. The write is atomic,
+so an interrupted download cannot leave a half-written file that looks fine. If
+the weights are not byte-for-byte what this build expects, they are rejected
+instead of loaded. `diffmind download --verify` re-checks a model you already
+have. This is why "the same diff gives the same review" holds on other machines
+too: a model name points at exact bytes, not at whatever a branch happens to
+contain today.
 
 | Model | Size | Min RAM | Use for |
 | -------------------- | ------- | ------- | ----------------------------------- |
@@ -383,10 +494,10 @@ a hardware check; `--model 1.5b --verify` checks an existing download.
 
 ### Your own model server
 
-"Local" doesn't have to mean "in this process". If you already run Ollama, vLLM
-or LM Studio, point diffmind at it — your code still never leaves your machine
-or your network, and you get a model class diffmind will never ship as a 20 GB
-download.
+"Local" does not have to mean "inside diffmind". If you already run Ollama, vLLM
+or LM Studio, just point diffmind at it. Your code still never leaves your
+machine or your network, and you get a bigger model than diffmind would ever
+ship as a 20 GB download.
 
 ```bash
 diffmind --backend ollama --backend-model qwen2.5-coder:14b
@@ -398,18 +509,30 @@ diffmind --backend openai-compatible --backend-url http://localhost:8000/v1 --ba
 API keys are read from the environment only (`DIFFMIND_API_KEY`, override with
 `--backend-api-key-env`) — never from the config file, which gets committed.
 
-> **What you trade for a bigger model.** The constrained JSON decoder hooks the
-> bundled sampler directly, so remote backends cannot use it: you get better
-> judgement and lose the same-diff-same-result guarantee. Token counts reported
-> by remote endpoints are estimates, marked `~`. Reproducibility is a property
-> of the local path.
+> **What a bigger model costs you.** The constrained JSON decoder plugs directly
+> into the built-in sampler, so a remote server cannot use it. You get better
+> answers, but you lose the guarantee that the same diff gives the same review.
+> Token counts from remote servers are estimates, marked `~`. Same-result-every-time
+> only applies to the built-in local model.
 
-Hosted backends are planned on the same terms — additive, opt-in, never the
-default, and subject to the same trade-off above.
+### Frontier backends — planned, opt-in
+
+The plan is small and specific: a built-in Anthropic backend, an opt-in
+`claude-cli` backend that reuses a subscription you already pay for, and real
+token counts from remote servers instead of estimates. Same rules as everything
+else here — added on top, off by default, and clear that you give up the
+same-result guarantee.
+
+The part that makes it worth paying for is **letting the cheap model decide what
+the expensive model reads**. The local model sorts several hundred hunks for
+free, then the frontier model looks closely at the few that actually carry risk.
+That is very different from sending every diff to an API, and it is the only
+version anyone keeps paying for after the first bill.
 
 ### Daemon mode
 
-Every invocation otherwise pays the model-load cost — seconds, every time.
+Without this, every run pays the model loading cost again — a few seconds, every
+time.
 
 ```bash
 diffmind serve            # loads the model, unloads after 10 idle minutes
@@ -426,49 +549,45 @@ work to it.
 
 ## How it works
 
-1. **Parse** — the diff becomes typed per-file hunks with real pre/post-image
-   line numbers.
-2. **Pre-filter** — lockfiles, `linguist-generated` paths, `@generated` banners,
+1. **Parse** — the diff is turned into per-file hunks with correct before and
+   after line numbers.
+2. **Filter** — lockfiles, `linguist-generated` paths, `@generated` banners,
    minified bundles, assets, snapshots, your `ignore` globs and whitespace-only
-   hunks are dropped. Costs nothing, typically removes most of a real branch,
-   and the counts are reported rather than silently applied:
+   hunks are dropped. This is free, usually removes most of a real branch, and
+   the counts are shown instead of hidden:
    `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
-   Whitespace inside a string literal counts as content; indentation is never
-   dismissed in Python or YAML.
-3. **Deterministic detectors** — `DM001`, `DM002` and your regex rules. No model
-   involved.
-4. **Context** — assembled per unit from `.diffmind/graph.db`: the enclosing
-   definition, the callers of every changed symbol, definitions of referenced
-   symbols, and the corresponding test file. Bounded by a byte budget, so
-   context does not grow with the repository. Bodies are read from the working
-   tree, so a snippet can never disagree with the file being reviewed.
-5. **Triage** — on large diffs, a cheap first pass decides which files carry real
-   risk.
-6. **Review units** — hunks are grouped into regions of a file rather than cut
-   wherever a line budget ran out, so related hunks are read together and an
-   edit in one function only re-reviews that function. When a changed symbol and
-   a changed caller both appear, the two are merged into one unit and reviewed
-   together. Units are sized to the backend's *actual* context window, read from
-   the GGUF metadata.
-7. **Constrained decoding** — the sampler consults a JSON state machine before
-   committing each token, so the model cannot emit a preamble, an unbalanced
-   brace or a truncated string. Output that hits the token cap is repaired
-   rather than discarded.
-8. **Anchoring** — findings pointing at a file not in the diff are dropped;
-   off-by-N line numbers snap to the nearest changed line.
-9. **Suppression** — inline directives, the baseline and `--min-confidence` are
-   applied, then results are deduplicated and sorted.
+   Whitespace inside a string still counts as a real change, and indentation is
+   never dropped in Python or YAML.
+3. **Fixed rules** — `DM001`, `DM002` and your regex rules. No model involved.
+4. **Context** — built for each review from `.diffmind/graph.db`: the function
+   the hunk is in, the callers of every changed symbol, the definitions it
+   refers to, and the matching test file. There is a size limit, so context does
+   not grow as the repo grows. Code is read from your files, so a snippet can
+   never disagree with the file being reviewed.
+5. **Sort by risk** — on large diffs, a quick first pass decides which files
+   actually carry risk.
+6. **Group** — hunks are grouped by area of the file rather than cut wherever a
+   line limit ran out, so related hunks are read together, and editing one
+   function only re-reviews that function. If a changed symbol and one of its
+   changed callers both appear, they are reviewed together as one. Group size
+   matches the model's *real* context window, read from the GGUF file.
+7. **Constrained decoding** — before each token, the sampler checks a JSON state
+   machine, so the model cannot write an intro sentence, an unbalanced brace or a
+   cut-off string. Output that hits the token limit is repaired, not thrown away.
+8. **Line matching** — findings that point at a file not in the diff are dropped,
+   and line numbers that are slightly off snap to the nearest changed line.
+9. **Silencing** — inline comments, the baseline and `--min-confidence` are
+   applied, then duplicates are removed and the results sorted.
 
-The **code graph** behind step 4 is the tree-sitter symbol index from
-[Language support](#language-support), kept in `.diffmind/graph.db` and updated
-incrementally by mtime. Build it with `diffmind index`.
+Step 4 is [the code graph](#the-code-graph). It is the step that separates this
+from a reviewer that only ever sees the diff.
 
 ---
 
 ## Configuration
 
-`.diffmind/config.toml` — precedence is CLI flag > config file > default.
-Unknown keys are reported rather than silently ignored.
+`.diffmind/config.toml`. A CLI flag beats the config file, and the config file
+beats the default. Keys diffmind does not recognise are reported, not ignored.
 
 ```toml
 [review]
@@ -490,14 +609,14 @@ model       = "qwen2.5-coder:14b"
 api_key_env = "DIFFMIND_API_KEY"
 ```
 
-### Options that matter
+### The options you will actually use
 
-| Flag | Effect |
+| Flag | What it does |
 | ----------------------- | -------------------------------------------------- |
 | `-b, --branch`          | Base branch [default: the repo's default branch] |
 | `-m, --model`           | `0.5b` … `32b` [default: `1.5b`] |
 | `-l, --last` / `--staged` / `--range` / `--stdin` | What to review |
-| `-t, --tui`             | Launch the cockpit |
+| `-t, --tui`             | Start an interactive review |
 | `--min-severity`        | Minimum severity to report [default: `low`] |
 | `--fail-on`             | Severity causing exit 1 [default: `--min-severity`] |
 | `--min-confidence`      | Minimum confidence to report, 0.0–1.0 |
@@ -510,21 +629,24 @@ api_key_env = "DIFFMIND_API_KEY"
 `--triage`, `--temperature`, `--seed`, `--max-tokens`, `--device` and `--debug`
 are in `diffmind --help`.
 
-The binary also carries two conveniences that are not the point of the tool:
-`diffmind describe` (a PR title and summary) and `diffmind commit` (a
-conventional commit message for staged changes). Use them if they're handy; they
-are not what diffmind is for.
+Two extras come along because the model is already loaded: `diffmind describe`
+(a PR title and summary) and `diffmind commit` (a conventional commit message
+for staged changes). Useful, but review is the product — nothing else here is
+built around them.
 
 ---
 
 ## Roadmap
 
-- Hosted backends — opt-in only, with the local model still the default
-- Auto-fix patches (`diffmind fix`) — gated on those backends, since a 1.5B's
-  patches are not trustworthy enough to apply
-- Cheap-model triage feeding a strong-model deep pass, and prompt-prefix caching
-- Learning from verdicts: marking a finding wrong should suppress its kind next
-  time, not merely count it
+- **Frontier models, opt-in** — a built-in Anthropic backend and a `claude-cli`
+  backend, with the local model still the default
+- **Cheap model picks what the strong model reads**, plus prompt-prefix caching —
+  this is what makes a paid model affordable
+- **Auto-fix patches** (`diffmind fix`) — waiting on those backends, because a
+  1.5B's patches are not safe enough to apply
+- **Learn from your answers** — marking a finding wrong should stop that kind of
+  finding next time, not just count it
+- More languages in the code graph, one `LANGS` entry at a time
 - VS Code / JetBrains extensions, talking to the daemon
 - Homebrew tap and scoop manifest
 

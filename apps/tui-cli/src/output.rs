@@ -161,6 +161,14 @@ pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
             plural(stats.units_unparseable)
         );
     }
+    if stats.units_too_large > 0 {
+        eprintln!(
+            "  {}  {} unit{} too large for the context window — skipped, not reviewed",
+            "!".yellow(),
+            stats.units_too_large,
+            plural(stats.units_too_large)
+        );
+    }
     if stats.suppressed > 0 {
         eprintln!(
             "  {}  {} finding{} suppressed (inline comments or baseline)",
@@ -255,6 +263,7 @@ pub fn render(
                 "units": stats.units_total,
                 "units_cached": stats.units_cached,
                 "units_unparseable": stats.units_unparseable,
+                "units_too_large": stats.units_too_large,
                 "inference_ms": stats.inference_ms,
                 "prompt_tokens": stats.prompt_tokens,
                 "completion_tokens": stats.completion_tokens,
