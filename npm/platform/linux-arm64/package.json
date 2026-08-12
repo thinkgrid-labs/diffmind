@@ -1,6 +1,6 @@
 {
   "name": "@diffmind/cli-linux-arm64",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "diffmind prebuilt binary for linux-arm64 (aarch64-unknown-linux-gnu)",
   "author": "Thinkgrid Labs <dennis@thinkgrid.dev>",
   "license": "MIT",

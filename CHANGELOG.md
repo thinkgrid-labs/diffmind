@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.2] — 08-12-2026
+
+### Fixed
+
+- **The dropped-rule-set warning no longer cries wolf.** 0.9.1 measured every
+  rule set in `.diffmind/rules/` against the budget, so a `react.md` scoped to
+  `**/*.tsx` was reported as dropped from a diff containing no `.tsx` at all.
+  The check now runs per changed file, against only the rule sets that actually
+  govern it, and names the file:
+
+  ```
+  !  2 rule set(s) do not fit the prompt budget (4851 bytes) and were dropped:
+     aaa-style (on app/dashboard/page.tsx), mmm-quality (on app/dashboard/page.tsx)
+  ```
+
+  A warning that fires when nothing is wrong is one people learn to scroll past,
+  which costs more than having no warning at all.
+
 ## [0.9.1] — 08-12-2026
 
 Config is not code, and reviewing it as though it were produced confident

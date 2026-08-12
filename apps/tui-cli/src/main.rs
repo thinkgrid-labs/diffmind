@@ -579,14 +579,26 @@ impl ProjectRules {
     }
 }
 
-/// Say so when the prompt budget cannot fit every rule set.
+/// Say so when the prompt budget cannot fit every rule set that applies.
 ///
 /// The alternative is what shipped before: a rule set stops applying and
-/// nothing anywhere says it did. The check is deliberately at the *widest*
-/// budget — depth 0, before any retry shrinks it — so this warns about the
-/// rule sets that can never apply, not about a transient squeeze on one
-/// oversized unit.
-fn warn_on_dropped_rulebooks(backend: &dyn ReviewBackend, settings: &Settings, books: &[Rulebook]) {
+/// nothing anywhere says it did.
+///
+/// Checked **per changed file**, against the sets that actually govern it.
+/// Measuring the whole `.diffmind/rules/` directory instead was the obvious
+/// implementation and it cried wolf: a `react.md` scoped to `**/*.tsx` was
+/// reported as dropped from a diff containing no `.tsx` at all. A warning that
+/// fires when nothing is wrong is one people learn to scroll past, which costs
+/// more than having no warning.
+///
+/// The budget is taken at depth 0 — the widest — so this reports rule sets that
+/// can never fit, not a transient squeeze on one oversized unit.
+fn warn_on_dropped_rulebooks(
+    backend: &dyn ReviewBackend,
+    settings: &Settings,
+    books: &[Rulebook],
+    diff: &str,
+) {
     if books.is_empty() {
         return;
     }
@@ -595,16 +607,34 @@ fn warn_on_dropped_rulebooks(backend: &dyn ReviewBackend, settings: &Settings, b
         settings.max_tokens as usize,
         0,
     );
-    let dropped = core_engine::rulebooks_dropped(books, budget);
+
+    // Worst affected file per rule set: the same set may fit beside one file's
+    // neighbours and not another's, and the reviewer only needs to be told once.
+    let mut dropped: std::collections::BTreeMap<String, String> = Default::default();
+    for file in core_engine::parse_diff(diff) {
+        let applicable: Vec<Rulebook> = books
+            .iter()
+            .filter(|b| b.applies_to(&file.path))
+            .cloned()
+            .collect();
+        for id in core_engine::rulebooks_dropped(&applicable, budget) {
+            dropped.entry(id).or_insert_with(|| file.path.clone());
+        }
+    }
+
     if dropped.is_empty() {
         return;
     }
 
+    let named: Vec<String> = dropped
+        .iter()
+        .map(|(id, path)| format!("{id} (on {path})"))
+        .collect();
     eprintln!(
         "  !  {} rule set(s) do not fit the prompt budget ({budget} bytes) and were \
          dropped: {}",
         dropped.len(),
-        dropped.join(", ")
+        named.join(", ")
     );
     eprintln!(
         "     Lowest severity is dropped first. Narrow their `scope`, shorten them, \
@@ -620,7 +650,7 @@ pub fn build_analyzer(
     ticket: Option<String>,
     project: ProjectRules,
 ) -> ReviewAnalyzer {
-    warn_on_dropped_rulebooks(&*backend, settings, &project.books);
+    warn_on_dropped_rulebooks(&*backend, settings, &project.books, diff);
 
     let mut analyzer = ReviewAnalyzer::new(backend)
         .with_unit_grouper(unit_grouper(project_root))
