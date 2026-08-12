@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use core_engine::{
-    AnalysisStats, Baseline, CommitSuggestion, CustomRule, PrDescription, ReviewAnalyzer,
-    ReviewBackend, ReviewCache, ReviewFinding, ReviewSummary, Severity,
+    AnalysisStats, Baseline, CommitSuggestion, CustomRule, PrDescription, PrefilterOptions,
+    PrefilterReport, ReviewAnalyzer, ReviewBackend, ReviewCache, ReviewFinding, ReviewSummary,
+    Rulebook, Severity,
 };
 use crossterm::style::Stylize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,6 +27,7 @@ mod indexer;
 mod output;
 mod rag;
 mod rules;
+mod runs;
 mod settings;
 mod tui;
 
@@ -97,6 +99,32 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
 
+    // Before anything costs a token, and before the TUI/CLI split so both
+    // surfaces review exactly the same set of hunks.
+    let (diff, prefilter) = apply_prefilter(&diff, &settings, &project_root)?;
+
+    if prefilter.dropped_everything() {
+        // Distinct from "no changes": there *were* changes, and none of them
+        // were worth a reviewer's attention. Reporting zero findings without
+        // saying so would read as "reviewed, found nothing".
+        if !settings.format.is_machine_readable() {
+            eprintln!(
+                "\n  Nothing to review — all {} hunk{} filtered ({}).\n",
+                prefilter.hunks_total,
+                if prefilter.hunks_total == 1 { "" } else { "s" },
+                prefilter.reason_summary()
+            );
+        } else {
+            emit(
+                &settings,
+                &ReviewSummary::default(),
+                &AnalysisStats::default(),
+                "none",
+            )?;
+        }
+        return Ok(0);
+    }
+
     if args.tui {
         tui::run(
             diff,
@@ -104,11 +132,20 @@ fn run() -> Result<i32> {
             project_root,
             settings,
             resolve_ticket(args.ticket.as_deref()),
+            prefilter,
         )?;
         return Ok(0);
     }
 
-    review(&args, &settings, &diff, &home, &model_dir, &project_root)
+    review(
+        &args,
+        &settings,
+        &diff,
+        &prefilter,
+        &home,
+        &model_dir,
+        &project_root,
+    )
 }
 
 fn run_command(
@@ -227,6 +264,42 @@ fn run_command(
             )
         }
 
+        cli::Commands::Stats { clear } => {
+            if clear {
+                let removed = runs::clear_runs(project_root)?;
+                println!("Cleared {removed} recorded run(s). Verdict history kept.");
+                return Ok(0);
+            }
+            print_stats(project_root);
+            Ok(0)
+        }
+
+        cli::Commands::Rules { action } => match action {
+            cli::RulesAction::Init => {
+                let path = rules::init_rulebooks(project_root)?;
+                println!("  ✓  Wrote {}", path.display());
+                println!("     Edit it, then commit it — review standards belong in the repo.");
+                Ok(0)
+            }
+            cli::RulesAction::List => {
+                let books = rules::load_rulebooks(project_root);
+                if books.is_empty() {
+                    println!("No rule sets. Run `diffmind rules init` to scaffold one.");
+                    return Ok(0);
+                }
+                for b in &books {
+                    let scope = if b.scope.is_empty() {
+                        "whole repository".to_string()
+                    } else {
+                        b.scope.join(", ")
+                    };
+                    let severity = b.severity.map(|s| s.as_str()).unwrap_or("unset");
+                    println!("  {:<24} {severity:<7} {scope}", b.id);
+                }
+                Ok(0)
+            }
+        },
+
         cli::Commands::Cache { action } => {
             let base = project_root.join(".diffmind");
             match action {
@@ -290,6 +363,27 @@ fn cache_stats(dir: &Path) -> (usize, u64) {
 // ─── Diff capture ────────────────────────────────────────────────────────────
 
 fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
+    // Each of these names a different set of changes. Silently honouring
+    // whichever the code happens to check first would review something the user
+    // did not ask for.
+    let selectors = [
+        (args.stdin, "--stdin"),
+        (args.staged, "--staged"),
+        (args.last, "--last"),
+        (args.range.is_some(), "--range"),
+    ];
+    let chosen: Vec<&str> = selectors
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect();
+    if chosen.len() > 1 {
+        anyhow::bail!(
+            "{} select different changes — pass only one.",
+            chosen.join(" and ")
+        );
+    }
+
     if args.stdin {
         let mut buffer = String::new();
         io::stdin()
@@ -312,9 +406,29 @@ fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
         return git::get_last_commit_diff(&args.files);
     }
 
+    if let Some((range, paths)) = resolve_range(args) {
+        return git::get_range_diff(&range, &paths);
+    }
+
     // Nobody said which branch — ask git rather than assuming `main`.
     let branch = settings.branch.clone().unwrap_or_else(git::default_branch);
     git::get_diff(&branch, &args.files)
+}
+
+/// Work out whether this run is scoped to an explicit revision range, and which
+/// positional arguments are paths rather than the range itself.
+///
+/// `--range` is authoritative. Failing that, a leading positional that resolves
+/// as a range is taken as one, so `diffmind v1.2.0..HEAD` works the way anyone
+/// would expect without a flag. The detection is strict — both endpoints must
+/// resolve and the string must not name an existing path — so `diffmind ../lib`
+/// is still a path.
+fn resolve_range(args: &cli::Cli) -> Option<(String, Vec<String>)> {
+    if let Some(range) = args.range.clone() {
+        return Some((range, args.files.clone()));
+    }
+    let first = args.files.first()?;
+    git::looks_like_range(first).then(|| (first.clone(), args.files[1..].to_vec()))
 }
 
 /// Accepts either a file path or inline text.
@@ -424,19 +538,42 @@ pub fn build_backend(choice: &BackendChoice, model_dir: &Path) -> Result<Box<dyn
 }
 
 /// Assemble a fully-configured analyzer. Shared by the CLI, the TUI and the daemon.
+/// Everything a project contributes to a review beyond the diff itself.
+/// Bundled because these three are always loaded together, from the same
+/// `.diffmind/` directory, and are meaningless apart.
+#[derive(Default, Clone)]
+pub struct ProjectRules {
+    /// Regex rules from `.diffmind/rules.toml`.
+    pub custom: Vec<CustomRule>,
+    /// Prose rule sets from `.diffmind/rules/*.md`.
+    pub books: Vec<Rulebook>,
+    /// Findings already accepted, from `.diffmind/baseline.json`.
+    pub baseline: Option<Baseline>,
+}
+
+impl ProjectRules {
+    pub fn load(project_root: &Path, use_baseline: bool) -> Self {
+        ProjectRules {
+            custom: rules::load_custom_rules(project_root),
+            books: rules::load_rulebooks(project_root),
+            baseline: load_baseline(project_root, use_baseline),
+        }
+    }
+}
+
 pub fn build_analyzer(
     backend: Box<dyn ReviewBackend>,
     settings: &Settings,
     project_root: &Path,
     diff: &str,
     ticket: Option<String>,
-    custom_rules: Vec<CustomRule>,
-    baseline: Option<Baseline>,
+    project: ProjectRules,
 ) -> ReviewAnalyzer {
     let mut analyzer = ReviewAnalyzer::new(backend)
         .with_languages(detect_languages(diff))
-        .with_custom_rules(custom_rules)
-        .with_baseline(baseline)
+        .with_custom_rules(project.custom)
+        .with_rulebooks(project.books)
+        .with_baseline(project.baseline)
         .with_triage(settings.triage)
         .with_min_confidence(settings.min_confidence)
         .with_sampling(settings.temperature, settings.seed)
@@ -451,11 +588,146 @@ pub fn build_analyzer(
     analyzer
 }
 
-/// Symbol context for the prompt, when an index exists.
-pub fn build_context(project_root: &Path, diff: &str, budget: usize) -> String {
-    Indexer::load(project_root)
-        .and_then(|index| rag::build_context(diff, &index, budget))
-        .unwrap_or_default()
+/// Report what the recorded runs say about whether this tool is earning its
+/// keep. The accept-to-wrong ratio is the headline: every other number here is
+/// context for it.
+fn print_stats(project_root: &Path) {
+    let s = runs::summarize(project_root);
+
+    if s.runs == 0 && s.accepted + s.dismissed + s.wrong == 0 {
+        println!("  No runs recorded yet. Review something, then come back.");
+        return;
+    }
+
+    println!();
+    println!("  diffmind  stats");
+    println!("  {}", "─".repeat(52));
+    println!("  {:<16} {}", "Runs", s.runs);
+    if let (Some(first), Some(last)) = (&s.first_run, &s.last_run) {
+        println!(
+            "  {:<16} {} → {}",
+            "Period",
+            &first[..10.min(first.len())],
+            &last[..10.min(last.len())]
+        );
+    }
+    println!("  {:<16} {}", "Median findings", s.median_findings);
+    println!("  {:<16} {:.1}s", "Median time", s.median_seconds);
+    println!("  {:<16} {}", "Median tokens", s.median_tokens);
+    println!("  {:<16} {:.0}%", "Cache hits", s.cache_hit_rate * 100.0);
+    println!();
+
+    println!(
+        "  {:<16} {} accepted · {} dismissed · {} wrong",
+        "Verdicts", s.accepted, s.dismissed, s.wrong
+    );
+    match s.accept_to_wrong() {
+        Some(ratio) => {
+            // The target from the plan. Below it, the tool is costing more
+            // attention than it saves and the rules or the model need work.
+            let verdict = if ratio >= 2.0 {
+                "on target"
+            } else {
+                "below the 2:1 target"
+            };
+            println!("  {:<16} {ratio:.1}:1  ({verdict})", "Accept : wrong");
+        }
+        None if s.accepted + s.dismissed == 0 => {
+            println!(
+                "  {:<16} no verdicts yet — use the TUI to accept or reject findings",
+                "Accept : wrong"
+            );
+        }
+        None => println!("  {:<16} nothing marked wrong yet", "Accept : wrong"),
+    }
+
+    if !s.worst_rules.is_empty() {
+        println!();
+        println!("  Most often wrong");
+        for (rule, count) in &s.worst_rules {
+            println!("     {count:>3}  {rule}");
+        }
+    }
+    println!();
+}
+
+/// Reviewable size limit, applied to the diff *after* filtering. Past this,
+/// chunking alone takes longer than a human review.
+const MAX_REVIEWABLE_DIFF_KB: usize = 1500;
+
+/// Drop the parts of a diff that are not worth spending inference on.
+///
+/// Runs before the size check on purpose: a branch whose diff is 90% lockfile
+/// used to be refused outright, when what was left was perfectly reviewable.
+fn apply_prefilter(
+    diff: &str,
+    settings: &Settings,
+    project_root: &Path,
+) -> Result<(String, PrefilterReport)> {
+    let paths: Vec<String> = core_engine::parse_diff(diff)
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+
+    // Two sources the engine cannot consult itself: git attributes, and the
+    // file's own header banner. A generated file usually declares itself on
+    // line 1, which a hunk deep in the file would never show.
+    let mut generated_paths = git::linguist_generated(&paths);
+    for path in &paths {
+        if generated_paths.contains(path) {
+            continue;
+        }
+        if let Ok(head) = read_head(&project_root.join(path))
+            && core_engine::looks_generated(&head)
+        {
+            generated_paths.insert(path.clone());
+        }
+    }
+
+    let (filtered, report) = core_engine::prefilter(
+        diff,
+        &PrefilterOptions {
+            generated_paths,
+            ignore_globs: settings.ignore_globs.clone(),
+        },
+    );
+
+    let size_kb = filtered.len() / 1024;
+    if size_kb > MAX_REVIEWABLE_DIFF_KB {
+        anyhow::bail!(
+            "diff is too large to review ({size_kb} KB of reviewable changes, limit \
+             {MAX_REVIEWABLE_DIFF_KB} KB). Review specific paths instead, e.g. `diffmind src/`."
+        );
+    }
+
+    Ok((filtered, report))
+}
+
+/// First 4 KB of a file — enough for a generated-file banner, and bounded so a
+/// multi-megabyte artifact costs nothing to classify.
+fn read_head(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; 4096];
+    let mut file = std::fs::File::open(path)?;
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Build the per-chunk symbol-context provider the analyzer calls.
+///
+/// The index is loaded once and captured, so assembling context per chunk costs
+/// a symbol lookup rather than a re-read of `symbols.json`. Returning a closure
+/// (instead of one context string for the whole diff) is what keeps each
+/// chunk's cache key independent of the other files in the diff.
+pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> String {
+    let index = Indexer::load(project_root);
+    move |chunk: &str| {
+        index
+            .as_ref()
+            .and_then(|index| rag::build_context(chunk, index, budget))
+            .unwrap_or_default()
+    }
 }
 
 fn load_baseline(project_root: &Path, enabled: bool) -> Option<Baseline> {
@@ -497,21 +769,26 @@ fn review(
     args: &cli::Cli,
     settings: &Settings,
     diff: &str,
+    prefilter: &PrefilterReport,
     home: &Path,
     model_dir: &Path,
     project_root: &Path,
 ) -> Result<i32> {
     let ticket = resolve_ticket(args.ticket.as_deref());
-    let custom_rules = rules::load_custom_rules(project_root);
-    let baseline = load_baseline(project_root, settings.use_baseline);
+    let project = ProjectRules::load(project_root, settings.use_baseline);
     let is_text = settings.format == OutputFormat::Text;
+
+    // We are about to write the cache and a run record. Claim the ignore file
+    // first, so neither ever shows up as an untracked change.
+    runs::ensure_gitignore(project_root);
 
     print_header(
         args,
         settings,
         diff,
         ticket.as_deref(),
-        custom_rules.len(),
+        project.custom.len(),
+        prefilter,
         is_text,
     );
 
@@ -527,18 +804,19 @@ fn review(
 
     let (summary, stats, backend_label) = if let Some(client) = daemon_client {
         spinner.set_message(format!("Analyzing via {}...", client.describe()));
-        let context = build_context(project_root, diff, 8000);
+        // Context is assembled daemon-side, per chunk, from `project_root`.
         let response = client
             .review(daemon::ReviewRequest {
                 diff: diff.to_string(),
-                context,
                 languages: detect_languages(diff),
                 requirements: ticket.clone(),
                 max_tokens: settings.max_tokens,
                 min_confidence: settings.min_confidence,
                 triage: format!("{:?}", settings.triage).to_lowercase(),
-                rules: custom_rules.clone(),
-                baseline: baseline
+                rules: project.custom.clone(),
+                rulebooks: project.books.clone(),
+                baseline: project
+                    .baseline
                     .as_ref()
                     .and_then(|b| serde_json::to_string(b).ok()),
                 use_cache: settings.use_cache,
@@ -551,20 +829,19 @@ fn review(
         let backend = build_backend(&settings.backend, model_dir)?;
         let backend_label = backend.describe();
 
-        let context = build_context(project_root, diff, 8000);
+        let context_for = context_builder(project_root, 8000);
         let mut analyzer = build_analyzer(
             backend,
             settings,
             project_root,
             diff,
             ticket.clone(),
-            custom_rules.clone(),
-            baseline,
+            project,
         );
 
         spinner.set_message("Analyzing diff...");
         let (summary, stats) =
-            run_with_progress(&mut analyzer, diff, &context, settings, &spinner)?;
+            run_with_progress(&mut analyzer, diff, &context_for, settings, &spinner)?;
         spinner.finish_and_clear();
         (summary, stats, backend_label)
     };
@@ -592,6 +869,21 @@ fn review(
     }
     emit(settings, &filtered, &stats, &backend_label)?;
 
+    // File the run. Never fatal: a review that found real problems must still be
+    // reported even if the notes could not be written.
+    let record = runs::RunRecord::new(
+        git::head_sha().unwrap_or_else(|| "working-tree".into()),
+        git::current_branch(),
+        backend_label.clone(),
+        &filtered,
+        &stats,
+        prefilter,
+    );
+    let rendered = output::markdown(&filtered, &stats, &backend_label);
+    if let Err(e) = runs::save(project_root, &record, &rendered) {
+        eprintln!("  !  could not record this run: {e}");
+    }
+
     Ok(if gated > 0 { EXIT_FINDINGS } else { 0 })
 }
 
@@ -599,13 +891,13 @@ fn review(
 fn run_with_progress(
     analyzer: &mut ReviewAnalyzer,
     diff: &str,
-    context: &str,
+    context_for: &dyn Fn(&str) -> String,
     settings: &Settings,
     spinner: &ProgressBar,
 ) -> Result<(ReviewSummary, AnalysisStats)> {
     // The model blocks the calling thread, so a background ticker keeps the
     // elapsed time honest during a long single-chunk inference.
-    let label = Arc::new(std::sync::Mutex::new(String::from("chunk 1/1")));
+    let label = Arc::new(std::sync::Mutex::new(String::from("unit 1/1")));
     let done = Arc::new(AtomicBool::new(false));
     {
         let (label, done, pb) = (label.clone(), done.clone(), spinner.clone());
@@ -635,11 +927,11 @@ fn run_with_progress(
 
     let result = analyzer.analyze(
         diff,
-        context,
+        context_for,
         settings.max_tokens,
         move |chunk, total| {
             if let Ok(mut l) = progress_label.lock() {
-                *l = format!("chunk {chunk}/{total}");
+                *l = format!("unit {chunk}/{total}");
             }
         },
         move |findings| {
@@ -671,6 +963,7 @@ fn print_header(
     diff: &str,
     ticket: Option<&str>,
     rule_count: usize,
+    report: &PrefilterReport,
     is_text: bool,
 ) {
     if !is_text {
@@ -700,6 +993,8 @@ fn print_header(
         "staged changes".to_string()
     } else if args.last {
         "last commit".to_string()
+    } else if let Some((range, _)) = resolve_range(args) {
+        range
     } else {
         let base = settings.branch.clone().unwrap_or_else(git::default_branch);
         match git::current_branch() {
@@ -719,6 +1014,18 @@ fn print_header(
         files.len(),
         if files.len() == 1 { "" } else { "s" }
     );
+    // The number that makes the filtering trustworthy: what was skipped, and
+    // why. Silent filtering reads as "reviewed everything" when it did not.
+    if report.hunks_dropped() > 0 {
+        eprintln!(
+            "  {:<10} {} hunks → {} reviewable ({} filtered: {})",
+            "Filtered",
+            report.hunks_total,
+            report.hunks_kept,
+            report.hunks_dropped(),
+            report.reason_summary()
+        );
+    }
     eprintln!(
         "  {:<10} {}",
         "Stack",
@@ -983,22 +1290,29 @@ fn run_baseline(
                 );
             }
 
+            // Same filtering as a real review, or the baseline would record —
+            // and then permanently accept — findings on files no review will
+            // ever look at again.
+            let (diff, _) = apply_prefilter(&diff, &settings, project_root)?;
+
             eprintln!("  Reviewing to establish a baseline — this runs a full analysis.\n");
             let backend = build_backend(&settings.backend, model_dir)?;
-            let context = build_context(project_root, &diff, 8000);
+            let context_for = context_builder(project_root, 8000);
             let mut analyzer = build_analyzer(
                 backend,
                 &settings,
                 project_root,
                 &diff,
                 None,
-                rules::load_custom_rules(project_root),
-                None,
+                ProjectRules {
+                    baseline: None,
+                    ..ProjectRules::load(project_root, false)
+                },
             );
 
             let spinner = make_spinner("Analyzing...", false);
             let (summary, _) =
-                run_with_progress(&mut analyzer, &diff, &context, &settings, &spinner)?;
+                run_with_progress(&mut analyzer, &diff, &context_for, &settings, &spinner)?;
             spinner.finish_and_clear();
 
             let baseline =
@@ -1134,11 +1448,17 @@ fn run_serve(
             &request_root,
             &req.diff,
             req.requirements.clone(),
-            req.rules.clone(),
-            baseline,
+            ProjectRules {
+                custom: req.rules.clone(),
+                books: req.rulebooks.clone(),
+                baseline,
+            },
         );
 
-        let outcome = analyzer.analyze(&req.diff, &req.context, req.max_tokens, |_, _| {}, |_| {});
+        // Built here rather than sent by the client: the daemon owns chunking,
+        // so only the daemon knows what each chunk contains.
+        let context_for = context_builder(&request_root, 8000);
+        let outcome = analyzer.analyze(&req.diff, &context_for, req.max_tokens, |_, _| {}, |_| {});
 
         let backend_label = analyzer.backend_description();
         // Reclaim the loaded weights for the next request — the whole point of

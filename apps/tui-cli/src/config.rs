@@ -34,6 +34,11 @@ pub struct ReviewConfig {
     /// Fail the run (exit 1) only at or above this severity. Defaults to
     /// `min_severity` so the reported set and the gate agree.
     pub fail_on: Option<String>,
+    /// Extra globs to drop before review, on top of the built-in noise rules
+    /// (lockfiles, generated files, minified bundles, formatting-only hunks).
+    /// Same syntax as a rule's `files`: `*.ts`, `**/legacy/**`, or an exact path.
+    #[serde(default)]
+    pub ignore: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -134,6 +139,26 @@ model = "qwen2.5-coder:14b"
         assert_eq!(c.review.fail_on.as_deref(), Some("high"));
         assert_eq!(c.review.cache, Some(true));
         assert_eq!(c.backend.kind.as_deref(), Some("ollama"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ignore_globs_are_loaded_and_default_to_empty() {
+        let d = tmpdir("ignore");
+        write(
+            &d,
+            "[review]\nignore = [\"**/legacy/**\", \"*.generated.ts\"]\n",
+        );
+        let c = FileConfig::load(&d);
+        assert_eq!(
+            c.review.ignore.as_deref(),
+            Some(&["**/legacy/**".to_string(), "*.generated.ts".to_string()][..])
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = tmpdir("no-ignore");
+        write(&d, "[review]\nmodel = \"3b\"\n");
+        assert!(FileConfig::load(&d).review.ignore.is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
