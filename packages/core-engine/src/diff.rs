@@ -69,6 +69,24 @@ impl FileDiff {
     }
 }
 
+/// Is `lines[i]` the `--- old` of a `--- old` / `+++ new` / `@@ …` file header?
+///
+/// The only file boundary a plain `diff -u` provides. `git diff` announces each
+/// file with a `diff --git` line, but a diff reaching `--stdin` from `diff -u`,
+/// `format-patch` or a review tool has nothing else to separate one file from
+/// the next.
+///
+/// Deliberately strict about all three lines. Inside a hunk, a removed line of
+/// content beginning `-- ` renders as `--- `, and SQL comments do exactly that —
+/// requiring the `@@` too is what stops `-- note` / `++ x` being read as a file
+/// boundary. Unified diff always puts the hunk header immediately after the path
+/// pair, so nothing legitimate is lost.
+pub(crate) fn starts_file_header_pair(lines: &[&str], i: usize) -> bool {
+    lines[i].starts_with("--- ")
+        && lines.get(i + 1).is_some_and(|l| l.starts_with("+++ "))
+        && lines.get(i + 2).is_some_and(|l| l.starts_with("@@"))
+}
+
 /// Parse a unified diff into per-file hunks.
 ///
 /// Tolerant by design: `git diff` output is interleaved with `index`, `old
@@ -90,7 +108,8 @@ pub fn parse_diff(diff: &str) -> Vec<FileDiff> {
         }
     }
 
-    for line in diff.lines() {
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().copied().enumerate() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             flush_hunk(&mut current, &mut hunk);
             if let Some(f) = current.take() {
@@ -111,29 +130,55 @@ pub fn parse_diff(diff: &str) -> Vec<FileDiff> {
             continue;
         }
 
-        // `+++ b/path` is authoritative when present — it survives paths with
-        // spaces, which the `diff --git` line cannot express unambiguously.
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            if let Some(f) = current.as_mut() {
-                let path = rest.trim();
-                if path != "/dev/null" {
-                    f.path = path.strip_prefix("b/").unwrap_or(path).to_string();
-                }
-            } else {
-                let path = rest.trim();
-                if path != "/dev/null" {
-                    current = Some(FileDiff {
-                        path: path.strip_prefix("b/").unwrap_or(path).to_string(),
-                        hunks: Vec::new(),
-                        is_deletion: false,
-                    });
-                }
+        // In a plain multi-file diff there is no `diff --git` line to close the
+        // previous file, so the next `--- old` / `+++ new` pair has to. Without
+        // this the second file's `+++` merely *renamed* the first file — every
+        // hunk in the diff ended up under the last path seen, and findings in
+        // the earlier files were attributed to the wrong one.
+        if starts_file_header_pair(&lines, i)
+            && current
+                .as_ref()
+                .is_some_and(|f| !f.hunks.is_empty() || hunk.is_some())
+        {
+            flush_hunk(&mut current, &mut hunk);
+            if let Some(f) = current.take() {
+                files.push(f);
             }
-            continue;
         }
 
-        if line.starts_with("--- ") {
-            continue;
+        // The `--- old` / `+++ new` path pair, which only ever appears *outside*
+        // a hunk. Inside one, a line beginning `--- ` or `+++ ` is content whose
+        // diff marker happens to be followed by two more of the same character:
+        // a removed `-- note` in SQL, Lua or Haskell renders as `--- note`.
+        // Handling those unconditionally meant such a line was dropped from the
+        // hunk, and its `+++` twin silently renamed the file to the comment's
+        // own text — so every finding in that file pointed at a path that does
+        // not exist.
+        if hunk.is_none() {
+            // `+++ b/path` is authoritative when present — it survives paths
+            // with spaces, which the `diff --git` line cannot express
+            // unambiguously.
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                let path = rest.trim();
+                if path != "/dev/null" {
+                    let path = path.strip_prefix("b/").unwrap_or(path).to_string();
+                    match current.as_mut() {
+                        Some(f) => f.path = path,
+                        None => {
+                            current = Some(FileDiff {
+                                path,
+                                hunks: Vec::new(),
+                                is_deletion: false,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if line.starts_with("--- ") {
+                continue;
+            }
         }
 
         if line.starts_with("@@") {
@@ -231,14 +276,8 @@ fn parse_git_header_path(rest: &str) -> String {
         return b_side.strip_prefix("b/").unwrap_or(b_side).to_string();
     }
 
-    // Even split: `a/<path> b/<path>` where both paths are identical.
-    if let Some(a_body) = rest.strip_prefix("a/") {
-        let midpoint = a_body.len().saturating_sub(1) / 2;
-        let candidate = &a_body[..midpoint.min(a_body.len())];
-        let expected = format!("a/{candidate} b/{candidate}");
-        if rest == expected {
-            return candidate.to_string();
-        }
+    if let Some(candidate) = even_split(rest) {
+        return candidate.to_string();
     }
 
     // Fall back to the last " b/" occurrence — right more often than the first
@@ -247,6 +286,30 @@ fn parse_git_header_path(rest: &str) -> String {
         return rest[idx + 3..].trim().to_string();
     }
     rest.to_string()
+}
+
+/// `a/<path> b/<path>` where both sides name the same file — the overwhelmingly
+/// common case, and the only one that stays right when the path itself contains
+/// " b/". Returns `None` when the two halves are not identical, leaving the
+/// caller's `rfind` fallback to handle renames.
+///
+/// The arithmetic used to be `(len - 1) / 2`, which is one byte long: the
+/// remainder after `a/` is `<path> b/<path>`, so for a path of `n` bytes it is
+/// `2n + 3` bytes, not `2n + 1`. The comparison therefore never matched and
+/// this branch never returned — every correct answer came from the fallback
+/// below it. Worse, the slice was taken without a boundary check, so a rename
+/// like `a/x.rs b/ääää.rs` landed mid-codepoint and panicked the process.
+fn even_split(rest: &str) -> Option<&str> {
+    let a_body = rest.strip_prefix("a/")?;
+    // `<path> b/<path>` is `2n + 3` bytes, so an odd remainder cannot be one.
+    let n = a_body.len().checked_sub(3).filter(|r| r % 2 == 0)? / 2;
+    // A rename whose two sides merely happen to be the same byte length can put
+    // `n` inside a multi-byte character. Refuse rather than slice.
+    if !a_body.is_char_boundary(n) {
+        return None;
+    }
+    let candidate = &a_body[..n];
+    (rest.len() == 2 + n + 3 + n && a_body[n..] == format!(" b/{candidate}")).then_some(candidate)
 }
 
 /// Parse `@@ -old_start,old_count +new_start,new_count @@ optional context`.
@@ -414,6 +477,105 @@ index 111..222 100644
             "diff --git a/my b/dir.rs b/my b/dir.rs\n--- a/my b/dir.rs\n+++ b/my b/dir.rs\n@@ -1 +1 @@\n+x\n",
         );
         assert_eq!(files[0].path, "my b/dir.rs");
+    }
+
+    /// The `diff --git` line has to stand on its own: a binary file or a mode
+    /// change carries no `+++ b/…` to correct it, and the pre-filter classifies
+    /// on the header before any `+++` has been read.
+    #[test]
+    fn the_git_header_alone_resolves_a_path_containing_b_slash() {
+        assert_eq!(
+            parse_git_header_path("a/my b/dir.rs b/my b/dir.rs"),
+            "my b/dir.rs",
+            "the last ' b/' is the wrong split point when the path contains one"
+        );
+        assert_eq!(parse_git_header_path("a/src/x.rs b/src/x.rs"), "src/x.rs");
+    }
+
+    /// The even split is only valid when both sides are the same file; a rename
+    /// must fall through to the `b/` side rather than report the `a/` side.
+    #[test]
+    fn a_rename_reports_the_post_image_path() {
+        assert_eq!(parse_git_header_path("a/old.rs b/new.rs"), "new.rs");
+        // Two different names that happen to be the same byte length — the case
+        // an even split would silently get wrong if it did not compare halves.
+        assert_eq!(parse_git_header_path("a/aa.rs b/bb.rs"), "bb.rs");
+    }
+
+    /// `core.quotePath=false` is a common setting, and a piped diff can carry
+    /// raw UTF-8 regardless. Slicing the header at a byte midpoint used to land
+    /// inside a codepoint and abort the process.
+    #[test]
+    fn a_non_ascii_path_does_not_panic_the_parser() {
+        assert_eq!(parse_git_header_path("a/x.rs b/ääää.rs"), "ääää.rs");
+        assert_eq!(parse_git_header_path("a/ä.rs b/ä.rs"), "ä.rs");
+        assert_eq!(parse_git_header_path("a/éé b/x"), "x");
+
+        let files = parse_diff("diff --git a/x.rs b/ääää.rs\n@@ -1 +1 @@\n+x\n");
+        assert_eq!(files[0].path, "ääää.rs");
+    }
+
+    /// A diff with no `diff --git` lines — `diff -u`, `format-patch`, or a
+    /// review tool piped to `--stdin`.
+    ///
+    /// Nothing closed the previous file, so the second `+++` merely *renamed*
+    /// the first one: every hunk in the diff collapsed under the last path seen,
+    /// and findings in the earlier files were reported against the wrong file.
+    #[test]
+    fn a_plain_multi_file_diff_keeps_its_files_apart() {
+        let files = parse_diff(
+            "\
+--- a/src/one.rs
++++ b/src/one.rs
+@@ -1,2 +1,2 @@
+-let a = 1;
++let a = 2;
+--- a/src/two.rs
++++ b/src/two.rs
+@@ -10,2 +10,2 @@
+-let b = 1;
++let b = 2;
+",
+        );
+
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/one.rs", "src/two.rs"]);
+        assert_eq!(
+            files[0].hunks.len(),
+            1,
+            "one hunk each, not both in one file"
+        );
+        assert_eq!(files[1].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0].new_start, 1);
+        assert_eq!(files[1].hunks[0].new_start, 10);
+        assert_eq!(
+            files[1].hunks[0].added().next().map(|l| l.text.as_str()),
+            Some("let b = 2;")
+        );
+    }
+
+    /// The pair detection must not fire on content. A removed SQL comment
+    /// (`-- note`) renders as `--- note`, which is why the `@@` is required too.
+    #[test]
+    fn a_removed_sql_comment_is_not_a_file_boundary() {
+        let files = parse_diff(
+            "\
+diff --git a/q.sql b/q.sql
++++ b/q.sql
+@@ -1,4 +1,4 @@
+ select 1;
+--- old note
++++ new note
+ select 2;
+",
+        );
+        assert_eq!(files.len(), 1, "one file, not two");
+        assert_eq!(files[0].path, "q.sql");
+        let removed: Vec<&str> = files[0].hunks[0]
+            .removed()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(removed, ["-- old note"], "still a removed content line");
     }
 
     fn f(file: &str, line: u32) -> ReviewFinding {

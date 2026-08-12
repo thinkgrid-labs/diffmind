@@ -492,17 +492,30 @@ pub fn extract_json(text: &str) -> Option<&str> {
             continue;
         }
         let mut state = JsonPrefix::new();
+        let mut rejected = false;
         for (offset, c) in text[start..].char_indices() {
             if state.push(c).is_err() {
+                rejected = true;
                 break;
             }
             if state.is_complete() {
                 return Some(&text[start..start + offset + c.len_utf8()]);
             }
         }
-        // This opener never closed; a later one will not either, since it is
-        // nested inside the same unterminated value.
-        break;
+        // Why the two endings are not the same thing. A *rejected* opener was
+        // never JSON — a brace in prose, `Note: {see below}` — and says nothing
+        // about what follows, so keep looking. An opener that merely ran out of
+        // text is genuinely unterminated, and every later opener is nested
+        // inside it, so none of them can close either: stop rather than rescan
+        // the tail once per brace.
+        //
+        // Conflating the two cost a whole unit whenever a model wrote a brace
+        // before its answer, which is exactly the habit the constrained decoder
+        // exists to correct — and the backends that cannot be constrained, the
+        // remote ones, are the only callers that reach here.
+        if !rejected {
+            break;
+        }
     }
     None
 }
@@ -707,5 +720,43 @@ mod tests {
     #[test]
     fn extract_json_returns_none_when_unterminated() {
         assert!(extract_json(r#"{"a": [1, 2"#).is_none());
+        // Nothing after an unterminated opener can close it either — the inner
+        // brackets are inside it.
+        assert!(extract_json(r#"{"a": {"b": 1"#).is_none());
+    }
+
+    /// A brace in the prose before the answer used to lose the answer.
+    ///
+    /// The scan tried the first `{`, found it was not JSON, and gave up instead
+    /// of looking further along — so the unit was counted unparseable and its
+    /// findings thrown away. Only reachable on backends whose decoding cannot be
+    /// constrained, which is precisely where a stray preamble is likely.
+    #[test]
+    fn extract_json_skips_a_brace_that_is_only_prose() {
+        let text = "Note: {see below}\n{\"findings\": [], \"positives\": [\"ok\"]}";
+        assert_eq!(
+            extract_json(text),
+            Some(r#"{"findings": [], "positives": ["ok"]}"#)
+        );
+
+        // Several false starts, and a bracket rather than a brace.
+        assert_eq!(
+            extract_json("[not json] {also not} finally: [1, 2]"),
+            Some("[1, 2]")
+        );
+    }
+
+    /// The whole pipeline, not just the extractor: a preamble containing a brace
+    /// must still yield the findings the model actually reported.
+    #[test]
+    fn a_braced_preamble_does_not_lose_the_findings() {
+        let response = "Looking at the diff {specifically auth.rs}, here is the review:\n\
+             {\"findings\":[{\"file\":\"a.rs\",\"line\":1,\"severity\":\"high\",\
+             \"category\":\"security\",\"issue\":\"boom\",\"suggested_fix\":\"f\"}],\
+             \"positives\":[],\"suggestions\":[]}";
+        let summary = crate::analyzer::parse_review_response(response)
+            .expect("a brace in the preamble must not cost the whole unit");
+        assert_eq!(summary.findings.len(), 1);
+        assert_eq!(summary.findings[0].issue, "boom");
     }
 }

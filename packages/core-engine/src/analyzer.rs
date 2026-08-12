@@ -32,6 +32,14 @@ const MAX_CHUNK_LINES: usize = 1200;
 /// How many times a chunk may be halved when its prompt overruns the window.
 const MAX_SPLIT_DEPTH: u32 = 4;
 
+/// Ceiling on either optional prompt section. Past this the model's attention is
+/// the binding constraint rather than the window.
+const MAX_SECTION_BYTES: usize = 12_000;
+/// Floor for an optional section, below which it is not worth carrying.
+const MIN_SECTION_BYTES: usize = 400;
+/// Ticket text is a fixed brief, not something that grows with the diff.
+const MAX_REQUIREMENTS_BYTES: usize = 2000;
+
 /// Triage only pays for itself once a diff spans enough files that skipping
 /// some saves more than the extra inference pass costs.
 const TRIAGE_MIN_FILES: usize = 6;
@@ -63,6 +71,9 @@ pub struct AnalysisStats {
     pub units_cached: usize,
     /// Units whose output could not be parsed even after repair.
     pub units_unparseable: usize,
+    /// Units skipped because no amount of splitting fit them in the window.
+    /// Distinct from `units_unparseable`: the model was never asked.
+    pub units_too_large: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -269,11 +280,22 @@ impl ReviewAnalyzer {
     /// The units this analyzer would review, for a caller that needs to show a
     /// reader the hunk a finding actually came from.
     ///
-    /// Ids match those stamped onto findings, because the sizing comes from the
-    /// same backend and units are grouped per file — so triage dropping a whole
-    /// file cannot shift the ids of the files that survive.
+    /// Ids match those stamped onto findings: the sizing comes from the same
+    /// backend, unit ids are content-derived rather than positional (so triage
+    /// dropping a whole file cannot shift the ids of the files that survive),
+    /// and the same grouper runs here as in [`Self::analyze`].
+    ///
+    /// That last part is easy to lose. Merging two units mints a **new** id, so
+    /// planning without the grouper returned only the unmerged halves — and
+    /// every finding from a merged unit named an id no caller could resolve.
+    /// The TUI's evidence pane went blank for precisely the cross-file changes
+    /// the code graph exists to link.
     pub fn plan_units(&self, diff: &str, max_tokens: u32) -> Vec<crate::unit::ReviewUnit> {
-        build_units(diff, self.max_chunk_lines(max_tokens as usize))
+        let units = build_units(diff, self.max_chunk_lines(max_tokens as usize));
+        match &self.unit_grouper {
+            Some(group) => group(units),
+            None => units,
+        }
     }
 
     fn gen_options(&self, max_new_tokens: usize) -> GenOptions {
@@ -301,25 +323,55 @@ impl ReviewAnalyzer {
         (available / TOKENS_PER_DIFF_LINE).clamp(MIN_CHUNK_LINES, MAX_CHUNK_LINES)
     }
 
-    fn build_prompt(&self, diff: &str, context: &str, rulebooks: &[&Rulebook]) -> Prompt {
+    fn build_prompt(
+        &self,
+        diff: &str,
+        context: &str,
+        rulebooks: &[&Rulebook],
+        max_new_tokens: usize,
+        depth: u32,
+    ) -> Prompt {
+        let budget = self.section_budget_bytes(max_new_tokens, depth);
         review_prompt(&ReviewPromptInput {
             diff,
             context,
             languages: self.languages.as_deref(),
             requirements: self.requirements.as_deref(),
             rulebooks,
-            max_context_bytes: self.context_budget_bytes(),
-            max_requirements_bytes: 2000,
-            max_rules_bytes: self.context_budget_bytes(),
+            max_context_bytes: budget,
+            max_requirements_bytes: budget.min(MAX_REQUIREMENTS_BYTES),
+            max_rules_bytes: budget,
         })
     }
 
-    /// Byte budget for the RAG/context section, scaled to the window rather
-    /// than pinned at the 2 KB a 4K window demanded.
-    fn context_budget_bytes(&self) -> usize {
-        let ctx = self.backend.context_tokens();
-        // Roughly a sixth of the window, three bytes per token.
-        ((ctx / 6) * 3).clamp(1500, 12_000)
+    /// Byte budget for each of the prompt's optional sections — the symbol
+    /// context and the project rules — at recursion `depth`.
+    ///
+    /// Two properties, both learned the hard way.
+    ///
+    /// **The diff keeps at least half the window.** These sections used to be
+    /// sized from the window alone, so a large `.diffmind/rules/` could claim
+    /// 12 KB and the context another 12 KB regardless of what was left for the
+    /// thing actually under review.
+    ///
+    /// **The budget shrinks with depth.** When a prompt overruns, the analyzer
+    /// halves the *diff* and retries — which cannot help when the fixed sections
+    /// are what overran. A big enough rule set therefore failed identically at
+    /// every recursion level and gave up at the depth cap, having never had a
+    /// chance. Shrinking here is what makes the retry mean something.
+    /// [`crate::prompt`] drops whole rule sets that no longer fit rather than
+    /// truncating one mid-sentence, so this degrades to "fewer rules", then to
+    /// "no rules" — never to half a rule that reads like a complete one.
+    fn section_budget_bytes(&self, max_new_tokens: usize, depth: u32) -> usize {
+        let available = self
+            .backend
+            .context_tokens()
+            .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
+        // Half of what is left, shared by the two sections, at ~3 bytes a token.
+        let share = ((available / 4) * 3).min(MAX_SECTION_BYTES);
+        // The floor never exceeds the share, or a window too small to afford it
+        // would be pushed further over by the very thing meant to protect it.
+        (share >> depth.min(16)).max(MIN_SECTION_BYTES.min(share))
     }
 
     /// True when the prompt fits the window with room for the response.
@@ -342,7 +394,12 @@ impl ReviewAnalyzer {
     /// - `context_for(chunk)` supplies the symbol context for one chunk. It is
     ///   a callback rather than a string because context must be assembled per
     ///   chunk: see [`Self::analyze_chunk`].
-    /// - `on_progress(done, total)` fires when a chunk starts.
+    /// - `on_progress(done, total, unit)` fires when a unit starts, and is
+    ///   handed the unit itself. A caller that wants to show a reader the hunk
+    ///   behind a finding should record it here rather than predict the unit
+    ///   list up front: triage and the grouper both run inside this method, and
+    ///   either can change which units exist and therefore what ids findings
+    ///   carry. It always fires before that unit's `on_chunk_result`.
     /// - `on_chunk_result(findings)` fires with each batch as it completes, so
     ///   the CLI can print before the whole diff is processed.
     ///
@@ -357,7 +414,7 @@ impl ReviewAnalyzer {
         on_chunk_result: G,
     ) -> Result<(ReviewSummary, AnalysisStats), EngineError>
     where
-        F: Fn(usize, usize),
+        F: Fn(usize, usize, &crate::unit::ReviewUnit),
         G: Fn(&[ReviewFinding]),
     {
         let files = parse_diff(diff);
@@ -410,7 +467,7 @@ impl ReviewAnalyzer {
         units.sort_by_key(|u| rulebook::group_key(&applicable_to_unit(&rulebooks, u)));
 
         for (i, unit) in units.iter().enumerate() {
-            on_progress(i + 1, units.len());
+            on_progress(i + 1, units.len(), unit);
             let books = applicable_to_unit(&rulebooks, unit);
 
             match self.analyze_chunk(&unit.text, context_for, &books, max_tokens_per_chunk, 0) {
@@ -441,6 +498,16 @@ impl ReviewAnalyzer {
                         eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file());
                     }
                     stats.units_unparseable += 1;
+                }
+                // Counted and skipped, not fatal. A hunk nobody can fit in the
+                // window is a fact about that hunk; failing the run over it
+                // would throw away every other unit's findings — including the
+                // deterministic ones, which never needed a model at all.
+                Err(EngineError::UnitTooLarge(why)) => {
+                    if self.debug {
+                        eprintln!("[debug] unit {} ({}) skipped: {why}", i + 1, unit.file());
+                    }
+                    stats.units_too_large += 1;
                 }
                 Err(e) => return Err(e),
             }
@@ -557,15 +624,15 @@ impl ReviewAnalyzer {
         }
 
         let context = context_for(chunk);
-        let prompt = self.build_prompt(chunk, &context, rulebooks);
+        let prompt = self.build_prompt(chunk, &context, rulebooks, max_tokens as usize, depth);
 
         if !self.prompt_fits(&prompt, max_tokens as usize) {
             if depth >= MAX_SPLIT_DEPTH {
-                return Err(EngineError::ForwardError(
-                    "a single diff hunk is too large for the model's context window even after \
-                     splitting; review that file on its own"
-                        .into(),
-                ));
+                return Err(EngineError::UnitTooLarge(format!(
+                    "still {} bytes of diff after {MAX_SPLIT_DEPTH} splits, with every \
+                     optional section already at its minimum",
+                    chunk.len()
+                )));
             }
             // Halve and recurse rather than truncate: silently dropping half a
             // hunk means silently not reviewing it. Each half re-derives its own
@@ -1060,7 +1127,7 @@ diff --git a/b.rs b/b.rs
         };
 
         analyzer
-            .analyze(TWO_FILES, &context_for, 512, |_, _| {}, |_| {})
+            .analyze(TWO_FILES, &context_for, 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         let prompts = seen.lock().expect("recording backend mutex");
@@ -1088,6 +1155,117 @@ diff --git a/b.rs b/b.rs
         );
     }
 
+    const TWO_SRC_FILES: &str = "\
+diff --git a/src/a.rs b/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,2 @@
+-let old_a = 1;
++let new_a = 2;
+diff --git a/src/b.rs b/src/b.rs
++++ b/src/b.rs
+@@ -1,2 +1,2 @@
+-let old_b = 1;
++let new_b = 2;
+";
+
+    /// What the TUI's evidence pane actually relies on.
+    ///
+    /// It records each unit from `on_progress` and looks it up by a finding's
+    /// `unit_id`. That only works if a unit is announced before any finding
+    /// naming it arrives — otherwise the pane is asked for a hunk it has not
+    /// been given, and silently shows nothing.
+    #[test]
+    fn a_unit_is_announced_before_any_finding_that_names_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut analyzer =
+            ReviewAnalyzer::new(Box::new(FindingBackend { seen })).with_triage(TriageMode::Off);
+
+        // One log, both callbacks, so the interleaving is what is asserted.
+        let announced: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let violations: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        analyzer
+            .analyze(
+                TWO_SRC_FILES,
+                &|_| String::new(),
+                512,
+                |_, _, unit| {
+                    announced.lock().expect("announced").insert(unit.id.clone());
+                },
+                |findings| {
+                    let known = announced.lock().expect("announced");
+                    for f in findings {
+                        if let Some(id) = f.unit_id.as_deref()
+                            && !known.contains(id)
+                        {
+                            violations.lock().expect("violations").push(id.to_string());
+                        }
+                    }
+                },
+            )
+            .expect("analysis should succeed");
+
+        assert!(
+            !announced.lock().expect("announced").is_empty(),
+            "no unit was announced at all"
+        );
+        assert!(
+            violations.lock().expect("violations").is_empty(),
+            "findings arrived naming units that had not been announced: {:?}",
+            violations.lock().expect("violations")
+        );
+    }
+
+    /// The regression that blanked the TUI's evidence pane.
+    ///
+    /// A caller planning units up front looks a hunk up by the finding's
+    /// `unit_id`. Merging two units mints a **new** id, so a plan built without
+    /// the grouper resolved nothing for a merged unit — and a merged unit is
+    /// precisely the cross-file change the code graph exists to link, i.e. the
+    /// finding whose evidence a reviewer most needs to see.
+    ///
+    /// The TUI now takes its units from `analyze` itself rather than predicting
+    /// them, but `plan_units` is still public API and must not lie.
+    #[test]
+    fn planned_unit_ids_cover_every_unit_a_finding_can_name() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut analyzer = ReviewAnalyzer::new(Box::new(FindingBackend { seen }))
+            .with_triage(TriageMode::Off)
+            // Stands in for the code graph linking a symbol to its caller.
+            .with_unit_grouper(Box::new(|units: Vec<crate::unit::ReviewUnit>| match units
+                .split_first()
+            {
+                Some((first, rest)) => {
+                    vec![rest.iter().fold(first.clone(), |a, b| a.merged_with(b))]
+                }
+                None => units,
+            }));
+
+        let planned: HashSet<String> = analyzer
+            .plan_units(TWO_SRC_FILES, 512)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+
+        let (summary, stats) = analyzer
+            .analyze(TWO_SRC_FILES, &|_| String::new(), 512, |_, _, _| {}, |_| {})
+            .expect("analysis should succeed");
+
+        assert_eq!(stats.units_total, 1, "the grouper should have merged both");
+        let used: HashSet<&str> = summary
+            .findings
+            .iter()
+            .filter_map(|f| f.unit_id.as_deref())
+            .collect();
+        assert!(!used.is_empty(), "a model finding must record its unit");
+        for id in &used {
+            assert!(
+                planned.contains(*id),
+                "a finding names unit {id}, which the plan cannot resolve: {planned:?}"
+            );
+        }
+    }
+
     /// Two regions of one file are two units, and each finding records which
     /// unit produced it — that is what lets the reader be shown the exact hunk
     /// the model was looking at.
@@ -1108,7 +1286,7 @@ diff --git a/src/a.rs b/src/a.rs
         let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
 
         let (summary, stats) = analyzer
-            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         assert_eq!(stats.units_total, 2, "two regions, two units");
@@ -1159,7 +1337,7 @@ diff --git a/src/a.rs b/src/a.rs
             .with_triage(TriageMode::Off)
             .with_rulebooks(books);
         analyzer
-            .analyze(ONE_FILE, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(ONE_FILE, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed")
             .0
             .findings
@@ -1253,7 +1431,7 @@ diff --git a/src/auth.js b/src/auth.js
         let mut analyzer = ReviewAnalyzer::new(backend).with_triage(TriageMode::Off);
 
         let (summary, _) = analyzer
-            .analyze(diff, &|_| String::new(), 512, |_, _| {}, |_| {})
+            .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
             .expect("analysis should succeed");
 
         let detector_findings: Vec<_> = summary

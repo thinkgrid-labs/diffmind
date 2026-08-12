@@ -18,6 +18,15 @@ pub enum EngineError {
     SamplingError(String),
     #[error("serialization error: {0}")]
     SerializationError(String),
+    /// A review unit could not be made to fit the model's context window, even
+    /// after splitting and after shrinking everything optional in the prompt.
+    ///
+    /// Reported as an error so the analyzer can tell it apart from a chunk that
+    /// merely came back unparseable, but it is *counted and skipped* rather than
+    /// failing the run: one unreviewable hunk must not discard the findings
+    /// every other hunk produced.
+    #[error("review unit does not fit the context window: {0}")]
+    UnitTooLarge(String),
     #[error("io error: {0}")]
     Io(String),
     /// A remote backend (Ollama, OpenAI-compatible) failed to answer.

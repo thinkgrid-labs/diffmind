@@ -39,6 +39,9 @@ pub struct ReviewConfig {
     /// Same syntax as a rule's `files`: `*.ts`, `**/legacy/**`, or an exact path.
     #[serde(default)]
     pub ignore: Option<Vec<String>>,
+    /// Refresh the code graph before each review. On by default — a stale graph
+    /// reports wrong line ranges, not merely missing ones.
+    pub auto_index: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

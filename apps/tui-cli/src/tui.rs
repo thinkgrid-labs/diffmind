@@ -1,4 +1,4 @@
-//! The reviewer's cockpit.
+//! Interactive review — the terminal UI behind `diffmind --tui`.
 //!
 //! This is the surface the whole tool is for: not a report, but a place to sit
 //! while deciding what to say about someone else's branch. Three things follow
@@ -55,8 +55,14 @@ struct UnitView {
 
 enum Msg {
     Progress(String),
-    /// Sent once, as soon as the backend is up and the units are known.
-    Units(HashMap<String, UnitView>),
+    /// One unit, sent as it starts — always before any finding that names it.
+    ///
+    /// Sent from the analyzer's own progress callback rather than planned up
+    /// front. Predicting the unit list means reimplementing triage and unit
+    /// grouping outside the engine, and getting either subtly wrong leaves a
+    /// finding pointing at an id nothing can resolve — a silently empty
+    /// evidence pane on exactly the cross-file changes that most need one.
+    Unit(String, Box<UnitView>),
     Findings(Vec<ReviewFinding>),
     Done(Box<AnalysisStats>),
     Error(String),
@@ -264,6 +270,10 @@ where
         app.analyzing = true;
         app.findings.clear();
         app.verdicts.clear();
+        // A re-run re-derives its units; keeping the old ones would leave the
+        // pane showing a hunk from the previous run for an id that no longer
+        // exists in it.
+        app.units.clear();
         app.stats = None;
         app.status = "Loading model…".into();
 
@@ -307,7 +317,9 @@ where
             loop {
                 match rx.try_recv() {
                     Ok(Msg::Progress(s)) => app.status = s,
-                    Ok(Msg::Units(units)) => app.units = units,
+                    Ok(Msg::Unit(id, view)) => {
+                        app.units.insert(id, *view);
+                    }
                     Ok(Msg::Findings(mut batch)) => {
                         batch.retain(|f| f.severity >= app.min_severity);
                         let was_empty = app.findings.is_empty();
@@ -396,34 +408,29 @@ fn analyze(
     let mut analyzer =
         crate::build_analyzer(backend, &settings, &project_root, &diff, ticket, project);
 
-    // Capture the evidence before reviewing, so a finding can show its hunk the
-    // moment it streams in rather than after the run completes.
-    let units: HashMap<String, UnitView> = analyzer
-        .plan_units(&diff, settings.max_tokens)
-        .into_iter()
-        .map(|u| {
-            let context = context_for(&u.text);
-            (
-                u.id,
-                UnitView {
-                    text: u.text,
-                    context,
-                },
-            )
-        })
-        .collect();
-    let _ = tx.send(Msg::Units(units));
     let _ = tx.send(Msg::Progress("Analyzing…".into()));
 
-    let progress_tx = tx.clone();
     let findings_tx = tx.clone();
+    // Borrowed, not moved: `context_for` is handed to `analyze` at the same
+    // time, and both uses are read-only.
+    let context_ref = &context_for;
     let (summary, stats) = analyzer
         .analyze(
             &diff,
             &context_for,
             settings.max_tokens,
-            move |done, total| {
-                let _ = progress_tx.send(Msg::Progress(format!("Analyzing unit {done}/{total}…")));
+            |done, total, unit| {
+                // Capture the evidence as the unit starts. The analyzer
+                // guarantees this lands before any finding naming it, so the
+                // detail pane is never asked for a hunk it has not been given.
+                let _ = tx.send(Msg::Unit(
+                    unit.id.clone(),
+                    Box::new(UnitView {
+                        context: context_ref(&unit.text),
+                        text: unit.text.clone(),
+                    }),
+                ));
+                let _ = tx.send(Msg::Progress(format!("Analyzing unit {done}/{total}…")));
             },
             move |batch| {
                 let _ = findings_tx.send(Msg::Findings(batch.to_vec()));

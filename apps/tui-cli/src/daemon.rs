@@ -81,14 +81,30 @@ pub enum Request {
     Review(Box<ReviewRequest>),
 }
 
+/// Everything the client can vary per invocation.
+///
+/// A field missing here is not a missing feature — it is a flag that silently
+/// does nothing the moment a daemon is running, because the daemon falls back
+/// to whatever `diffmind serve` was started with. Nothing about the field's
+/// absence looks wrong from either side.
+///
+/// Note the deliberate lack of `#[serde(default)]` on the scalars: a default
+/// would let a renamed or dropped field arrive as `0`, which for `seed` is a
+/// perfectly plausible value and would quietly change every result. `read_info`
+/// already refuses a daemon from another build, so a hard parse error is the
+/// better failure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub diff: String,
-    pub languages: Vec<String>,
     pub requirements: Option<String>,
     pub max_tokens: u32,
     pub min_confidence: f32,
     pub triage: String,
+    /// Sampling, which decides whether two runs of the same diff agree. The
+    /// daemon must not substitute its own: reproducibility is the property the
+    /// whole gate rests on, and `--seed` silently ignored is worse than absent.
+    pub temperature: f64,
+    pub seed: u64,
     pub rules: Vec<core_engine::CustomRule>,
     /// Prose rule sets, sent rather than re-read: the daemon may be serving a
     /// different repository than the one it was started in.
@@ -132,6 +148,8 @@ pub struct SerializableStats {
     pub tokens_estimated: bool,
     pub units_cached: usize,
     pub units_unparseable: usize,
+    #[serde(default)]
+    pub units_too_large: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -148,6 +166,7 @@ impl From<&AnalysisStats> for SerializableStats {
             tokens_estimated: s.tokens_estimated,
             units_cached: s.units_cached,
             units_unparseable: s.units_unparseable,
+            units_too_large: s.units_too_large,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -166,6 +185,7 @@ impl From<SerializableStats> for AnalysisStats {
             tokens_estimated: s.tokens_estimated,
             units_cached: s.units_cached,
             units_unparseable: s.units_unparseable,
+            units_too_large: s.units_too_large,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -571,11 +591,12 @@ mod tests {
         let response = client
             .review(ReviewRequest {
                 diff: "d".into(),
-                languages: vec![],
                 requirements: None,
                 max_tokens: 128,
                 min_confidence: 0.0,
                 triage: "off".into(),
+                temperature: 0.0,
+                seed: core_engine::DEFAULT_SEED,
                 rules: vec![],
                 rulebooks: vec![],
                 baseline: None,
@@ -637,11 +658,12 @@ mod tests {
         let response = client
             .review(ReviewRequest {
                 diff: "d".into(),
-                languages: vec![],
                 requirements: None,
                 max_tokens: 128,
                 min_confidence: 0.0,
                 triage: "off".into(),
+                temperature: 0.0,
+                seed: core_engine::DEFAULT_SEED,
                 rules: vec![],
                 rulebooks: vec![core_engine::Rulebook {
                     id: "api".into(),
@@ -666,6 +688,65 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 500);
         assert_eq!(stats.completion_tokens, 60);
         assert!(stats.tokens_estimated);
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    /// `--seed` and `--temperature` used to be absent from the protocol
+    /// entirely, so a daemon reviewed with whatever sampling `diffmind serve`
+    /// was started with. Two runs of the same diff could then disagree for no
+    /// visible reason — and reproducibility is the property the gate rests on.
+    #[test]
+    fn sampling_survives_the_wire() {
+        let server = Server::bind(0, Duration::from_secs(30)).unwrap();
+        let port = server.port().unwrap();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || {
+            server
+                .run(|req| {
+                    // Echo what the handler actually received, so the assertion
+                    // sees the deserialized request rather than the sent one.
+                    Response::Ok(Box::new(ReviewResponse {
+                        summary: ReviewSummary {
+                            positives: vec![format!("{}|{}", req.temperature, req.seed)],
+                            ..Default::default()
+                        },
+                        stats: SerializableStats::default(),
+                        backend: "test".into(),
+                    }))
+                })
+                .unwrap();
+        });
+
+        let client = Client {
+            info: info(port, &token),
+        };
+        // Deliberately not the defaults — a dropped field would read as 0.0/0
+        // or as the daemon's own values, and both would pass a laxer assertion.
+        let response = client
+            .review(ReviewRequest {
+                diff: "d".into(),
+                requirements: None,
+                max_tokens: 128,
+                min_confidence: 0.0,
+                triage: "off".into(),
+                temperature: 0.7,
+                seed: 424_242,
+                rules: vec![],
+                rulebooks: vec![],
+                baseline: None,
+                use_cache: false,
+                project_root: ".".into(),
+            })
+            .expect("review should round-trip");
+
+        assert_eq!(
+            response.summary.positives,
+            vec!["0.7|424242"],
+            "sampling must reach the daemon, or --seed silently does nothing"
+        );
 
         client.shutdown().unwrap();
         handle.join().unwrap();
@@ -698,11 +779,12 @@ mod tests {
         let err = attacker
             .review(ReviewRequest {
                 diff: "secret code".into(),
-                languages: vec![],
                 requirements: None,
                 max_tokens: 16,
                 min_confidence: 0.0,
                 triage: "off".into(),
+                temperature: 0.0,
+                seed: core_engine::DEFAULT_SEED,
                 rules: vec![],
                 rulebooks: vec![],
                 baseline: None,

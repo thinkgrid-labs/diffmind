@@ -64,10 +64,6 @@ impl Def {
         let end = end.min(start + max_lines);
         Some(lines[start..end].join("\n"))
     }
-
-    fn span(&self) -> u32 {
-        self.end_line.saturating_sub(self.start_line)
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -243,19 +239,6 @@ impl Graph {
         Ok(stats)
     }
 
-    /// Definitions of `name`, preferring one in `near` when the name is
-    /// ambiguous — a local declaration is far likelier to be the referent.
-    pub fn definitions_of(&self, name: &str, near: Option<&str>, limit: usize) -> Vec<Def> {
-        let mut defs = self.query_defs(
-            "SELECT path, name, kind, start_line, end_line FROM defs WHERE name = ?1 LIMIT ?2",
-            params![name, limit as i64],
-        );
-        if let Some(near) = near {
-            defs.sort_by_key(|d| d.path != near);
-        }
-        defs
-    }
-
     /// The innermost definition whose body contains `line`.
     pub fn enclosing(&self, path: &str, line: u32) -> Option<Def> {
         self.query_defs(
@@ -268,31 +251,86 @@ impl Graph {
         .next()
     }
 
+    /// Every definition in `path` overlapping `start..=end`, innermost first.
+    ///
+    /// For a caller that needs the enclosing symbol of *many* lines. Asking
+    /// [`Self::enclosing`] per line is one query per line, and a unit spanning
+    /// several hundred lines then costs several hundred queries before any
+    /// inference starts. One query, resolved in memory, answers the same
+    /// question — see `graph::link`.
+    pub fn declarations_overlapping(&self, path: &str, start: u32, end: u32) -> Vec<Def> {
+        self.query_defs(
+            "SELECT path, name, kind, start_line, end_line FROM defs \
+             WHERE path = ?1 AND start_line <= ?3 AND end_line >= ?2 \
+             ORDER BY (end_line - start_line), start_line, name",
+            params![path, start, end],
+        )
+    }
+
+    /// Every definition whose name is one of `names`.
+    ///
+    /// Ordered by `(name, path, start_line)`, so a caller picking one definition
+    /// per name gets the same answer on every run. Batched rather than one query
+    /// per name: `rag` derives candidate names from every word in the diff, which
+    /// is thousands of lookups on a large branch — and it does it per review
+    /// unit.
+    ///
+    /// Chunked so a diff with more distinct words than SQLite's bound-parameter
+    /// limit still works; in practice this is a single query.
+    pub fn definitions_of_names(&self, names: &[String]) -> Vec<Def> {
+        /// Comfortably below SQLite's `SQLITE_MAX_VARIABLE_NUMBER`, whose
+        /// historical value was 999.
+        const CHUNK: usize = 400;
+
+        let mut out = Vec::new();
+        for batch in names.chunks(CHUNK) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            out.extend(self.query_defs(
+                &format!(
+                    "SELECT path, name, kind, start_line, end_line FROM defs \
+                     WHERE name IN ({placeholders}) ORDER BY name, path, start_line"
+                ),
+                rusqlite::params_from_iter(batch.iter()),
+            ));
+        }
+        out
+    }
+
     /// The definitions that mention `name` — the reverse edge, and the reason
     /// this file exists.
     ///
-    /// A reference sitting inside nested declarations belongs to the innermost
-    /// one; SQLite's bare-column rule hands back the row matching `MIN`.
+    /// `limit` bounds **callers**, not references. Deduplicating in Rust after a
+    /// SQL `LIMIT` looked equivalent and was not: the limit fell on reference
+    /// rows, so one function calling a symbol three times consumed the whole
+    /// budget and every other caller — the ones a blast radius exists to
+    /// surface — was silently dropped. `rag.rs` asks for three.
+    ///
+    /// Two levels, therefore. The inner query resolves each reference to the
+    /// innermost declaration containing it (nested declarations both match the
+    /// join; SQLite's bare-column rule hands back the row matching `MIN`).
+    /// The outer collapses those to distinct callers before the limit applies.
+    ///
+    /// Ordered smallest-span first, then by location, so the most specific
+    /// caller leads and the result does not vary between identical runs — an
+    /// unordered `LIMIT` is whatever the query planner felt like returning.
     /// Self-references are excluded, or every symbol would appear to call itself.
     pub fn callers_of(&self, name: &str, limit: usize) -> Vec<Def> {
-        let mut callers = self.query_defs(
-            "SELECT d.path, d.name, d.kind, d.start_line, d.end_line, \
-                    MIN(d.end_line - d.start_line) \
-             FROM refs r \
-             JOIN defs d ON d.path = r.path AND r.line >= d.start_line AND r.line <= d.end_line \
-             WHERE r.name = ?1 AND d.name != ?1 \
-             GROUP BY r.rowid \
+        self.query_defs(
+            "SELECT path, name, kind, start_line, end_line FROM ( \
+                 SELECT d.path AS path, d.name AS name, d.kind AS kind, \
+                        d.start_line AS start_line, d.end_line AS end_line, \
+                        MIN(d.end_line - d.start_line) \
+                 FROM refs r \
+                 JOIN defs d ON d.path = r.path \
+                            AND r.line >= d.start_line AND r.line <= d.end_line \
+                 WHERE r.name = ?1 AND d.name != ?1 \
+                 GROUP BY r.rowid \
+             ) \
+             GROUP BY path, name, kind, start_line, end_line \
+             ORDER BY (end_line - start_line), path, start_line, name \
              LIMIT ?2",
             params![name, limit as i64],
-        );
-        // One caller referencing a symbol five times is still one caller.
-        callers.sort_by(|a, b| {
-            (&a.path, a.start_line, &a.name).cmp(&(&b.path, b.start_line, &b.name))
-        });
-        callers
-            .dedup_by(|a, b| a.path == b.path && a.start_line == b.start_line && a.name == b.name);
-        callers.sort_by_key(|d| d.span());
-        callers
+        )
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -355,6 +393,13 @@ mod tests {
         let mut g = Graph::open(root).unwrap();
         g.index(root, &|_| {}).unwrap();
         g
+    }
+
+    /// Definitions of a single name, for tests that only care whether the graph
+    /// knows a symbol. Production resolves names in batches — a query per name
+    /// is what made context assembly scale with the size of the diff.
+    fn defs_of(g: &Graph, name: &str) -> Vec<Def> {
+        g.definitions_of_names(&[name.to_string()])
     }
 
     const LIB: &str = "\
@@ -422,6 +467,77 @@ pub fn refresh(token: &str) -> bool {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The limit counts callers, not references.
+    ///
+    /// It used to bound the reference *rows* and deduplicate afterwards, so a
+    /// function calling the symbol several times spent the whole budget on its
+    /// own. Three callers of six calls each, asking for three, returned one —
+    /// and `rag.rs` asks for three. The blast radius quietly collapsed to the
+    /// first caller the query planner happened to reach.
+    #[test]
+    fn a_chatty_caller_does_not_crowd_out_the_others() {
+        let root = project("crowding");
+        write(&root, "src/lib.rs", "fn target() {}\n");
+        for name in ["a", "m", "z"] {
+            let calls = "    target();\n".repeat(6);
+            write(
+                &root,
+                &format!("src/{name}.rs"),
+                &format!("fn caller_{name}() {{\n{calls}}}\n"),
+            );
+        }
+        let g = indexed(&root);
+
+        let distinct = |k: usize| -> Vec<String> {
+            g.callers_of("target", k)
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+        assert_eq!(
+            distinct(3),
+            ["caller_a", "caller_m", "caller_z"],
+            "three callers exist and three were asked for"
+        );
+        assert_eq!(distinct(2).len(), 2, "a smaller limit still yields callers");
+        assert_eq!(distinct(1).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unordered `LIMIT` returns whatever the planner chose, so the same
+    /// repository could yield different review context from run to run — and a
+    /// review that is not reproducible cannot be a gate.
+    #[test]
+    fn callers_come_back_in_a_stable_most_specific_first_order() {
+        let root = project("ordering");
+        write(&root, "src/lib.rs", "fn target() {}\n");
+        write(
+            &root,
+            "src/big.rs",
+            &format!(
+                "fn big() {{\n    target();\n{}}}\n",
+                "    let x = 1;\n".repeat(20)
+            ),
+        );
+        write(&root, "src/small.rs", "fn small() { target(); }\n");
+        let g = indexed(&root);
+
+        let names = |n: usize| -> Vec<String> {
+            g.callers_of("target", n)
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+        assert_eq!(names(10), ["small", "big"], "tightest scope leads");
+        assert_eq!(names(10), names(10), "repeated queries must agree");
+        assert_eq!(
+            names(1),
+            ["small"],
+            "a limit must keep the most specific caller, not an arbitrary one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_innermost_definition_owns_a_reference() {
         let root = project("innermost");
@@ -480,11 +596,52 @@ pub fn refresh(token: &str) -> bool {
         write(&root, "src/a.rs", "pub fn after() {}\n");
         g.index(&root, &|_| {}).unwrap();
 
-        assert!(
-            g.definitions_of("before", None, 10).is_empty(),
-            "stale symbol survived"
+        assert!(defs_of(&g, "before").is_empty(), "stale symbol survived");
+        assert_eq!(defs_of(&g, "after").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Why the graph is refreshed before every review rather than on demand.
+    ///
+    /// A stale graph does not merely miss new code — its line ranges point at
+    /// whatever now occupies those lines, and `source` reads the working tree,
+    /// so the model is handed unrelated code labelled as the enclosing symbol.
+    /// Confidently wrong context is worse than none.
+    #[test]
+    fn a_stale_graph_reports_the_wrong_lines_until_reindexed() {
+        let root = project("stale");
+        write(
+            &root,
+            "src/a.rs",
+            "pub fn target() {\n    let secret = 1;\n}\n",
         );
-        assert_eq!(g.definitions_of("after", None, 10).len(), 1);
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+
+        let before = defs_of(&g, "target").remove(0);
+        assert!(before.source(&root, 100).unwrap().contains("let secret"));
+
+        // Someone adds imports at the top — utterly ordinary.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(
+            &root,
+            "src/a.rs",
+            "// added\n// added\n// added\n// added\n// added\npub fn target() {\n    let secret = 1;\n}\n",
+        );
+
+        let stale = defs_of(&g, "target").remove(0);
+        assert!(
+            !stale.source(&root, 100).unwrap().contains("let secret"),
+            "this is the failure mode being guarded against"
+        );
+
+        // Re-indexing is what makes it right again, and is cheap enough to do
+        // before every review.
+        g.index(&root, &|_| {}).unwrap();
+        let fresh = defs_of(&g, "target").remove(0);
+        assert_eq!(fresh.start_line, 6);
+        assert!(fresh.source(&root, 100).unwrap().contains("let secret"));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -494,29 +651,98 @@ pub fn refresh(token: &str) -> bool {
         write(&root, "src/gone.rs", "pub fn vanishing() {}\n");
         let mut g = Graph::open(&root).unwrap();
         g.index(&root, &|_| {}).unwrap();
-        assert_eq!(g.definitions_of("vanishing", None, 10).len(), 1);
+        assert_eq!(defs_of(&g, "vanishing").len(), 1);
 
         std::fs::remove_file(root.join("src/gone.rs")).unwrap();
         let stats = g.index(&root, &|_| {}).unwrap();
 
         assert_eq!(stats.files_removed, 1);
         assert!(
-            g.definitions_of("vanishing", None, 10).is_empty(),
+            defs_of(&g, "vanishing").is_empty(),
             "a deleted file must stop answering queries"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An ambiguous name keeps every candidate, in a fixed order, so the caller
+    /// choosing between them (`rag`, which prefers a definition in the file the
+    /// reference was seen in) gets the same answer on every run.
     #[test]
-    fn a_local_definition_is_preferred_when_a_name_is_ambiguous() {
+    fn an_ambiguous_name_returns_every_candidate_in_a_stable_order() {
         let root = project("ambiguous");
-        write(&root, "src/a.rs", "pub struct Config { a: u32 }\n");
         write(&root, "src/b.rs", "pub struct Config { b: u32 }\n");
+        write(&root, "src/a.rs", "pub struct Config { a: u32 }\n");
         let g = indexed(&root);
 
-        let defs = g.definitions_of("Config", Some("src/b.rs"), 10);
+        let defs = defs_of(&g, "Config");
         assert_eq!(defs.len(), 2, "both are real and both are kept");
-        assert_eq!(defs[0].path, "src/b.rs", "the local one comes first");
+        let paths: Vec<&str> = defs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["src/a.rs", "src/b.rs"],
+            "ordered by path regardless of which file was indexed first"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Several names in one round trip, which is how `rag` resolves the words it
+    /// harvests from a diff. Names the graph does not know simply do not appear.
+    #[test]
+    fn many_names_resolve_in_one_query() {
+        let root = project("batch");
+        write(
+            &root,
+            "src/a.rs",
+            "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n",
+        );
+        let g = indexed(&root);
+
+        let names: Vec<String> = ["gamma", "alpha", "nonexistent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let resolved = g.definitions_of_names(&names);
+        let found: Vec<&str> = resolved.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            found,
+            ["alpha", "gamma"],
+            "ordered by name, unknowns absent"
+        );
+        assert!(g.definitions_of_names(&[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The query the per-line `enclosing` loop was replaced with.
+    #[test]
+    fn declarations_overlapping_a_span_come_back_innermost_first() {
+        let root = project("overlapping");
+        write(
+            &root,
+            "src/a.rs",
+            "mod outer {\n    pub fn inner() {\n        let x = 1;\n    }\n}\nfn after() {}\n",
+        );
+        let g = indexed(&root);
+
+        let overlapping = g.declarations_overlapping("src/a.rs", 2, 3);
+        let names: Vec<&str> = overlapping.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["inner", "outer"],
+            "both contain the span; the tighter one leads"
+        );
+
+        // The same answer `enclosing` gives, for every line in the span.
+        for line in 2..=3 {
+            assert_eq!(
+                g.enclosing("src/a.rs", line).map(|d| d.name),
+                Some("inner".into()),
+                "line {line}"
+            );
+        }
+        assert!(
+            g.declarations_overlapping("src/a.rs", 90, 99).is_empty(),
+            "a span past the end of the file declares nothing"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -525,7 +751,7 @@ pub fn refresh(token: &str) -> bool {
         let root = project("source");
         write(&root, "src/a.rs", "pub fn f() {\n    let x = 1;\n}\n");
         let g = indexed(&root);
-        let def = g.definitions_of("f", None, 1).remove(0);
+        let def = defs_of(&g, "f").remove(0);
 
         assert!(def.source(&root, 100).unwrap().contains("let x = 1;"));
 
@@ -542,7 +768,7 @@ pub fn refresh(token: &str) -> bool {
         let body = format!("pub fn big() {{\n{}}}\n", "    let x = 1;\n".repeat(500));
         write(&root, "src/a.rs", &body);
         let g = indexed(&root);
-        let def = g.definitions_of("big", None, 1).remove(0);
+        let def = defs_of(&g, "big").remove(0);
         assert_eq!(def.source(&root, 10).unwrap().lines().count(), 10);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -555,9 +781,9 @@ pub fn refresh(token: &str) -> bool {
         write(&root, "target/debug/gen.rs", "pub fn generated() {}\n");
         let g = indexed(&root);
 
-        assert_eq!(g.definitions_of("real", None, 10).len(), 1);
-        assert!(g.definitions_of("fake", None, 10).is_empty());
-        assert!(g.definitions_of("generated", None, 10).is_empty());
+        assert_eq!(defs_of(&g, "real").len(), 1);
+        assert!(defs_of(&g, "fake").is_empty());
+        assert!(defs_of(&g, "generated").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
