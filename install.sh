@@ -4,7 +4,7 @@
 #   curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
 #
 # Options (env vars):
-#   VERSION     — pin a specific release tag, e.g. VERSION=v0.6.0
+#   VERSION     — pin a specific release tag, e.g. VERSION=v0.9.0
 #   INSTALL_DIR — override install location (default: /usr/local/bin)
 
 set -euo pipefail
