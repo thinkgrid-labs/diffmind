@@ -106,7 +106,18 @@ pub struct ReviewAnalyzer {
     seed: u64,
     /// Accumulated across every backend call in one `analyze`, including triage.
     metering: Metering,
+    /// Optional regrouping of units before review.
+    unit_grouper: Option<UnitGrouper>,
 }
+
+/// Merges units the engine has no way to know are related.
+///
+/// The engine groups by file and adjacency, which is all a diff can tell it.
+/// Whether two units in *different* files are one review — a changed function
+/// and a caller that changed with it — is a question only the code graph can
+/// answer, and the graph lives in the application.
+pub type UnitGrouper =
+    Box<dyn Fn(Vec<crate::unit::ReviewUnit>) -> Vec<crate::unit::ReviewUnit> + Send>;
 
 /// What one run cost. Accumulated on the analyzer because `analyze_chunk`
 /// recurses when a unit overruns the window, and each level must add to the
@@ -136,7 +147,14 @@ impl ReviewAnalyzer {
             temperature: defaults.temperature,
             seed: defaults.seed,
             metering: Metering::default(),
+            unit_grouper: None,
         }
+    }
+
+    /// Let the caller merge related units before review. See [`UnitGrouper`].
+    pub fn with_unit_grouper(mut self, grouper: UnitGrouper) -> Self {
+        self.unit_grouper = Some(grouper);
+        self
     }
 
     /// Run the backend, recording what it cost.
@@ -375,6 +393,9 @@ impl ReviewAnalyzer {
             &reviewable,
             self.max_chunk_lines(max_tokens_per_chunk as usize),
         );
+        if let Some(group) = &self.unit_grouper {
+            units = group(std::mem::take(&mut units));
+        }
         stats.units_total = units.len();
 
         // Cloned once per run: `analyze_chunk` needs `&mut self`, so the
@@ -386,11 +407,11 @@ impl ReviewAnalyzer {
         // a backend that can reuse a prompt prefix gets the longest possible
         // run of hits. Findings are sorted before output regardless, so this
         // changes only the order work is done in.
-        units.sort_by_key(|u| rulebook::group_key(&rulebook::applicable(&rulebooks, &u.file)));
+        units.sort_by_key(|u| rulebook::group_key(&applicable_to_unit(&rulebooks, u)));
 
         for (i, unit) in units.iter().enumerate() {
             on_progress(i + 1, units.len());
-            let books = rulebook::applicable(&rulebooks, &unit.file);
+            let books = applicable_to_unit(&rulebooks, unit);
 
             match self.analyze_chunk(&unit.text, context_for, &books, max_tokens_per_chunk, 0) {
                 Ok((unit_summary, cached)) => {
@@ -417,7 +438,7 @@ impl ReviewAnalyzer {
                 }
                 Err(EngineError::SerializationError(e)) => {
                     if self.debug {
-                        eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file);
+                        eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file());
                     }
                     stats.units_unparseable += 1;
                 }
@@ -719,6 +740,23 @@ impl ReviewAnalyzer {
             .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
         (available * 3).clamp(4_000, 60_000)
     }
+}
+
+/// Rule sets governing any file in the unit. A merged unit spans more than one
+/// file, and a rule scoped to either of them still applies.
+fn applicable_to_unit<'a>(
+    books: &'a [Rulebook],
+    unit: &crate::unit::ReviewUnit,
+) -> Vec<&'a Rulebook> {
+    let mut out: Vec<&Rulebook> = Vec::new();
+    for file in &unit.files {
+        for b in rulebook::applicable(books, file) {
+            if !out.iter().any(|existing| existing.id == b.id) {
+                out.push(b);
+            }
+        }
+    }
+    out
 }
 
 /// Where a batch of findings came from, so `finalize` can stamp provenance and

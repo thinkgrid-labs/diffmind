@@ -1,0 +1,10 @@
+# Written by diffmind. Generated state — not worth committing.
+# Deliberately absent: rules/, rules.toml, config.toml, baseline.json.
+cache/
+runs/
+models/
+graph.db
+graph.db-wal
+graph.db-shm
+symbols.json
+daemon.json

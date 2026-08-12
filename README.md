@@ -36,7 +36,7 @@ Your source code never leaves your environment. Works offline. Ships as a **sing
 - **SARIF output** — inline PR annotations via GitHub Code Scanning, no bot account or token
 - **Pluggable backends** — the bundled GGUF, or your own Ollama / vLLM / LM Studio endpoint
 - **Daemon mode** — keep the model resident so reviews are near-instant
-- **Local RAG** — feeds the model the *enclosing function* of each hunk, not just the diff
+- **Code graph** — a tree-sitter symbol graph (Rust, TypeScript, TSX, JavaScript, Python) in local SQLite. Each hunk is reviewed alongside its enclosing function, **the callers of what changed**, referenced definitions, and the file's tests — so a changed signature is judged against the code that depends on it
 - **Reproducible** — greedy decoding with a fixed seed: the same diff always reviews the same way
 - **Reviewer's cockpit** (`--tui`) — analyses on launch, shows the hunk and context behind each finding, and records accept / dismiss / wrong so the signal-to-noise ratio is measured rather than guessed
 - JSON / Markdown output, and a proper CI gate
@@ -86,7 +86,7 @@ cargo install --path apps/tui-cli
 
 ```bash
 diffmind download          # one-time model download (~1.1 GB)
-diffmind index             # optional: index symbols for context-aware reviews
+diffmind index             # build the code graph (recommended)
 diffmind                   # review this branch against the repo's default branch
 ```
 
@@ -502,9 +502,9 @@ Options:
 1. **Parse** — the diff is parsed once into typed per-file hunks with real pre/post-image line numbers.
 2. **Pre-filter** — lockfiles, `linguist-generated` paths, files carrying a `@generated` banner, minified bundles, assets, snapshots, your `ignore` globs, and hunks that only change whitespace are dropped. Costs nothing, typically removes most of a real branch, and the counts are reported rather than silently applied. Whitespace inside a string literal counts as content, and indentation is never dismissed in Python or YAML.
 3. **Deterministic detectors** — commented-out code, removed-but-used declarations, and your regex rules. No model involved.
-4. **Context** — the enclosing function of each hunk (plus definitions of referenced symbols) is pulled from `.diffmind/symbols.json`, assembled per chunk so one file's edit does not invalidate another's cached result.
+4. **Context** — assembled per unit from `.diffmind/graph.db`: the enclosing definition, the callers of every changed symbol, definitions of referenced symbols, and the corresponding test file. Bounded by a byte budget, so context does not grow with the repository.
 5. **Triage** — on large diffs, a cheap first pass decides which files carry real risk.
-6. **Review units** — hunks are grouped into regions of a file rather than cut wherever a line budget ran out, so related hunks are read together and an edit in one function only re-reviews that function. Units are sized to the backend's *actual* context window, read from the GGUF metadata.
+6. **Review units** — hunks are grouped into regions of a file rather than cut wherever a line budget ran out, so related hunks are read together and an edit in one function only re-reviews that function. When the graph shows a changed symbol and a changed caller, the two are merged into one unit and reviewed together. Units are sized to the backend's *actual* context window, read from the GGUF metadata.
 7. **Constrained decoding** — the sampler consults a JSON state machine before committing each token, so the model cannot emit a preamble, an unbalanced brace, or a truncated string. Output that hits the token cap is repaired rather than discarded.
 8. **Anchoring** — findings pointing at a file not in the diff are dropped; off-by-N line numbers snap to the nearest changed line.
 9. **Suppression** — inline directives, the baseline, and `--min-confidence` are applied, then results are deduplicated and sorted.

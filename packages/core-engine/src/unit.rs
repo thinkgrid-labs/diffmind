@@ -34,7 +34,9 @@ const MAX_UNITS_PER_FILE: usize = 8;
 /// One reviewable region of one file.
 #[derive(Debug, Clone)]
 pub struct ReviewUnit {
-    pub file: String,
+    /// Files this unit covers. Usually one; more when the graph linked a
+    /// changed symbol to callers that changed in the same diff.
+    pub files: Vec<String>,
     /// Self-contained diff text: the file's header, then this unit's hunks.
     /// Original bytes, so hunk headers and line numbers are untouched.
     pub text: String,
@@ -49,9 +51,53 @@ pub struct ReviewUnit {
 }
 
 impl ReviewUnit {
-    /// Does this unit cover `line` in `file`?
+    /// The file this unit is primarily about — the one its line span refers to.
+    pub fn file(&self) -> &str {
+        self.files.first().map(String::as_str).unwrap_or("")
+    }
+
+    /// Does this unit cover `line` in `file`? Answers for the primary region;
+    /// a merged unit's other files are carried in `files`.
     pub fn covers(&self, file: &str, line: u32) -> bool {
-        self.file == file && line >= self.new_start && line <= self.new_end
+        self.file() == file && line >= self.new_start && line <= self.new_end
+    }
+
+    /// Combine two units into one review.
+    ///
+    /// Used when a changed symbol and code that calls it were **both** edited.
+    /// Reviewed apart, the model judges an interaction while seeing only one
+    /// side of it as background — and pays for the other side's context twice.
+    /// Together it is one call, one context, and the actual question.
+    pub fn merged_with(&self, other: &ReviewUnit) -> ReviewUnit {
+        let mut files = self.files.clone();
+        for f in &other.files {
+            if !files.contains(f) {
+                files.push(f.clone());
+            }
+        }
+
+        let text = format!("{}{}", self.text, other.text);
+        let mut h = Sha256::new();
+        for f in &files {
+            h.update(f.as_bytes());
+            h.update(b"\x00");
+        }
+        h.update(text.as_bytes());
+
+        ReviewUnit {
+            files,
+            text,
+            id: format!("{:x}", h.finalize())[..16].to_string(),
+            hunk_count: self.hunk_count + other.hunk_count,
+            // The span still describes the primary file; a range across two
+            // files would not mean anything.
+            new_start: self.new_start,
+            new_end: self.new_end,
+        }
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.text.lines().count()
     }
 }
 
@@ -178,7 +224,7 @@ fn assemble(file: &RawFile, group: &[usize]) -> ReviewUnit {
     let id = format!("{:x}", h.finalize())[..16].to_string();
 
     ReviewUnit {
-        file: file.path.clone(),
+        files: vec![file.path.clone()],
         text,
         id,
         hunk_count: group.len(),
