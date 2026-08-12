@@ -1,10 +1,43 @@
 //! Prompt construction, kept separate from inference so the exact text a
 //! backend receives can be asserted in tests without loading a 1.1 GB model.
 
+use crate::rulebook::Rulebook;
+
+/// Render the rule sets governing this unit into the stable half of the prompt.
+///
+/// Each is labelled with its id so the model can attribute a finding back to it,
+/// and with its declared severity so the ceiling is stated rather than merely
+/// enforced after the fact.
+fn render_rulebooks(books: &[&Rulebook], max_bytes: usize) -> String {
+    if books.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n\n### Project review rules\n");
+    for book in books {
+        let label = match book.severity {
+            Some(s) => format!("{} ({} severity)", book.id, s.as_str()),
+            None => book.id.clone(),
+        };
+        let entry = format!("\n--- {label} ---\n{}\n", book.body);
+        // Stop at a whole rule set rather than truncating one mid-sentence: half
+        // a rule reads as a complete rule that says something else.
+        if out.len() + entry.len() > max_bytes {
+            break;
+        }
+        out.push_str(&entry);
+    }
+
+    if out.trim() == "### Project review rules" {
+        return String::new();
+    }
+    out
+}
+
 /// Bumped whenever a prompt's wording changes. It is part of the review cache
 /// key, so a prompt edit invalidates stale cached results instead of silently
 /// serving output the current prompt would never produce.
-pub const PROMPT_VERSION: u32 = 3;
+pub const PROMPT_VERSION: u32 = 4;
 
 /// A chat-shaped prompt. Backends render it their own way: the local GGUF
 /// model needs ChatML control tokens, an HTTP endpoint needs a messages array.
@@ -44,6 +77,13 @@ pub fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Inputs that shape a review prompt.
+///
+/// The split between `system` and `user` in the result is not cosmetic. Every
+/// field that is constant across a run belongs in the system half so that half
+/// is byte-identical from one unit to the next and can be prefix-cached; the
+/// per-unit data (this unit's diff, and the context assembled for it) goes in
+/// the user half. The context section used to sit in the system prompt, which
+/// silently made every unit's prefix unique.
 pub struct ReviewPromptInput<'a> {
     pub diff: &'a str,
     /// Symbol definitions and enclosing-function bodies pulled from the index.
@@ -52,10 +92,14 @@ pub struct ReviewPromptInput<'a> {
     pub languages: Option<&'a str>,
     /// User story / acceptance criteria from a ticket.
     pub requirements: Option<&'a str>,
+    /// Project rule sets that govern this unit's file.
+    pub rulebooks: &'a [&'a Rulebook],
     /// Byte budget for the context section.
     pub max_context_bytes: usize,
     /// Byte budget for the requirements section.
     pub max_requirements_bytes: usize,
+    /// Byte budget for the rendered rule sets.
+    pub max_rules_bytes: usize,
 }
 
 pub fn review_prompt(input: &ReviewPromptInput<'_>) -> Prompt {
@@ -76,10 +120,12 @@ pub fn review_prompt(input: &ReviewPromptInput<'_>) -> Prompt {
         if ctx.trim().is_empty() {
             String::new()
         } else {
-            format!("\n\n### Surrounding code (for reference, not under review):\n{ctx}\n")
+            format!("### Surrounding code (for reference, not under review):\n{ctx}\n\n")
         }
     };
 
+    let rules_section = render_rulebooks(input.rulebooks, input.max_rules_bytes);
+    let has_rules = !rules_section.is_empty();
     let has_requirements = !requirements_section.is_empty();
 
     let compliance_focus = if has_requirements {
@@ -95,9 +141,23 @@ pub fn review_prompt(input: &ReviewPromptInput<'_>) -> Prompt {
         "\"security\"|\"quality\"|\"performance\"|\"maintainability\""
     };
 
+    let rule_field = if has_rules {
+        ", \"rule\": \"id of the project rule set this violates, omitted otherwise\""
+    } else {
+        ""
+    };
+    let rule_guidance = if has_rules {
+        "\n- rule: set it only when the finding breaks one of the project rules above, \
+         copying that rule set's name exactly. Omit it for everything else.\n\
+         - Project rules are this team's standards. Apply them in addition to the focus \
+         areas above, not instead of them."
+    } else {
+        ""
+    };
+
     let system = format!(
         "You are an expert Senior Software Engineer and Code Reviewer. Analyze the git diff and \
-         provide a thorough code review for {stack} code.{requirements_section}{context_section}\n\n\
+         provide a thorough code review for {stack} code.{requirements_section}{rules_section}\n\n\
          Focus on:\n\
          1. **Security**: Vulnerabilities, exposed secrets, insecure handling, disabled auth or validation.\n\
          2. **Quality**: Bugs, anti-patterns, logical errors, dead code left behind.\n\
@@ -106,7 +166,7 @@ pub fn review_prompt(input: &ReviewPromptInput<'_>) -> Prompt {
          Return a JSON object ONLY with exactly this structure:\n\
          {{\n\
          \x20 \"findings\": [{{ \"file\": \"path\", \"line\": 12, \"severity\": \"high\"|\"medium\"|\"low\", \
-         \"category\": {category_hint}, \"issue\": \"description\", \"suggested_fix\": \"fix\" }}],\n\
+         \"category\": {category_hint}, \"issue\": \"description\", \"suggested_fix\": \"fix\"{rule_field} }}],\n\
          \x20 \"positives\": [\"one sentence describing something done well\"],\n\
          \x20 \"suggestions\": [\"one sentence optional improvement that is not a bug\"]\n\
          }}\n\n\
@@ -116,13 +176,15 @@ pub fn review_prompt(input: &ReviewPromptInput<'_>) -> Prompt {
          - line: use the line number shown in the diff for the line you are describing.\n\
          - positives: always include 1-3 things done well. Never leave this empty.\n\
          - suggestions: nice-to-have improvements (tests, docs, refactors). Use [] if nothing comes to mind.\n\
-         - Keep each positive/suggestion to one concise sentence.\n\
+         - Keep each positive/suggestion to one concise sentence.{rule_guidance}\n\
          - Output the JSON object and nothing else — no preamble, no commentary, no markdown fence."
     );
 
     Prompt {
         system,
-        user: format!("Analyze this diff:\n{}\n", input.diff),
+        // Everything below varies per unit, which is exactly why it is here and
+        // not in the system half.
+        user: format!("{context_section}Analyze this diff:\n{}\n", input.diff),
     }
 }
 
@@ -196,9 +258,12 @@ pub fn commit_message_prompt(diff: &str) -> Prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Severity;
 
     fn base<'a>(diff: &'a str) -> ReviewPromptInput<'a> {
         ReviewPromptInput {
+            rulebooks: &[],
+            max_rules_bytes: 4000,
             diff,
             context: "",
             languages: None,
@@ -236,7 +301,87 @@ mod tests {
         // The assertion is simply that building the prompt does not panic and
         // yields valid UTF-8 — slicing mid-codepoint would abort.
         let p = review_prompt(&input);
-        assert!(p.system.contains('é'));
+        assert!(p.user.contains('é'));
+    }
+
+    fn rb(id: &str, severity: Option<Severity>) -> Rulebook {
+        Rulebook {
+            id: id.into(),
+            scope: vec![],
+            severity,
+            body: format!("- Rule from {id}."),
+        }
+    }
+
+    /// The whole reason rule bodies live in the system half.
+    #[test]
+    fn the_system_prompt_is_identical_for_two_units_under_the_same_rules() {
+        let books = [rb("api", Some(Severity::High))];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+
+        let mut a = base("diff for unit A");
+        a.rulebooks = &refs;
+        a.context = "context for A";
+
+        let mut b = base("diff for unit B");
+        b.rulebooks = &refs;
+        b.context = "totally different context for B";
+
+        let (pa, pb) = (review_prompt(&a), review_prompt(&b));
+        assert_eq!(
+            pa.system, pb.system,
+            "the cacheable prefix must not vary with per-unit data"
+        );
+        assert_ne!(pa.user, pb.user, "the per-unit half must still differ");
+    }
+
+    #[test]
+    fn rule_bodies_and_their_severity_reach_the_system_prompt() {
+        let books = [rb("api-conventions", Some(Severity::High))];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+        let mut input = base("d");
+        input.rulebooks = &refs;
+
+        let p = review_prompt(&input);
+        assert!(p.system.contains("Rule from api-conventions"));
+        assert!(p.system.contains("api-conventions (high severity)"));
+        assert!(
+            p.system.contains("\"rule\""),
+            "the model needs to be told how to attribute a finding"
+        );
+    }
+
+    #[test]
+    fn without_rule_sets_the_prompt_does_not_mention_them() {
+        // Existing users have no `.diffmind/rules/`; their prompt must not grow
+        // an empty section or an instruction about a field that cannot apply.
+        let p = review_prompt(&base("d"));
+        assert!(!p.system.contains("Project review rules"));
+        assert!(!p.system.contains("\"rule\""));
+    }
+
+    #[test]
+    fn an_oversized_rule_set_is_dropped_whole_rather_than_cut_in_half() {
+        let books = [
+            rb("small", None),
+            Rulebook {
+                id: "huge".into(),
+                scope: vec![],
+                severity: None,
+                body: "x".repeat(5000),
+            },
+        ];
+        let refs: Vec<&Rulebook> = books.iter().collect();
+        let mut input = base("d");
+        input.rulebooks = &refs;
+        input.max_rules_bytes = 200;
+
+        let p = review_prompt(&input);
+        assert!(p.system.contains("Rule from small"));
+        assert!(
+            !p.system.contains("huge"),
+            "half a rule reads as a complete rule that says something else"
+        );
     }
 
     #[test]

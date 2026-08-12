@@ -64,6 +64,11 @@ pub struct Cli {
     #[arg(long)]
     pub stdin: bool,
 
+    /// Review an explicit revision range, e.g. `v1.2.0..HEAD` or `main...HEAD`.
+    /// A bare `a..b` positional argument is recognised as one too.
+    #[arg(long, value_name = "RANGE")]
+    pub range: Option<String>,
+
     /// Launch interactive TUI
     #[arg(short, long)]
     pub tui: bool,
@@ -155,7 +160,7 @@ pub struct Cli {
     #[arg(long, value_name = "SECS")]
     pub backend_timeout: Option<u64>,
 
-    /// Specific files or directories to review (optional)
+    /// Specific files or directories to review, or a revision range (optional)
     pub files: Vec<String>,
 }
 
@@ -243,6 +248,17 @@ pub enum Commands {
         #[arg(long)]
         status: bool,
     },
+    /// Manage the prose rule sets in `.diffmind/rules/`
+    Rules {
+        #[command(subcommand)]
+        action: RulesAction,
+    },
+    /// Findings, cost and accept/wrong ratio over recorded runs
+    Stats {
+        /// Delete recorded runs. Verdict history is kept.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Inspect or clear the review cache
     Cache {
         #[command(subcommand)]
@@ -263,6 +279,14 @@ pub enum BaselineAction {
     Show,
     /// Delete the baseline
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RulesAction {
+    /// Write a starter `.diffmind/rules/default.md`
+    Init,
+    /// List the rule sets that would be loaded, and what they govern
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -322,6 +346,19 @@ mod tests {
     fn positional_files_still_parse() {
         let cli = Cli::try_parse_from(["diffmind", "src/a.rs", "src/b.rs"]).unwrap();
         assert_eq!(cli.files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn a_range_can_be_given_explicitly_or_positionally() {
+        let cli = Cli::try_parse_from(["diffmind", "--range", "v1.0..HEAD"]).unwrap();
+        assert_eq!(cli.range.as_deref(), Some("v1.0..HEAD"));
+        assert!(cli.files.is_empty());
+
+        // The positional form arrives as a file and is classified later, once
+        // git can be asked whether it resolves.
+        let cli = Cli::try_parse_from(["diffmind", "v1.0..HEAD", "src/"]).unwrap();
+        assert!(cli.range.is_none());
+        assert_eq!(cli.files, vec!["v1.0..HEAD", "src/"]);
     }
 
     #[test]

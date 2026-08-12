@@ -69,6 +69,8 @@ pub struct Settings {
     pub use_baseline: bool,
     pub use_daemon: bool,
     pub debug: bool,
+    /// Extra globs dropped by the pre-filter, from `.diffmind/config.toml`.
+    pub ignore_globs: Vec<String>,
 }
 
 pub fn resolve_settings(cli: &Cli, file: &FileConfig) -> Result<Settings> {
@@ -132,6 +134,7 @@ pub fn resolve_settings(cli: &Cli, file: &FileConfig) -> Result<Settings> {
         // A cache is only sound at temperature 0; above it, two runs are
         // *supposed* to differ, and replaying one would be a lie.
         use_cache: !cli.no_cache && resolve(None, r.cache, true) && temperature == 0.0,
+        ignore_globs: r.ignore.clone().unwrap_or_default(),
         use_baseline: !cli.no_baseline,
         use_daemon: !cli.no_daemon,
         debug: cli.debug,

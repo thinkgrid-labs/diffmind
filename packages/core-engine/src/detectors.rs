@@ -106,6 +106,8 @@ pub fn detect_commented_out_code(files: &[FileDiff]) -> Vec<ReviewFinding> {
                      entirely. Use version control (git revert/branch) instead of commenting out."
                         .to_string(),
                 confidence: Some(0.95),
+                rule: None,
+                unit_id: None,
                 rule_id: Some(RULE_COMMENTED_OUT_CODE.to_string()),
             });
         }
@@ -236,7 +238,9 @@ pub fn detect_removed_used_variables(files: &[FileDiff]) -> Vec<ReviewFinding> {
                         "Restore the declaration of `{name}`, or remove the remaining references to it."
                     ),
                     confidence: Some(0.92),
-                    rule_id: Some(RULE_REMOVED_USED_VARIABLE.to_string()),
+                    rule: None,
+            unit_id: None,
+                        rule_id: Some(RULE_REMOVED_USED_VARIABLE.to_string()),
                 });
             }
         }
@@ -372,20 +376,83 @@ pub fn references_identifier(text: &str, name: &str) -> bool {
 
 // ─── Custom rules from .diffmind/rules.toml ──────────────────────────────────
 
-/// Returns true when `file_path` matches the simple glob `pattern`.
-/// Supported: `*` (any), `*.ext`, `**/dir/**`, exact filename, path suffix.
+/// Returns true when `file_path` matches the glob `pattern`.
+///
+/// Supports `*` (within one path segment), `?`, `**` (any number of segments),
+/// and literal text. A pattern with no `/` matches the file name at any depth,
+/// so `*.ts` means `**/*.ts`.
+///
+/// This was previously a handful of `starts_with`/`contains` special cases,
+/// which could not express the most natural pattern of all — a directory
+/// prefix. `src/api/**` matched nothing, and `**/gen/**` was a substring test
+/// that also matched `src/gen-legacy/`.
 pub fn file_matches_glob(file_path: &str, pattern: &str) -> bool {
+    let path = file_path.trim().trim_start_matches("./");
+    let pattern = pattern.trim();
+    if pattern.is_empty() || path.is_empty() {
+        return false;
+    }
     if pattern == "*" || pattern == "**" {
         return true;
     }
-    if let Some(ext) = pattern.strip_prefix("*.") {
-        return file_path.ends_with(&format!(".{ext}"));
+
+    if !pattern.contains('/') {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        return wildcard_matches(base, pattern);
     }
-    if let Some(inner) = pattern.strip_prefix("**/") {
-        let inner = inner.strip_suffix("/**").unwrap_or(inner);
-        return file_path.contains(inner);
+
+    let path_segments: Vec<&str> = path.split('/').collect();
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    if match_segments(&path_segments, &pattern_segments) {
+        return true;
     }
-    file_path == pattern || file_path.ends_with(&format!("/{pattern}"))
+
+    // Unanchored fallback, so a partial path like `utils/helper.ts` still
+    // matches `src/utils/helper.ts` as it always has.
+    let mut floating = vec!["**"];
+    floating.extend(pattern_segments);
+    match_segments(&path_segments, &floating)
+}
+
+fn match_segments(path: &[&str], pattern: &[&str]) -> bool {
+    match (pattern.first(), path.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        // `**` matches zero segments, or one and then itself again.
+        (Some(&"**"), _) => {
+            match_segments(path, &pattern[1..])
+                || (!path.is_empty() && match_segments(&path[1..], pattern))
+        }
+        (Some(_), None) => false,
+        (Some(p), Some(s)) => wildcard_matches(s, p) && match_segments(&path[1..], &pattern[1..]),
+    }
+}
+
+/// `*` and `?` against a single segment. Iterative with backtracking, so a
+/// pathological pattern cannot blow the stack.
+fn wildcard_matches(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star, mut resume) = (usize::MAX, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            pi += 1;
+            resume = ti;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 pub fn detect_custom_rule_violations(
@@ -432,6 +499,8 @@ pub fn detect_custom_rule_violations(
                             issue: rule.message.clone(),
                             suggested_fix: rule.fix.clone().unwrap_or_default(),
                             confidence: Some(1.0),
+                            rule: None,
+                            unit_id: None,
                             rule_id: Some(rule.effective_id()),
                         });
                     }
@@ -746,5 +815,48 @@ diff --git a/src/a.ts b/src/a.ts
         assert!(file_matches_glob("src/gen/api.ts", "**/gen/**"));
         assert!(!file_matches_glob("src/app/api.ts", "**/gen/**"));
         assert!(file_matches_glob("a/b/c.rs", "*.rs"));
+    }
+
+    #[test]
+    fn glob_matches_a_directory_prefix() {
+        // The most natural pattern to write, and the one the old matcher could
+        // not express at all.
+        assert!(file_matches_glob("src/api/users.rs", "src/api/**"));
+        assert!(file_matches_glob("src/api/v2/users.rs", "src/api/**"));
+        assert!(!file_matches_glob("src/web/users.rs", "src/api/**"));
+    }
+
+    #[test]
+    fn glob_combines_a_prefix_with_an_extension() {
+        assert!(file_matches_glob("src/api/users.rs", "src/api/**/*.rs"));
+        assert!(file_matches_glob("src/api/v2/users.rs", "src/api/**/*.rs"));
+        assert!(
+            !file_matches_glob("src/api/users.ts", "src/api/**/*.rs"),
+            "the extension still has to match"
+        );
+    }
+
+    #[test]
+    fn glob_respects_segment_boundaries() {
+        // `contains` used to say yes to both of these.
+        assert!(!file_matches_glob("src/gen-legacy/api.ts", "**/gen/**"));
+        assert!(!file_matches_glob("src/apiary/x.rs", "src/api/**"));
+    }
+
+    #[test]
+    fn glob_still_matches_an_exact_or_partial_path() {
+        assert!(file_matches_glob("src/a.ts", "src/a.ts"));
+        assert!(file_matches_glob("apps/web/src/a.ts", "src/a.ts"));
+        assert!(!file_matches_glob("src/b.ts", "src/a.ts"));
+    }
+
+    #[test]
+    fn glob_handles_a_star_inside_a_segment() {
+        assert!(file_matches_glob("src/user.test.ts", "*.test.ts"));
+        assert!(file_matches_glob("src/handlers/get_user.rs", "**/get_*.rs"));
+        assert!(!file_matches_glob(
+            "src/handlers/set_user.rs",
+            "**/get_*.rs"
+        ));
     }
 }

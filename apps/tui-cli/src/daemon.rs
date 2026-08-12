@@ -84,15 +84,21 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub diff: String,
-    pub context: String,
     pub languages: Vec<String>,
     pub requirements: Option<String>,
     pub max_tokens: u32,
     pub min_confidence: f32,
     pub triage: String,
     pub rules: Vec<core_engine::CustomRule>,
+    /// Prose rule sets, sent rather than re-read: the daemon may be serving a
+    /// different repository than the one it was started in.
+    #[serde(default)]
+    pub rulebooks: Vec<core_engine::Rulebook>,
     pub baseline: Option<String>,
     pub use_cache: bool,
+    /// Where the daemon loads the symbol index and cache from. The client does
+    /// not send assembled context: the daemon owns chunking, so only it knows
+    /// what each chunk contains and therefore what context that chunk needs.
     pub project_root: String,
 }
 
@@ -115,9 +121,17 @@ pub struct ReviewResponse {
 /// struct); mirror it rather than force serde into the engine's public API.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SerializableStats {
-    pub chunks_total: usize,
-    pub chunks_cached: usize,
-    pub chunks_unparseable: usize,
+    pub units_total: usize,
+    #[serde(default)]
+    pub inference_ms: u64,
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub completion_tokens: usize,
+    #[serde(default)]
+    pub tokens_estimated: bool,
+    pub units_cached: usize,
+    pub units_unparseable: usize,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -127,9 +141,13 @@ pub struct SerializableStats {
 impl From<&AnalysisStats> for SerializableStats {
     fn from(s: &AnalysisStats) -> Self {
         SerializableStats {
-            chunks_total: s.chunks_total,
-            chunks_cached: s.chunks_cached,
-            chunks_unparseable: s.chunks_unparseable,
+            units_total: s.units_total,
+            inference_ms: s.inference_ms,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            tokens_estimated: s.tokens_estimated,
+            units_cached: s.units_cached,
+            units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -141,9 +159,13 @@ impl From<&AnalysisStats> for SerializableStats {
 impl From<SerializableStats> for AnalysisStats {
     fn from(s: SerializableStats) -> Self {
         AnalysisStats {
-            chunks_total: s.chunks_total,
-            chunks_cached: s.chunks_cached,
-            chunks_unparseable: s.chunks_unparseable,
+            units_total: s.units_total,
+            inference_ms: s.inference_ms,
+            prompt_tokens: s.prompt_tokens,
+            completion_tokens: s.completion_tokens,
+            tokens_estimated: s.tokens_estimated,
+            units_cached: s.units_cached,
+            units_unparseable: s.units_unparseable,
             files_skipped_by_triage: s.files_skipped_by_triage,
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
@@ -549,19 +571,101 @@ mod tests {
         let response = client
             .review(ReviewRequest {
                 diff: "d".into(),
-                context: String::new(),
                 languages: vec![],
                 requirements: None,
                 max_tokens: 128,
                 min_confidence: 0.0,
                 triage: "off".into(),
                 rules: vec![],
+                rulebooks: vec![],
                 baseline: None,
                 use_cache: false,
                 project_root: ".".into(),
             })
             .expect("review should round-trip");
         assert_eq!(response.summary.positives, vec!["from the daemon"]);
+
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Everything added to this protocol carries `#[serde(default)]`, which is
+    /// what lets an older daemon accept a newer request — and also what would
+    /// let a renamed or unserializable field silently arrive empty.
+    ///
+    /// Both failures here are invisible: rule sets would quietly stop applying
+    /// on the daemon path, and every daemon-served review would report zero
+    /// cost, which is the number Phase 2 is measured on.
+    #[test]
+    fn rule_sets_and_cost_survive_the_wire() {
+        let server = Server::bind(0, Duration::from_secs(30)).unwrap();
+        let port = server.port().unwrap();
+        let token = server.token().to_string();
+
+        let handle = std::thread::spawn(move || {
+            server
+                .run(|req| {
+                    // Echo what arrived, so the assertions below see the
+                    // deserialized request rather than the one we constructed.
+                    let seen = req
+                        .rulebooks
+                        .first()
+                        .map(|b| format!("{}|{}", b.id, b.body))
+                        .unwrap_or_else(|| "NO RULEBOOKS".into());
+                    Response::Ok(Box::new(ReviewResponse {
+                        summary: ReviewSummary {
+                            positives: vec![seen],
+                            ..Default::default()
+                        },
+                        stats: SerializableStats {
+                            units_total: 3,
+                            inference_ms: 1234,
+                            prompt_tokens: 500,
+                            completion_tokens: 60,
+                            tokens_estimated: true,
+                            ..Default::default()
+                        },
+                        backend: "test".into(),
+                    }))
+                })
+                .unwrap();
+        });
+
+        let client = Client {
+            info: info(port, &token),
+        };
+        let response = client
+            .review(ReviewRequest {
+                diff: "d".into(),
+                languages: vec![],
+                requirements: None,
+                max_tokens: 128,
+                min_confidence: 0.0,
+                triage: "off".into(),
+                rules: vec![],
+                rulebooks: vec![core_engine::Rulebook {
+                    id: "api".into(),
+                    scope: vec!["src/api/**".into()],
+                    severity: Some(core_engine::Severity::High),
+                    body: "- Handlers return ApiError.".into(),
+                }],
+                baseline: None,
+                use_cache: false,
+                project_root: ".".into(),
+            })
+            .expect("review should round-trip");
+
+        assert_eq!(
+            response.summary.positives,
+            vec!["api|- Handlers return ApiError."],
+            "the rule set must reach the daemon, or it silently stops applying"
+        );
+
+        let stats: AnalysisStats = response.stats.into();
+        assert_eq!(stats.inference_ms, 1234);
+        assert_eq!(stats.prompt_tokens, 500);
+        assert_eq!(stats.completion_tokens, 60);
+        assert!(stats.tokens_estimated);
 
         client.shutdown().unwrap();
         handle.join().unwrap();
@@ -594,13 +698,13 @@ mod tests {
         let err = attacker
             .review(ReviewRequest {
                 diff: "secret code".into(),
-                context: String::new(),
                 languages: vec![],
                 requirements: None,
                 max_tokens: 16,
                 min_confidence: 0.0,
                 triage: "off".into(),
                 rules: vec![],
+                rulebooks: vec![],
                 baseline: None,
                 use_cache: false,
                 project_root: ".".into(),
