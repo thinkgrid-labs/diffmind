@@ -2,6 +2,22 @@
 
 ## [0.9.0] — 08-12-2026
 
+diffmind was built as a gate: run it, get a verdict, pass or fail. This release
+adds the other half — a place to *sit* while deciding what to say about someone
+else's branch. Both surfaces share one engine; neither replaces the other.
+
+### Breaking
+
+- **`--format json`: `stats.chunks` → `stats.units`**, plus `units_cached` and
+  `units_unparseable`. The unit of review is now a region of a file rather than
+  an arbitrary slice of lines, and the field names say so. Exit codes, SARIF and
+  Markdown output are unchanged, so CI gates are unaffected.
+- **Daemon protocol changed.** A running 0.8 daemon is ignored rather than
+  misused — the version gate already handled this — but you will want
+  `diffmind serve --stop` after upgrading.
+- **`chunk_diff` removed** from the `core-engine` public API, superseded by
+  `build_units`.
+
 ### Security
 
 - **Model weights are now pinned and verified.** Downloads used HuggingFace's
@@ -22,6 +38,64 @@
   Existing downloads are verified against the new pins on next use; the current
   files match, so no re-download is expected.
 
+### Added
+
+- **Code graph.** A tree-sitter symbol graph for 13 languages — Rust,
+  TypeScript, TSX, JavaScript, Python, Go, Java, C#, Ruby, PHP, C, C++ and
+  Scala — stored in `.diffmind/graph.db` and updated incrementally
+  by mtime. Replaces the regex symbol index, which could only see `pub`/`export`
+  declarations and had no concept of a reference at all.
+  Review context now includes **the callers of every changed symbol** — a
+  changed signature is judged against the code that depends on it — plus the
+  enclosing definition, referenced definitions, and the file's tests. Everything
+  stays inside a byte budget, so context does not grow with the repository.
+  Bodies are read from the working tree rather than stored, so a snippet can
+  never disagree with the file being reviewed. The graph refreshes itself
+  incrementally before every review (~0.1s on 647 unchanged files) and builds on
+  first use, so it can never fall behind the code; `--no-index` opts out. Adding a language is one entry in
+  a table; contributions welcome.
+
+- **Cross-file review units.** When a symbol and code that calls it both change
+  in one diff, they are reviewed together as a single unit instead of separately.
+  Reviewed apart, the model judges an interaction while seeing only one side of
+  it as background. One call replaces two.
+- **Reviewer's cockpit** (`diffmind --tui`). Analyses on launch. Each finding
+  shows the actual hunk the model reviewed and the context it was given.
+  `a` accepts (and copies a review comment via OSC 52, which works over SSH),
+  `d` dismisses, `w` marks wrong. Verdicts are written through immediately.
+- **Review standards as markdown** — `.diffmind/rules/*.md`, scoped by path
+  glob, committed to the repo. `diffmind rules init` / `rules list`. A finding
+  the model attributes to a rule set gets the ID `rulebook.<id>` and suppresses
+  like any other; an attribution naming a rule set that does not govern that
+  file is discarded.
+- **Reportable pre-filter.** Lockfiles, `linguist-generated` paths, `@generated`
+  banners, minified bundles, assets, snapshots and formatting-only hunks are
+  dropped before the model sees them — and the run says what it skipped:
+  `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
+  Whitespace inside a string literal counts as content; indentation is never
+  dismissed in Python or YAML.
+- **`diffmind stats`** — findings, cost and the accept-to-wrong ratio over
+  recorded runs. Every review is filed to `.diffmind/runs/<sha>/`.
+- **Cost reporting** — wall-clock and token counts in the footer, in JSON, and
+  in the run record. Estimated counts are marked `~` rather than passed off as
+  exact.
+- **Revision ranges** — `diffmind v1.2.0..HEAD`, or `--range`. Paths after a
+  range narrow it.
+- **`review.ignore`** globs in `.diffmind/config.toml`.
+- diffmind writes its own `.diffmind/.gitignore`, keeping generated state out of
+  git while leaving `rules/`, `rules.toml`, `config.toml` and `baseline.json`
+  committable. Your repository's `.gitignore` is not touched.
+
+### Changed
+
+- `Graph::definitions_of` is replaced by `definitions_of_names` (batched) and
+  `declarations_overlapping` (span-based). The "prefer a definition in this
+  file" rule moved to `rag`, where the file being reviewed is known.
+- `ReviewAnalyzer::analyze`'s progress callback takes the unit being reviewed:
+  `Fn(usize, usize)` → `Fn(usize, usize, &ReviewUnit)`. Callers that need to
+  show a reader the hunk behind a finding should record it here rather than
+  predicting the unit list with `plan_units`.
+
 ### Fixed
 
 - **A non-ASCII path in a diff header could abort the process.** The
@@ -33,6 +107,21 @@
   it. Now fixed rather than removed: a `diff --git` line resolves on its own,
   which matters for binary files and mode changes, where no `+++ b/…` follows to
   correct it.
+
+- **A large rule set could fail the whole review.** Two faults compounding.
+  Splitting an oversized prompt halves the *diff*, but the context and rule
+  sections were sized from the window alone — identical at every recursion
+  level — so a prompt that overran because of its rules failed the same way four
+  times and then gave up. And giving up returned an error that propagated out of
+  `analyze`, exiting 2 and discarding the findings every *other* unit had
+  produced, including deterministic ones that never needed a model.
+
+  Both sections now shrink with each split (dropping whole rule sets rather than
+  truncating one mid-sentence), and are held to at most half of what the window
+  has left, so the diff under review cannot be crowded out. A unit that still
+  will not fit is counted in the new `units_too_large` stat and skipped, and the
+  footer says so. Unchanged for an ordinary review: at depth 0 on the shipped
+  32K window the budgets are exactly what they were.
 
 - **A non-ASCII identifier could abort the detector.** `references_identifier`
   advanced by one *byte* past a match, so a name whose first character is
@@ -97,20 +186,24 @@
   Both are now per-request. The daemon also re-asserts that caching is off above
   temperature 0 rather than trusting the client to have done so.
 
-### Internal
-
-- **End-to-end coverage for `--stdin`.** `apps/tui-cli/tests/stdin_pipeline.rs`
-  runs the real binary with a diff on stdin and asserts on stdout and the exit
-  code, with inference supplied by a stub `openai-compatible` endpoint rather
-  than the bundled model — so no 1.1 GB download is a test dependency, and the
-  path exercised is a shipped one rather than a test-only seam.
-  The stub answers each request about whichever file it can see in the prompt,
-  and records the prompts, so the tests can assert what the model was *shown* and
-  not merely what came back.
-
-  This is the coverage whose absence let one defect live in four places at once:
-  each copy had unit tests, and none of them tested the four together. Reverting
-  all four fixes now fails four of the six new tests.
+- **The result cache never worked across files.** Context was assembled once
+  from the whole diff and folded into every chunk's cache key, so editing one
+  file invalidated every other file's cached result — a re-review after a
+  force-push re-inferred the entire diff. Context is now assembled per unit.
+- **Each chunk was given the wrong context.** The six enclosing functions were
+  taken from whichever files sorted first, so most chunks paid for context about
+  files they did not contain.
+- **Editing one region of a file re-reviewed the whole file.** Units are grouped
+  by region, so a change in one function only invalidates that function.
+- **Glob matching could not express a directory prefix.** `src/api/**` matched
+  nothing, and `**/gen/**` was a substring test that also matched
+  `src/gen-legacy/`. Affects `rules.toml` `files` patterns as well.
+- **Conflicting input selectors were silently resolved by order.** Passing both
+  `--staged` and `--last` reviewed whichever the code checked first; it now
+  errors.
+- A diff dominated by a lockfile is no longer refused for size before the
+  lockfile is filtered out.
+- The TUI now honours the pre-filter and files a run record, which it did not.
 
 ### Performance
 
@@ -138,101 +231,17 @@ every review — including one that turned out to be fully cached.
   collision would hand one unit another's context, and confidently wrong context
   is the failure the whole module exists to prevent.
 
-### Changed
+### Internal
 
-- `Graph::definitions_of` is replaced by `definitions_of_names` (batched) and
-  `declarations_overlapping` (span-based). The "prefer a definition in this
-  file" rule moved to `rag`, where the file being reviewed is known.
-- `ReviewAnalyzer::analyze`'s progress callback takes the unit being reviewed:
-  `Fn(usize, usize)` → `Fn(usize, usize, &ReviewUnit)`. Callers that need to
-  show a reader the hunk behind a finding should record it here rather than
-  predicting the unit list with `plan_units`.
-- **Daemon protocol changed** — `ReviewRequest` gains `temperature` and `seed`
-  and drops the unused `languages` field. The version gate already refuses a
-  daemon from another build; run `diffmind serve --stop` after upgrading.
+- **End-to-end coverage for `--stdin`.** `apps/tui-cli/tests/stdin_pipeline.rs`
+  runs the real binary with a diff on stdin and asserts on stdout and the exit
+  code, with inference supplied by a stub `openai-compatible` endpoint rather
+  than the bundled model — so no 1.1 GB download is a test dependency, and the
+  path exercised is a shipped one rather than a test-only seam.
+  The stub answers each request about whichever file it can see in the prompt,
+  and records the prompts, so the tests can assert what the model was *shown* and
+  not merely what came back.
 
-
-diffmind was built as a gate: run it, get a verdict, pass or fail. This release
-adds the other half — a place to *sit* while deciding what to say about someone
-else's branch. Both surfaces share one engine; neither replaces the other.
-
-### Breaking
-
-- **`--format json`: `stats.chunks` → `stats.units`**, plus `units_cached` and
-  `units_unparseable`. The unit of review is now a region of a file rather than
-  an arbitrary slice of lines, and the field names say so. Exit codes, SARIF and
-  Markdown output are unchanged, so CI gates are unaffected.
-- **Daemon protocol changed.** A running 0.8 daemon is ignored rather than
-  misused — the version gate already handled this — but you will want
-  `diffmind serve --stop` after upgrading.
-- **`chunk_diff` removed** from the `core-engine` public API, superseded by
-  `build_units`.
-
-### Added
-
-- **Code graph.** A tree-sitter symbol graph for 13 languages — Rust,
-  TypeScript, TSX, JavaScript, Python, Go, Java, C#, Ruby, PHP, C, C++ and
-  Scala — stored in `.diffmind/graph.db` and updated incrementally
-  by mtime. Replaces the regex symbol index, which could only see `pub`/`export`
-  declarations and had no concept of a reference at all.
-  Review context now includes **the callers of every changed symbol** — a
-  changed signature is judged against the code that depends on it — plus the
-  enclosing definition, referenced definitions, and the file's tests. Everything
-  stays inside a byte budget, so context does not grow with the repository.
-  Bodies are read from the working tree rather than stored, so a snippet can
-  never disagree with the file being reviewed. The graph refreshes itself
-  incrementally before every review (~0.1s on 647 unchanged files) and builds on
-  first use, so it can never fall behind the code; `--no-index` opts out. Adding a language is one entry in
-  a table; contributions welcome.
-
-- **Cross-file review units.** When a symbol and code that calls it both change
-  in one diff, they are reviewed together as a single unit instead of separately.
-  Reviewed apart, the model judges an interaction while seeing only one side of
-  it as background. One call replaces two.
-- **Reviewer's cockpit** (`diffmind --tui`). Analyses on launch. Each finding
-  shows the actual hunk the model reviewed and the context it was given.
-  `a` accepts (and copies a review comment via OSC 52, which works over SSH),
-  `d` dismisses, `w` marks wrong. Verdicts are written through immediately.
-- **Review standards as markdown** — `.diffmind/rules/*.md`, scoped by path
-  glob, committed to the repo. `diffmind rules init` / `rules list`. A finding
-  the model attributes to a rule set gets the ID `rulebook.<id>` and suppresses
-  like any other; an attribution naming a rule set that does not govern that
-  file is discarded.
-- **Reportable pre-filter.** Lockfiles, `linguist-generated` paths, `@generated`
-  banners, minified bundles, assets, snapshots and formatting-only hunks are
-  dropped before the model sees them — and the run says what it skipped:
-  `312 hunks → 74 reviewable (238 filtered: lockfiles, generated, formatting)`.
-  Whitespace inside a string literal counts as content; indentation is never
-  dismissed in Python or YAML.
-- **`diffmind stats`** — findings, cost and the accept-to-wrong ratio over
-  recorded runs. Every review is filed to `.diffmind/runs/<sha>/`.
-- **Cost reporting** — wall-clock and token counts in the footer, in JSON, and
-  in the run record. Estimated counts are marked `~` rather than passed off as
-  exact.
-- **Revision ranges** — `diffmind v1.2.0..HEAD`, or `--range`. Paths after a
-  range narrow it.
-- **`review.ignore`** globs in `.diffmind/config.toml`.
-- diffmind writes its own `.diffmind/.gitignore`, keeping generated state out of
-  git while leaving `rules/`, `rules.toml`, `config.toml` and `baseline.json`
-  committable. Your repository's `.gitignore` is not touched.
-
-### Fixed
-
-- **The result cache never worked across files.** Context was assembled once
-  from the whole diff and folded into every chunk's cache key, so editing one
-  file invalidated every other file's cached result — a re-review after a
-  force-push re-inferred the entire diff. Context is now assembled per unit.
-- **Each chunk was given the wrong context.** The six enclosing functions were
-  taken from whichever files sorted first, so most chunks paid for context about
-  files they did not contain.
-- **Editing one region of a file re-reviewed the whole file.** Units are grouped
-  by region, so a change in one function only invalidates that function.
-- **Glob matching could not express a directory prefix.** `src/api/**` matched
-  nothing, and `**/gen/**` was a substring test that also matched
-  `src/gen-legacy/`. Affects `rules.toml` `files` patterns as well.
-- **Conflicting input selectors were silently resolved by order.** Passing both
-  `--staged` and `--last` reviewed whichever the code checked first; it now
-  errors.
-- A diff dominated by a lockfile is no longer refused for size before the
-  lockfile is filtered out.
-- The TUI now honours the pre-filter and files a run record, which it did not.
+  This is the coverage whose absence let one defect live in four places at once:
+  each copy had unit tests, and none of them tested the four together. Reverting
+  all four fixes now fails four of the six new tests.

@@ -29,7 +29,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -42,6 +42,7 @@ use std::{
     time::Duration,
 };
 
+use crate::output::VERSION;
 use crate::runs::{self, Verdict};
 use crate::settings::Settings;
 
@@ -102,6 +103,46 @@ impl App {
 
     fn evidence(&self, finding: &ReviewFinding) -> Option<&UnitView> {
         self.units.get(finding.unit_id.as_deref()?)
+    }
+
+    /// Fold one message from the analysis thread into the view.
+    ///
+    /// Lifted out of the event loop so it can be tested. The loop itself cannot
+    /// be: it polls real stdin and only returns on a keypress, which left the
+    /// step that actually populates the evidence pane — `Msg::Unit` — reachable
+    /// only by launching the terminal and looking at it. That is exactly the
+    /// wiring that was silently broken before, so it should not be the one part
+    /// nothing can assert on.
+    fn apply(&mut self, msg: Msg) {
+        match msg {
+            Msg::Progress(s) => self.status = s,
+            Msg::Unit(id, view) => {
+                self.units.insert(id, *view);
+            }
+            Msg::Findings(mut batch) => {
+                batch.retain(|f| f.severity >= self.min_severity);
+                let was_empty = self.findings.is_empty();
+                self.findings.extend(batch);
+                // Select the first finding the moment one arrives, so the detail
+                // pane has something in it without the reviewer pressing a key.
+                if was_empty && !self.findings.is_empty() {
+                    self.state.select(Some(0));
+                }
+            }
+            Msg::Done(stats) => {
+                self.analyzing = false;
+                self.status = format!(
+                    "{} finding{} — a accept · d dismiss · w wrong",
+                    self.findings.len(),
+                    if self.findings.len() == 1 { "" } else { "s" }
+                );
+                self.stats = Some(*stats);
+            }
+            Msg::Error(e) => {
+                self.analyzing = false;
+                self.status = format!("Error: {e}");
+            }
+        }
     }
 
     /// Record a verdict for the selected finding and advance.
@@ -316,31 +357,7 @@ where
             let mut disconnected = false;
             loop {
                 match rx.try_recv() {
-                    Ok(Msg::Progress(s)) => app.status = s,
-                    Ok(Msg::Unit(id, view)) => {
-                        app.units.insert(id, *view);
-                    }
-                    Ok(Msg::Findings(mut batch)) => {
-                        batch.retain(|f| f.severity >= app.min_severity);
-                        let was_empty = app.findings.is_empty();
-                        app.findings.extend(batch);
-                        if was_empty && !app.findings.is_empty() {
-                            app.state.select(Some(0));
-                        }
-                    }
-                    Ok(Msg::Done(stats)) => {
-                        app.analyzing = false;
-                        app.status = format!(
-                            "{} finding{} — a accept · d dismiss · w wrong",
-                            app.findings.len(),
-                            if app.findings.len() == 1 { "" } else { "s" }
-                        );
-                        app.stats = Some(*stats);
-                    }
-                    Ok(Msg::Error(e)) => {
-                        app.analyzing = false;
-                        app.status = format!("Error: {e}");
-                    }
+                    Ok(msg) => app.apply(msg),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -494,13 +511,26 @@ fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let header = Paragraph::new(format!(" diffmind  {}", app.status))
-        .block(Block::default().borders(Borders::ALL).title("Status"))
-        .style(if app.analyzing {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Green)
-        });
+    let status_style = if app.analyzing {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" diffmind v{VERSION}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {}", app.status), status_style),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(status_style)
+            .title("Status"),
+    );
     f.render_widget(header, rows[0]);
 
     if app.findings.is_empty() {
@@ -523,20 +553,151 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn render_empty(f: &mut Frame, area: Rect, app: &App) {
-    let body = if app.analyzing {
-        "\n  Analyzing…\n\n  Findings appear here as each unit completes."
-    } else if app.stats.is_some() {
-        "\n  No issues found.\n\n  Press 'r' to re-run."
+/// The wordmark, in block letters, shown while there is nothing to triage yet.
+///
+/// It lives in the empty pane rather than the header because that is the only
+/// place it is free: the pane is already blank during analysis, and the banner
+/// is gone the moment the first finding lands. A logo that persisted into
+/// triage would be spending rows on itself that the findings list needs.
+const BANNER: [&str; 6] = [
+    "██████╗ ██╗███████╗███████╗███╗   ███╗██╗███╗   ██╗██████╗ ",
+    "██╔══██╗██║██╔════╝██╔════╝████╗ ████║██║████╗  ██║██╔══██╗",
+    "██║  ██║██║█████╗  █████╗  ██╔████╔██║██║██╔██╗ ██║██║  ██║",
+    "██║  ██║██║██╔══╝  ██╔══╝  ██║╚██╔╝██║██║██║╚██╗██║██║  ██║",
+    "██████╔╝██║██║     ██║     ██║ ╚═╝ ██║██║██║ ╚████║██████╔╝",
+    "╚═════╝ ╚═╝╚═╝     ╚═╝     ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═════╝ ",
+];
+
+/// Half-height wordmark for panes too narrow for [`BANNER`].
+const BANNER_COMPACT: [&str; 2] = [
+    "█▀▄ █ █▀▀ █▀▀ █▀▄▀█ █ █▄ █ █▀▄",
+    "█▄▀ █ █▀  █▀  █ ▀ █ █ █ ▀█ █▄▀",
+];
+
+const TAGLINE: &str = "local-first AI code review";
+
+/// Columns each wordmark needs. Both are pure ASCII-width glyphs, so the
+/// character count is the column count.
+const BANNER_WIDTH: u16 = 59;
+const BANNER_COMPACT_WIDTH: u16 = 30;
+
+/// The wordmark sized to the pane, or nothing if the pane cannot spare it.
+///
+/// A banner that wraps is worse than no banner, so each size is used only when
+/// it fits whole — in both axes. The height check reserves room for the version
+/// line and status beneath it, which are the part a reviewer actually needs.
+fn banner_lines(inner: Rect) -> Vec<Line<'static>> {
+    let art: &[&str] = if inner.width >= BANNER_WIDTH {
+        &BANNER
+    } else if inner.width >= BANNER_COMPACT_WIDTH {
+        &BANNER_COMPACT
     } else {
-        "\n  Starting…"
+        return Vec::new();
     };
 
-    let widget = Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title("Review"))
-        .style(Style::default().fg(Color::Cyan))
-        .wrap(Wrap { trim: false });
-    f.render_widget(widget, area);
+    // The art, plus a blank line, the version line, and two rows of status.
+    if inner.height < art.len() as u16 + 4 {
+        return Vec::new();
+    }
+
+    art.iter().map(|row| banner_row(row)).collect()
+}
+
+/// One row of block letters, with the drop shadow dimmed behind the face.
+///
+/// Runs of like-styled characters are coalesced rather than emitted per glyph:
+/// this pane redraws on every tick of the event loop.
+fn banner_row(row: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_is_face = None;
+
+    for ch in row.chars() {
+        let is_face = ch == '█' || ch == '▀' || ch == '▄';
+        if run_is_face != Some(is_face) && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                banner_style(run_is_face == Some(true)),
+            ));
+        }
+        run_is_face = Some(is_face);
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, banner_style(run_is_face == Some(true))));
+    }
+    Line::from(spans)
+}
+
+fn banner_style(is_face: bool) -> Style {
+    if is_face {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Blue)
+    }
+}
+
+fn render_empty(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title("Review");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let status: Vec<Line> = if app.analyzing {
+        vec![
+            Line::styled("Analyzing…", Style::default().fg(Color::Cyan)),
+            Line::styled(
+                "Findings appear here as each unit completes.",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]
+    } else if app.stats.is_some() {
+        vec![
+            Line::styled("No issues found.", Style::default().fg(Color::Green)),
+            Line::styled("Press 'r' to re-run.", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![Line::styled("Starting…", Style::default().fg(Color::Cyan))]
+    };
+
+    let banner = banner_lines(inner);
+    if banner.is_empty() {
+        // Too small for the wordmark — fall back to the plain left-aligned pane.
+        let mut lines = vec![Line::raw("")];
+        lines.extend(status.into_iter().map(|l| {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(l.spans);
+            Line::from(spans)
+        }));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
+    let mut lines = banner;
+    lines.push(Line::raw(""));
+    // The tagline is the first thing to go: the pane does not wrap, so a
+    // subtitle wider than the pane would be sheared mid-word.
+    let subtitle = format!("v{VERSION} · {TAGLINE}");
+    lines.push(Line::styled(
+        if subtitle.chars().count() as u16 <= inner.width {
+            subtitle
+        } else {
+            format!("v{VERSION}")
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(status);
+
+    // Sit the block a third of the way down rather than dead centre: optically
+    // centred beats arithmetically centred, and it keeps the status text near
+    // where the findings list will replace it.
+    let pad = inner.height.saturating_sub(lines.len() as u16) / 3;
+    let mut padded = vec![Line::raw(""); pad as usize];
+    padded.extend(lines);
+
+    f.render_widget(Paragraph::new(padded).alignment(Alignment::Center), inner);
 }
 
 fn render_findings(f: &mut Frame, area: Rect, app: &mut App) {
@@ -721,6 +882,59 @@ fn kv<'a>(key: &'a str, value: &str) -> Line<'a> {
 mod tests {
     use super::*;
 
+    /// A ragged row would wrap and shear the wordmark in half, and the declared
+    /// widths are what the fit check is decided on — so both must be true.
+    #[test]
+    fn banner_rows_all_match_their_declared_width() {
+        for row in BANNER {
+            assert_eq!(
+                row.chars().count(),
+                BANNER_WIDTH as usize,
+                "row {row:?} does not match BANNER_WIDTH"
+            );
+        }
+        for row in BANNER_COMPACT {
+            assert_eq!(
+                row.chars().count(),
+                BANNER_COMPACT_WIDTH as usize,
+                "row {row:?} does not match BANNER_COMPACT_WIDTH"
+            );
+        }
+    }
+
+    #[test]
+    fn banner_steps_down_and_then_out_as_the_pane_narrows() {
+        let pane = |w, h| Rect::new(0, 0, w, h);
+
+        assert_eq!(banner_lines(pane(BANNER_WIDTH, 20)).len(), BANNER.len());
+        assert_eq!(
+            banner_lines(pane(BANNER_WIDTH - 1, 20)).len(),
+            BANNER_COMPACT.len(),
+            "one column short of the full wordmark must drop to the compact one"
+        );
+        assert!(
+            banner_lines(pane(BANNER_COMPACT_WIDTH - 1, 20)).is_empty(),
+            "a pane too narrow for either wordmark gets none"
+        );
+    }
+
+    /// A short pane spends its rows on the status text, not on the logo.
+    #[test]
+    fn banner_is_dropped_when_the_pane_is_too_short() {
+        assert!(banner_lines(Rect::new(0, 0, BANNER_WIDTH, 8)).is_empty());
+        assert!(!banner_lines(Rect::new(0, 0, BANNER_WIDTH, 10)).is_empty());
+    }
+
+    /// The face of the letters and their drop shadow must not collapse into one
+    /// flat colour — the depth is the whole point of the block font.
+    #[test]
+    fn banner_row_styles_the_shadow_apart_from_the_face() {
+        let line = banner_row(BANNER[0]);
+        let colours: Vec<_> = line.spans.iter().filter_map(|s| s.style.fg).collect();
+        assert!(colours.contains(&Color::Cyan), "no lit face");
+        assert!(colours.contains(&Color::Blue), "no shadow");
+    }
+
     fn finding(sev: Severity) -> ReviewFinding {
         ReviewFinding {
             file: "src/a.rs".into(),
@@ -883,6 +1097,81 @@ mod tests {
     fn base64_handles_utf8_beyond_ascii() {
         assert_eq!(base64("é".as_bytes()), "w6k=");
         assert_eq!(base64("→".as_bytes()), "4oaS");
+    }
+
+    /// The wiring the evidence pane actually rests on, driven the way the event
+    /// loop drives it.
+    ///
+    /// The pane is fed by two messages arriving in order: the analyzer announces
+    /// a unit, then streams findings that name it. Previously the units were
+    /// *predicted* up front instead, which resolved to nothing for any unit the
+    /// grouper had merged — a blank pane on exactly the cross-file findings that
+    /// most need evidence. Nothing could assert on it, because the only code
+    /// path ran inside a loop that polls stdin.
+    #[test]
+    fn a_unit_announced_before_its_findings_gives_them_evidence() {
+        let mut a = app(0, "apply-order");
+
+        a.apply(Msg::Unit(
+            "unit-7".into(),
+            Box::new(UnitView {
+                text: "@@ -1 +1 @@\n+let x = 2;".into(),
+                context: "fn enclosing() {}".into(),
+            }),
+        ));
+
+        let mut f = finding(Severity::High);
+        f.unit_id = Some("unit-7".into());
+        a.apply(Msg::Findings(vec![f]));
+
+        assert_eq!(a.findings.len(), 1);
+        assert_eq!(
+            a.state.selected(),
+            Some(0),
+            "the first finding selects itself, so the pane is never blank on arrival"
+        );
+
+        let shown = a
+            .evidence(&a.findings[0])
+            .expect("the announced unit must resolve — this is the blank-pane bug");
+        assert!(shown.text.contains("+let x = 2;"));
+        assert!(shown.context.contains("fn enclosing()"));
+    }
+
+    /// A detector finding has no unit and must not borrow another's hunk, but it
+    /// must also not stop the pane working for the findings that do have one.
+    #[test]
+    fn a_detector_finding_coexists_with_unit_backed_ones() {
+        let mut a = app(0, "apply-mixed");
+        a.apply(Msg::Unit(
+            "unit-1".into(),
+            Box::new(UnitView {
+                text: "hunk".into(),
+                context: String::new(),
+            }),
+        ));
+
+        let detector = finding(Severity::High); // unit_id: None
+        let mut model = finding(Severity::High);
+        model.unit_id = Some("unit-1".into());
+        a.apply(Msg::Findings(vec![detector, model]));
+
+        assert!(a.evidence(&a.findings[0]).is_none());
+        assert!(a.evidence(&a.findings[1]).is_some());
+    }
+
+    /// Findings below the reporting threshold never reach the queue, so the
+    /// verdict count and the gate agree with what the reviewer can see.
+    #[test]
+    fn applying_findings_respects_the_severity_threshold() {
+        let mut a = app(0, "apply-severity");
+        a.min_severity = Severity::High;
+        a.apply(Msg::Findings(vec![
+            finding(Severity::Low),
+            finding(Severity::High),
+        ]));
+        assert_eq!(a.findings.len(), 1);
+        assert_eq!(a.findings[0].severity, Severity::High);
     }
 
     #[test]

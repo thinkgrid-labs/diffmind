@@ -1305,6 +1305,117 @@ diff --git a/src/a.rs b/src/a.rs
         );
     }
 
+    /// A backend whose window is far too small for any prompt, so every unit
+    /// exhausts the split depth. Records nothing: it is never reached.
+    struct TinyWindowBackend;
+
+    impl ReviewBackend for TinyWindowBackend {
+        fn generate(&mut self, _p: &Prompt, _o: &GenOptions) -> Result<String, EngineError> {
+            panic!("a unit that cannot fit must never reach the backend");
+        }
+        fn describe(&self) -> String {
+            "tiny".into()
+        }
+        fn context_tokens(&self) -> usize {
+            128
+        }
+    }
+
+    /// A unit nobody can fit must not take the run down with it.
+    ///
+    /// This used to return `Err` from `analyze_chunk`, and every error except a
+    /// parse failure propagated straight out of `analyze` — so one oversized
+    /// hunk exited 2 and discarded the findings every *other* unit had already
+    /// produced, including the deterministic ones that never needed a model.
+    #[test]
+    fn a_unit_that_cannot_fit_is_counted_and_skipped_not_fatal() {
+        // Commented-out auth, which DM001 catches with no model involved.
+        let diff = "\
+diff --git a/src/auth.js b/src/auth.js
+--- a/src/auth.js
++++ b/src/auth.js
+@@ -10,6 +10,6 @@
+ function check() {
+-  const token = read();
+-  if (!token) throw new Error('no token');
+-  return verify(token);
++  // const token = read();
++  // if (!token) throw new Error('no token');
++  // return verify(token);
+ }
+";
+        let mut analyzer =
+            ReviewAnalyzer::new(Box::new(TinyWindowBackend)).with_triage(TriageMode::Off);
+
+        let (summary, stats) = analyzer
+            .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
+            .expect("an unfittable unit must not fail the run");
+
+        assert_eq!(stats.units_too_large, 1, "the skip should be counted");
+        assert_eq!(
+            stats.units_unparseable, 0,
+            "not a parse failure — the model was never asked"
+        );
+        assert!(
+            summary
+                .findings
+                .iter()
+                .any(|f| f.rule_id.as_deref() == Some(crate::types::RULE_COMMENTED_OUT_CODE)),
+            "deterministic findings must survive a unit the model could not read: {:?}",
+            summary.findings
+        );
+    }
+
+    /// The rule sets are the same size no matter how the diff is split, so
+    /// halving the hunk cannot rescue a prompt they overran. The budget has to
+    /// shrink with depth or the retry is theatre.
+    #[test]
+    fn the_optional_sections_shrink_with_each_split() {
+        let analyzer = ReviewAnalyzer::new(Box::new(RecordingBackend {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }));
+
+        let at = |depth| analyzer.section_budget_bytes(1024, depth);
+        assert!(at(0) > at(1), "depth 1 must be smaller than depth 0");
+        assert!(at(1) > at(2));
+        assert!(at(2) > at(3));
+        assert!(at(4) >= MIN_SECTION_BYTES, "but never vanishes entirely");
+
+        // Unchanged at depth 0 for the shipped 32K window, so an ordinary review
+        // sees exactly the context and rules it saw before.
+        assert_eq!(at(0), MAX_SECTION_BYTES);
+    }
+
+    /// The diff is the thing under review; the optional sections must not be
+    /// able to crowd it out of its own window.
+    #[test]
+    fn the_optional_sections_never_claim_more_than_half_the_window() {
+        struct Window(usize);
+        impl ReviewBackend for Window {
+            fn generate(&mut self, _p: &Prompt, _o: &GenOptions) -> Result<String, EngineError> {
+                unreachable!()
+            }
+            fn describe(&self) -> String {
+                "w".into()
+            }
+            fn context_tokens(&self) -> usize {
+                self.0
+            }
+        }
+
+        for window in [2048usize, 4096, 8192, 32_768] {
+            let analyzer = ReviewAnalyzer::new(Box::new(Window(window)));
+            let max_new = 1024;
+            let available = window.saturating_sub(max_new + SYSTEM_PROMPT_TOKENS);
+            // Two sections, three bytes a token, against what the window has left.
+            let claimed_tokens = (analyzer.section_budget_bytes(max_new, 0) * 2) / 3;
+            assert!(
+                claimed_tokens <= available.max(1),
+                "window {window}: sections claim {claimed_tokens} of {available} tokens"
+            );
+        }
+    }
+
     /// Emits one finding that claims to violate `rule`, at `high`.
     struct ClaimingBackend {
         rule: &'static str,
