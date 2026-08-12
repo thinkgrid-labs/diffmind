@@ -114,6 +114,45 @@ still treated as paths.
 
 ---
 
+## Language support
+
+Two things here are language-specific, and only one of them limits you.
+
+**Review itself works on any text diff** — any language, plus config files, SQL
+migrations, shell scripts. The model reads the hunk; the deterministic detectors
+and your regex rules run on added lines regardless of extension.
+
+**The code graph is the part that needs a grammar.** It supplies the enclosing
+definition, the callers of a changed symbol, and referenced definitions —
+tree-sitter parsers, 13 languages:
+
+| Language | Extensions |
+| ---------- | -------------------------------- |
+| Rust       | `.rs` |
+| TypeScript | `.ts` `.mts` `.cts` |
+| TSX        | `.tsx` |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` |
+| Python     | `.py` `.pyi` |
+| Go         | `.go` |
+| Java       | `.java` |
+| C#         | `.cs` |
+| Ruby       | `.rb` `.rake` |
+| PHP        | `.php` |
+| C          | `.c` `.h` |
+| C++        | `.cpp` `.cc` `.cxx` `.hpp` `.hh` |
+| Scala      | `.scala` `.sc` |
+
+Each gets definitions, references and callers. Files outside the table are still
+reviewed — with their hunk, their test file when it is conventionally named, and
+your rule sets — just without caller context, so a changed signature is judged on
+its own rather than against the code that depends on it.
+
+Adding a language is one entry in the `LANGS` table in
+[`apps/tui-cli/src/graph/extract.rs`](apps/tui-cli/src/graph/extract.rs) —
+contributions welcome.
+
+---
+
 ## The gate
 
 ### GitHub Action
@@ -412,11 +451,9 @@ work to it.
 9. **Suppression** — inline directives, the baseline and `--min-confidence` are
    applied, then results are deduplicated and sorted.
 
-The **code graph** behind step 4 is a tree-sitter symbol index over 13
-languages — Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C#, Ruby, PHP,
-C, C++ and Scala — kept in `.diffmind/graph.db` and updated incrementally by
-mtime. Build it with `diffmind index`. Adding a language is one entry in a
-table; contributions welcome.
+The **code graph** behind step 4 is the tree-sitter symbol index from
+[Language support](#language-support), kept in `.diffmind/graph.db` and updated
+incrementally by mtime. Build it with `diffmind index`.
 
 ---
 
