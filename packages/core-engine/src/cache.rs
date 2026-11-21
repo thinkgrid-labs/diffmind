@@ -211,8 +211,24 @@ impl ReviewCache {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Drop the oldest entries once the cache exceeds `max_entries`.
+    /// Drop the oldest entries once the cache exceeds `max_entries`, and any
+    /// temporary file a crashed writer left behind more than an hour ago.
+    ///
+    /// "Oldest" is by write time; reads do not refresh it, so this evicts the
+    /// first-written rather than the least-recently-used entries.
     pub fn prune(&self, max_entries: usize) {
+        if let Ok(read) = std::fs::read_dir(&self.dir) {
+            let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            for e in read.flatten() {
+                let stale_tmp = e.file_name().to_string_lossy().contains(".tmp.")
+                    && e.metadata()
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t < hour_ago);
+                if stale_tmp {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         let Ok(read) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -513,6 +529,26 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .count();
         assert_eq!(stray, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_temporaries_orphaned_by_a_crash() {
+        let dir = tmp("orphans");
+        let cache = ReviewCache::open(&dir).unwrap();
+        let orphan = dir.join("cache").join(".abc.tmp.999.0");
+        std::fs::write(&orphan, b"half").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .unwrap();
+        let fresh = dir.join("cache").join(".def.tmp.999.1");
+        std::fs::write(&fresh, b"in flight").unwrap();
+        cache.prune(100);
+        assert!(!orphan.exists(), "an hour-old temporary is an orphan");
+        assert!(fresh.exists(), "a fresh one may belong to a live writer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

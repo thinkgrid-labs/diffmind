@@ -911,6 +911,20 @@ pub fn unit_grouper(project_root: &Path) -> core_engine::analyzer::UnitGrouper {
 }
 
 pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> String {
+    context_builder_with_notes(project_root, budget).0
+}
+
+/// Files whose context was withheld because the working tree is not the
+/// reviewed revision's post-image. Collected so the run can say so.
+pub type WithheldContext = Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
+/// [`context_builder`], also reporting which files had their context withheld.
+pub fn context_builder_with_notes(
+    project_root: &Path,
+    budget: usize,
+) -> (impl Fn(&str) -> String, WithheldContext) {
+    let withheld: WithheldContext = Default::default();
+    let notes = withheld.clone();
     let graph = Graph::open(project_root).ok().filter(|g| !g.is_empty());
     let root = project_root.to_path_buf();
     // Memoised on the chunk text, because the same chunk is asked about twice:
@@ -924,11 +938,22 @@ pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> S
     // failure this whole module exists to avoid. The keys are the unit texts,
     // which the caller is already holding.
     let memo: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
-    move |chunk: &str| {
+    let build = move |chunk: &str| {
         if let Ok(cache) = memo.lock()
             && let Some(hit) = cache.get(chunk)
         {
             return hit.clone();
+        }
+        if graph.is_some()
+            && let Some(path) = rag::worktree_mismatch(chunk, &root)
+        {
+            if let Ok(mut w) = notes.lock() {
+                w.insert(path);
+            }
+            if let Ok(mut cache) = memo.lock() {
+                cache.insert(chunk.to_string(), String::new());
+            }
+            return String::new();
         }
         let built = graph
             .as_ref()
@@ -938,7 +963,8 @@ pub fn context_builder(project_root: &Path, budget: usize) -> impl Fn(&str) -> S
             cache.insert(chunk.to_string(), built.clone());
         }
         built
-    }
+    };
+    (build, withheld)
 }
 
 fn load_baseline(project_root: &Path, enabled: bool) -> Option<Baseline> {
@@ -1041,7 +1067,7 @@ fn review(
         let backend = build_backend(&settings.backend, model_dir)?;
         let backend_label = backend.describe();
 
-        let context_for = context_builder(project_root, 8000);
+        let (context_for, withheld) = context_builder_with_notes(project_root, 8000);
         let mut analyzer = build_analyzer(
             backend,
             settings,
@@ -1054,6 +1080,18 @@ fn review(
         spinner.set_message("Analyzing diff...");
         let outcome = run_with_progress(&mut analyzer, diff, &context_for, settings, &spinner);
         spinner.finish_and_clear();
+        // Said once, after the run: a review with less context than usual
+        // should not look like the same review done worse.
+        if let Ok(w) = withheld.lock()
+            && !w.is_empty()
+        {
+            let first = w.iter().next().cloned().unwrap_or_default();
+            eprintln!(
+                "  ·  code context withheld for {} file(s) (e.g. {first}): the working tree is \
+                 not the revision being reviewed. Commit or stash local edits for full context.",
+                w.len()
+            );
+        }
         match outcome {
             Ok((summary, stats)) => (summary, stats, backend_label),
             // The backend failed part-way. Still emit the report — it carries

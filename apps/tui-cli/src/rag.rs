@@ -233,7 +233,7 @@ pub fn build_context(
 /// different revision of a file almost never has the same text at the same
 /// line numbers. Deleted files have no post-image and are skipped; a file the
 /// diff adds but the tree lacks is a mismatch.
-fn worktree_matches_diff(files: &[FileDiff], project_root: &Path) -> bool {
+fn first_worktree_mismatch(files: &[FileDiff], project_root: &Path) -> Option<String> {
     const SAMPLES_PER_FILE: usize = 3;
     for file in files {
         if file.is_deletion {
@@ -251,19 +251,31 @@ fn worktree_matches_diff(files: &[FileDiff], project_root: &Path) -> bool {
             continue;
         }
         let Some(text) = crate::graph::read_repo_file(project_root, &file.path) else {
-            return false;
+            return Some(file.path.clone());
         };
         let lines: Vec<&str> = text.lines().collect();
         for (n, expected) in samples {
             let Some(actual) = (n as usize).checked_sub(1).and_then(|i| lines.get(i)) else {
-                return false;
+                return Some(file.path.clone());
             };
             if actual.trim_end() != expected.trim_end() {
-                return false;
+                return Some(file.path.clone());
             }
         }
     }
-    true
+    None
+}
+
+fn worktree_matches_diff(files: &[FileDiff], project_root: &Path) -> bool {
+    first_worktree_mismatch(files, project_root).is_none()
+}
+
+/// The first file in `diff` whose working-tree content is not the diff's
+/// post-image, if any — the condition under which no context is given. Public
+/// so the CLI can tell the user context was withheld, and for which file,
+/// instead of leaving a thinner review unexplained.
+pub fn worktree_mismatch(diff: &str, project_root: &Path) -> Option<String> {
+    first_worktree_mismatch(&parse_diff(diff), project_root)
 }
 
 /// The test file for `path`, by convention, and its content. No graph needed —

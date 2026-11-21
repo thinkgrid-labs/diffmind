@@ -283,6 +283,49 @@ diff --git a/src/b.rs b/src/b.rs
     assert_ne!(spoofed.unit_id.as_deref(), Some("forged"));
 }
 
+/// Basename matching must not carry a finding across units: a finding the
+/// model makes about `src/b/mod.rs` while reviewing `src/a/mod.rs` (it saw b
+/// only as context, or was told to) is dropped, not attached to b.
+#[test]
+fn a_same_named_file_in_another_unit_cannot_receive_this_units_findings() {
+    let diff = "\
+diff --git a/src/a/mod.rs b/src/a/mod.rs
+--- a/src/a/mod.rs
++++ b/src/a/mod.rs
+@@ -1,2 +1,2 @@
+-let a = 1;
++let a = 2;
+diff --git a/src/b/mod.rs b/src/b/mod.rs
+--- a/src/b/mod.rs
++++ b/src/b/mod.rs
+@@ -1,2 +1,2 @@
+-let b = 1;
++let b = 2;
+";
+    let (b, _) = Scripted::new(vec![
+        Ok(r#"{"findings":[
+            {"file":"src/b/mod.rs","line":1,"severity":"high","category":"quality","issue":"cross-unit","suggested_fix":"f"},
+            {"file":"mod.rs","line":1,"severity":"low","category":"quality","issue":"bare basename","suggested_fix":"f"}
+        ]}"#
+        .into()),
+        clean(),
+    ]);
+    let (summary, _) = analyzer(b)
+        .analyze(diff, &|_| String::new(), 512, |_, _, _| {}, |_| {})
+        .unwrap();
+    assert!(
+        !summary.findings.iter().any(|f| f.issue == "cross-unit"),
+        "{:?}",
+        summary.findings
+    );
+    let bare = summary
+        .findings
+        .iter()
+        .find(|f| f.issue == "bare basename")
+        .expect("a bare basename within the unit is kept");
+    assert_eq!(bare.file, "src/a/mod.rs", "anchored to the unit's own file");
+}
+
 /// Terminal escape sequences and bidi overrides in model text would rewrite a
 /// reviewer's terminal or disguise text. They are stripped at parse time, so
 /// every output format gets the clean version.

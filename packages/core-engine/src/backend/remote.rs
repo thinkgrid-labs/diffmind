@@ -273,17 +273,19 @@ impl RemoteBackend {
     /// Text from the server, made safe to print: control characters removed,
     /// the API key masked if the server echoed it, and the length capped.
     fn sanitize_detail(&self, text: &str) -> String {
-        let mut out: String = text
-            .chars()
-            .filter(|c| !c.is_control() || *c == ' ')
-            .take(MAX_ERROR_DETAIL)
-            .collect();
+        // Redact before truncating: a key straddling the cut would otherwise
+        // survive as a prefix.
+        let mut redacted = text.to_string();
         if let Some(key) = &self.api_key
             && key.len() >= 4
         {
-            out = out.replace(key.as_str(), "<redacted>");
+            redacted = redacted.replace(key.as_str(), "<redacted>");
         }
-        out
+        redacted
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .take(MAX_ERROR_DETAIL)
+            .collect()
     }
 
     /// Read a response body without trusting its size.
@@ -293,12 +295,30 @@ impl RemoteBackend {
         response
             .take(MAX_RESPONSE_BYTES + 1)
             .read_to_end(&mut buf)
-            .map_err(|e| Attempt::Retry {
-                message: format!(
-                    "the connection to {} was interrupted: {e}",
-                    self.display_url
-                ),
-                after: None,
+            .map_err(|e| {
+                // The overall timeout can expire while the body is still
+                // arriving (headers sent, then a stall). That has already
+                // spent the whole budget, so — as for a timeout before the
+                // headers — it is not retried.
+                let timed_out = e.kind() == std::io::ErrorKind::TimedOut
+                    || e.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout);
+                if timed_out {
+                    Attempt::Fatal(format!(
+                        "timed out reading the response from {}. Raise --backend-timeout.",
+                        self.display_url
+                    ))
+                } else {
+                    Attempt::Retry {
+                        message: format!(
+                            "the connection to {} was interrupted: {}",
+                            self.display_url,
+                            self.sanitize_detail(&e.to_string())
+                        ),
+                        after: None,
+                    }
+                }
             })?;
         if buf.len() as u64 > MAX_RESPONSE_BYTES {
             return Err(Attempt::Fatal(format!(
@@ -608,12 +628,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// One scripted reply. `Close` drops the connection without answering;
-    /// `Stall` accepts and never answers.
+    /// `Stall` accepts and never answers; `StallBody` sends headers and part
+    /// of the body, then stalls.
     #[derive(Clone)]
     enum Reply {
         Http(u16, Vec<(&'static str, String)>, Vec<u8>),
         Close,
         Stall,
+        StallBody,
     }
 
     fn ok_ollama(content: &str) -> Reply {
@@ -647,6 +669,12 @@ mod tests {
                 match reply {
                     Reply::Close => drop(conn),
                     Reply::Stall => {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    Reply::StallBody => {
+                        let _ = conn.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"mess",
+                        );
                         std::thread::sleep(Duration::from_secs(5));
                     }
                     Reply::Http(code, headers, body) => {
@@ -786,6 +814,37 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_body_that_stalls_after_the_headers_times_out_without_retrying() {
+        let (url, hits) = stub(vec![Reply::StallBody]);
+        let mut b = live(&url, Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a timeout must not be retried"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_key_straddling_the_truncation_point_is_still_redacted() {
+        let key = "sk-0123456789abcdef";
+        let b = RemoteBackend::new(
+            RemoteProtocol::OpenAiCompatible,
+            "https://llm.example.invalid/v1",
+            "m",
+            Some(key.into()),
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let text = format!("{}{key}", "x".repeat(MAX_ERROR_DETAIL - 5));
+        assert!(!b.sanitize_detail(&text).contains("sk-01"));
     }
 
     #[test]

@@ -705,17 +705,26 @@ impl ReviewAnalyzer {
         // "about" one of those — or about another unit's file it has not seen
         // — is speculation, or the product of instructions planted in that
         // code. It is dropped and counted with the unanchorable ones.
-        if let Some(unit_files) = from.unit_files {
+        //
+        // The match is by path — exact, or on a whole path-component suffix —
+        // never by bare basename against another directory: `src/b/mod.rs`
+        // must not pass for a unit covering `src/a/mod.rs`. Surviving findings
+        // are then anchored against the unit's files only, so the diff-wide
+        // fallback matching cannot re-attach one to another unit's file.
+        let in_unit: Option<Vec<FileDiff>> = from
+            .unit_files
+            .map(|unit_files| {
+                files
+                    .iter()
+                    .filter(|f| unit_files.iter().any(|u| u == &f.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+        if let Some(scope) = &in_unit {
             let before = findings.len();
-            let in_unit: Vec<FileDiff> = files
-                .iter()
-                .filter(|f| unit_files.iter().any(|u| u == &f.path))
-                .cloned()
-                .collect();
-            if !in_unit.is_empty() {
-                findings.retain(|f| crate::diff::matches_any_file(&f.file, &in_unit));
-                stats.unanchorable += before - findings.len();
-            }
+            findings.retain(|f| names_a_unit_file(&f.file, scope));
+            stats.unanchorable += before - findings.len();
         }
         // Give model findings an explicit rule ID so they can be suppressed and
         // reported like any other, and record which unit produced them so a
@@ -756,7 +765,7 @@ impl ReviewAnalyzer {
         }
 
         let before_anchor = findings.len();
-        anchor_findings(&mut findings, files);
+        anchor_findings(&mut findings, in_unit.as_deref().unwrap_or(files));
         stats.unanchorable += before_anchor - findings.len();
 
         let before_conf = findings.len();
@@ -991,6 +1000,22 @@ impl ReviewAnalyzer {
             .saturating_sub(max_new_tokens + SYSTEM_PROMPT_TOKENS);
         (available * 3).clamp(4_000, 60_000)
     }
+}
+
+/// Whether a model-reported path names one of `scope`'s files: exactly, or by
+/// a suffix that starts at a path separator (`mod.rs` or `a/mod.rs` for
+/// `src/a/mod.rs`, never `b/mod.rs`). An empty path is accepted only when the
+/// unit has a single file.
+fn names_a_unit_file(reported: &str, scope: &[FileDiff]) -> bool {
+    let reported = reported.trim().trim_start_matches("./");
+    if reported.is_empty() {
+        return scope.len() == 1;
+    }
+    scope.iter().any(|f| {
+        f.path == reported
+            || f.path.ends_with(&format!("/{reported}"))
+            || reported.ends_with(&format!("/{}", f.path))
+    })
 }
 
 /// Rule sets governing any file in the unit. A merged unit spans more than one

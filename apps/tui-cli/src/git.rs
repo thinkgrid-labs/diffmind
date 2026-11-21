@@ -101,7 +101,11 @@ fn rev_exists(rev: &str) -> bool {
 }
 
 fn run_diff(range: Option<&str>, paths: &[String], cached: bool) -> Result<String> {
-    let mut args: Vec<String> = vec!["diff".into()];
+    // core.quotepath=false: non-ASCII paths come out as UTF-8 instead of git's
+    // octal-escaped quoted form (`"caf\303\251.rs"`), which the diff parser
+    // does not map back to the file — so context, anchoring and the generated
+    // check all missed it.
+    let mut args: Vec<String> = vec!["-c".into(), "core.quotepath=false".into(), "diff".into()];
     if cached {
         args.push("--cached".into());
     }

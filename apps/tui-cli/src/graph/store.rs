@@ -306,7 +306,14 @@ impl Graph {
             // it misses an edit that lands in the same timestamp tick, a file
             // restored with its original mtime (`cp -p`, `rsync -t`, `tar x`),
             // and a clock that steps backwards.
-            let bytes = std::fs::read(entry.path()).unwrap_or_default();
+            // A read can fail transiently — a sharing violation from an editor
+            // or virus scanner on Windows. Leave the row untouched so the next
+            // run retries: recording it would store this mtime and size beside
+            // an empty hash, and the fast path would then trust that forever
+            // on a platform with no ctime to notice otherwise.
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
             let hash = format!("{:x}", Sha256::digest(&bytes));
             stats.files_hashed += 1;
             if let Some((_, _, _, known_hash, _)) = &known
