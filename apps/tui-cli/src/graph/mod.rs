@@ -42,7 +42,17 @@ pub fn read_repo_file(project_root: &Path, relative: &str) -> Option<String> {
     }
     let root = project_root.canonicalize().ok()?;
     let full = root.join(rel).canonicalize().ok()?;
-    if !full.starts_with(&root) {
+    let inside = full.strip_prefix(&root).ok()?;
+    // Inside the root is not enough: `.git/` is the repository's metadata,
+    // not its files, and `.git/config` holds the checkout's credentials
+    // (actions/checkout persists the job token there). A committed
+    // `src/app.test.js -> ../.git/config` would otherwise be quoted into the
+    // prompt as "the test file". Case-insensitive for macOS and Windows.
+    if rel
+        .components()
+        .chain(inside.components())
+        .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))
+    {
         return None;
     }
     let meta = std::fs::metadata(&full).ok()?;
@@ -109,6 +119,38 @@ mod tests {
         std::os::unix::fs::symlink(r.join("src/real.ts"), r.join("src/alias.ts")).unwrap();
         assert_eq!(read_repo_file(&r, "src/alias.ts").as_deref(), Some("ok"));
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn repository_metadata_is_never_read() {
+        let r = root("gitdir");
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        std::fs::write(
+            r.join(".git/config"),
+            "[http]\n\textraheader = AUTHORIZATION: basic SECRET\n",
+        )
+        .unwrap();
+        assert!(read_repo_file(&r, ".git/config").is_none());
+        assert!(read_repo_file(&r, "./.git/config").is_none());
+        assert!(read_repo_file(&r, ".GIT/config").is_none());
+        // A file merely named like it elsewhere is still an ordinary file.
+        std::fs::write(r.join("src/.gitignore"), "target/").unwrap();
+        assert_eq!(
+            read_repo_file(&r, "src/.gitignore").as_deref(),
+            Some("target/")
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_repository_metadata_is_not_followed() {
+        let r = root("gitlink");
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        std::fs::write(r.join(".git/config"), "extraheader = SECRET").unwrap();
+        std::os::unix::fs::symlink("../.git/config", r.join("src/app.test.js")).unwrap();
+        assert!(read_repo_file(&r, "src/app.test.js").is_none());
         let _ = std::fs::remove_dir_all(&r);
     }
 
