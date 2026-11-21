@@ -22,7 +22,8 @@ pub mod types;
 pub mod unit;
 
 pub use analyzer::{
-    AnalysisStats, ReviewAnalyzer, TriageMode, parse_review_response, section_budget_bytes,
+    AnalysisStats, Completeness, ReviewAnalyzer, SkipReason, TriageMode, UnitSkip,
+    parse_review_response, section_budget_bytes,
 };
 pub use backend::{
     CandleBackend, DEFAULT_SEED, DevicePreference, GenOptions, RemoteBackend, RemoteProtocol,
@@ -31,11 +32,11 @@ pub use backend::{
 pub use cache::ReviewCache;
 pub use detectors::{detect_commented_out_code, detect_removed_used_variables};
 pub use diff::{FileDiff, anchor_findings, parse_diff};
-pub use error::EngineError;
+pub use error::{EngineError, PartialReview};
 pub use prefilter::{DropReason, PrefilterOptions, PrefilterReport, looks_generated, prefilter};
 pub use prompt::rulebooks_dropped;
 pub use rulebook::{DEFAULT_RULEBOOK, RULEBOOK_RULE_PREFIX, Rulebook};
-pub use sarif::to_sarif;
+pub use sarif::{attach_completeness, to_sarif};
 pub use suppression::{Baseline, InlineSuppressions};
 pub use types::{
     Category, CommitSuggestion, CustomRule, PrDescription, ReviewFinding, ReviewSummary, Severity,

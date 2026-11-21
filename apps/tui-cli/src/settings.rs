@@ -75,6 +75,21 @@ pub struct Settings {
     pub include_docs: bool,
     /// Refresh the code graph before reviewing.
     pub auto_index: bool,
+    /// Exit 2 when any unit went unreviewed. See [`require_complete_default`].
+    pub require_complete: bool,
+}
+
+/// `CI` is set by GitHub Actions, GitLab CI, CircleCI, Travis, Buildkite,
+/// Azure Pipelines and most others. In CI the result gates a merge, so an
+/// incomplete review must fail closed; at a developer's terminal it is a
+/// warning they can see and act on.
+fn require_complete_default() -> bool {
+    std::env::var("CI")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no")
+        })
+        .unwrap_or(false)
 }
 
 pub fn resolve_settings(cli: &Cli, file: &FileConfig) -> Result<Settings> {
@@ -144,6 +159,13 @@ pub fn resolve_settings(cli: &Cli, file: &FileConfig) -> Result<Settings> {
         use_baseline: !cli.no_baseline,
         use_daemon: !cli.no_daemon,
         debug: cli.debug,
+        require_complete: if cli.require_complete {
+            true
+        } else if cli.allow_incomplete {
+            false
+        } else {
+            resolve(None, r.require_complete, require_complete_default())
+        },
     })
 }
 
@@ -307,6 +329,30 @@ mod tests {
         .unwrap();
         assert_eq!(s.min_severity, Severity::Low);
         assert_eq!(s.fail_on, Severity::High);
+    }
+
+    #[test]
+    fn completeness_flags_override_the_config_file() {
+        let mut file = FileConfig::default();
+        file.review.require_complete = Some(false);
+        let s = resolve_settings(&cli(&["--require-complete"]), &file).unwrap();
+        assert!(
+            s.require_complete,
+            "a repository config must not relax the CLI gate"
+        );
+
+        file.review.require_complete = Some(true);
+        let s = resolve_settings(&cli(&["--allow-incomplete"]), &file).unwrap();
+        assert!(!s.require_complete);
+
+        let s = resolve_settings(&cli(&[]), &file).unwrap();
+        assert!(s.require_complete, "config applies when no flag is given");
+    }
+
+    #[test]
+    fn the_completeness_flags_are_mutually_exclusive() {
+        let r = Cli::try_parse_from(["diffmind", "--require-complete", "--allow-incomplete"]);
+        assert!(r.is_err());
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub struct ReviewConfig {
     /// Refresh the code graph before each review. On by default — a stale graph
     /// reports wrong line ranges, not merely missing ones.
     pub auto_index: Option<bool>,
+    /// Treat a review that skipped any unit as a failure (exit 2). Defaults to
+    /// on in CI (the `CI` environment variable is set) and off elsewhere.
+    ///
+    /// The CLI flags `--require-complete` / `--allow-incomplete` override this,
+    /// which is how the GitHub Action keeps a pull request from relaxing it.
+    pub require_complete: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

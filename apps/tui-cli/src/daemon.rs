@@ -186,6 +186,14 @@ pub struct SerializableStats {
     pub suppressed: usize,
     pub below_confidence: usize,
     pub unanchorable: usize,
+    /// Completeness, added in 0.9.3. `read_info` refuses a daemon from another
+    /// build, so these defaults only ever apply to a hand-written request.
+    #[serde(default)]
+    pub units_failed: usize,
+    #[serde(default)]
+    pub backend_error: Option<String>,
+    #[serde(default)]
+    pub skipped: Vec<core_engine::UnitSkip>,
 }
 
 impl From<&AnalysisStats> for SerializableStats {
@@ -203,6 +211,9 @@ impl From<&AnalysisStats> for SerializableStats {
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
             unanchorable: s.unanchorable,
+            units_failed: s.units_failed,
+            backend_error: s.backend_error.clone(),
+            skipped: s.skipped.clone(),
         }
     }
 }
@@ -222,6 +233,9 @@ impl From<SerializableStats> for AnalysisStats {
             suppressed: s.suppressed,
             below_confidence: s.below_confidence,
             unanchorable: s.unanchorable,
+            units_failed: s.units_failed,
+            backend_error: s.backend_error,
+            skipped: s.skipped,
         }
     }
 }
@@ -1202,6 +1216,50 @@ mod tests {
             "sampling must reach the daemon, or --seed silently does nothing"
         );
 
+        client.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A partial review must cross the wire as one: if `backend_error` or the
+    /// skip list were dropped, a daemon-served review whose backend failed
+    /// would arrive looking complete and exit 0.
+    #[test]
+    fn completeness_survives_the_wire() {
+        let server = Server::bind(0, Duration::from_secs(30)).unwrap();
+        let port = server.port().unwrap();
+        let token = server.token().to_string();
+        let handle = std::thread::spawn(move || {
+            server
+                .run(|_| {
+                    let stats = AnalysisStats {
+                        units_total: 3,
+                        units_unparseable: 1,
+                        units_failed: 1,
+                        backend_error: Some("HTTP 503".into()),
+                        skipped: vec![core_engine::UnitSkip {
+                            unit_id: "u1".into(),
+                            files: vec!["a.rs".into()],
+                            reason: core_engine::SkipReason::BackendFailed,
+                            detail: "HTTP 503".into(),
+                        }],
+                        ..Default::default()
+                    };
+                    Response::Ok(Box::new(ReviewResponse {
+                        summary: ReviewSummary::default(),
+                        stats: (&stats).into(),
+                        backend: "test".into(),
+                    }))
+                })
+                .unwrap();
+        });
+        let client = Client {
+            info: info(port, &token),
+        };
+        let stats: AnalysisStats = client.review(sample_request()).unwrap().stats.into();
+        assert!(!stats.is_complete());
+        assert_eq!(stats.backend_error.as_deref(), Some("HTTP 503"));
+        assert_eq!(stats.units_skipped(), 2);
+        assert_eq!(stats.skipped.len(), 1);
         client.shutdown().unwrap();
         handle.join().unwrap();
     }

@@ -5,6 +5,7 @@ use crate::cache::{CacheKeyInput, ReviewCache};
 use crate::detectors;
 use crate::diff::{FileDiff, LineKind, anchor_findings, parse_diff};
 use crate::error::EngineError;
+use crate::error::PartialReview;
 use crate::json_guard::extract_json;
 use crate::prompt::{
     PROMPT_VERSION, Prompt, ReviewPromptInput, commit_message_prompt, pr_description_prompt,
@@ -79,6 +80,73 @@ impl TriageMode {
     }
 }
 
+/// Why a review unit was not reviewed by the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The model answered, but not with anything parseable as a review.
+    Unparseable,
+    /// No amount of splitting fit the unit in the context window.
+    TooLarge,
+    /// The backend failed before or while reviewing it.
+    BackendFailed,
+}
+
+impl SkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::Unparseable => "unparseable",
+            SkipReason::TooLarge => "too_large",
+            SkipReason::BackendFailed => "backend_failed",
+        }
+    }
+}
+
+/// One unit the model did not review, and why.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnitSkip {
+    pub unit_id: String,
+    pub files: Vec<String>,
+    pub reason: SkipReason,
+    pub detail: String,
+}
+
+/// Whether a review covered everything it set out to, in the shape the
+/// machine-readable outputs report it.
+///
+/// Four states, deliberately kept apart because a CI gate must treat them
+/// differently: *complete* with or without blocking findings (the exit code
+/// says which), *incomplete* (some units were never reviewed, so "no
+/// findings" proves nothing about them), and *failed* (the backend broke).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Completeness {
+    /// `complete`, `incomplete`, or `failed`.
+    pub status: String,
+    pub units_planned: usize,
+    pub units_reviewed: usize,
+    pub units_cached: usize,
+    pub units_skipped: usize,
+    pub skipped_unparseable: usize,
+    pub skipped_too_large: usize,
+    pub skipped_backend_failed: usize,
+    /// Files the triage pass chose not to send for deep review. A policy
+    /// decision rather than a failure, so it does not make a review incomplete,
+    /// but it is reported because "reviewed" should never be read as "every
+    /// file was looked at" when it was not.
+    pub files_skipped_by_triage: usize,
+    /// The deterministic detectors run before any inference and cannot be
+    /// skipped; this is true whenever a report exists.
+    pub deterministic_checks_completed: bool,
+    /// Whether the run was configured to require a complete review.
+    pub required: bool,
+    /// True only for a complete review. A gate result from an incomplete or
+    /// failed review says nothing about the units that were not reviewed.
+    pub trustworthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_error: Option<String>,
+    pub skipped: Vec<UnitSkip>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AnalysisStats {
     pub units_total: usize,
@@ -88,6 +156,13 @@ pub struct AnalysisStats {
     /// Units skipped because no amount of splitting fit them in the window.
     /// Distinct from `units_unparseable`: the model was never asked.
     pub units_too_large: usize,
+    /// Units never reviewed because the backend failed — the one that failed
+    /// and every one after it. Non-zero only alongside `backend_error`.
+    pub units_failed: usize,
+    /// The backend failure that stopped the review, if one did.
+    pub backend_error: Option<String>,
+    /// Every unit counted in the three fields above, with its reason.
+    pub skipped: Vec<UnitSkip>,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -105,6 +180,47 @@ pub struct AnalysisStats {
 }
 
 impl AnalysisStats {
+    /// Units the model did not review, for any reason.
+    pub fn units_skipped(&self) -> usize {
+        self.units_unparseable + self.units_too_large + self.units_failed
+    }
+
+    /// Units with a review result, fresh or cached.
+    pub fn units_reviewed(&self) -> usize {
+        self.units_total.saturating_sub(self.units_skipped())
+    }
+
+    /// Every planned unit was reviewed and the backend never failed.
+    pub fn is_complete(&self) -> bool {
+        self.units_skipped() == 0 && self.backend_error.is_none()
+    }
+
+    pub fn completeness(&self, required: bool) -> Completeness {
+        let status = if self.backend_error.is_some() {
+            "failed"
+        } else if self.is_complete() {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        Completeness {
+            status: status.to_string(),
+            units_planned: self.units_total,
+            units_reviewed: self.units_reviewed(),
+            units_cached: self.units_cached,
+            units_skipped: self.units_skipped(),
+            skipped_unparseable: self.units_unparseable,
+            skipped_too_large: self.units_too_large,
+            skipped_backend_failed: self.units_failed,
+            files_skipped_by_triage: self.files_skipped_by_triage,
+            deterministic_checks_completed: true,
+            required,
+            trustworthy: self.is_complete(),
+            backend_error: self.backend_error.clone(),
+            skipped: self.skipped.clone(),
+        }
+    }
+
     pub fn total_tokens(&self) -> usize {
         self.prompt_tokens + self.completion_tokens
     }
@@ -473,7 +589,25 @@ impl ReviewAnalyzer {
         // changes only the order work is done in.
         units.sort_by_key(|u| rulebook::group_key(&applicable_to_unit(&rulebooks, u)));
 
+        let mut backend_failure: Option<String> = None;
         for (i, unit) in units.iter().enumerate() {
+            let skip = |reason: SkipReason, detail: String| UnitSkip {
+                unit_id: unit.id.clone(),
+                files: unit.files.clone(),
+                reason,
+                detail,
+            };
+
+            // Once the backend has failed, asking it again for every remaining
+            // unit only multiplies timeouts. Record them as not reviewed.
+            if let Some(why) = &backend_failure {
+                stats.units_failed += 1;
+                stats
+                    .skipped
+                    .push(skip(SkipReason::BackendFailed, why.clone()));
+                continue;
+            }
+
             on_progress(i + 1, units.len(), unit);
             let books = applicable_to_unit(&rulebooks, unit);
 
@@ -506,6 +640,7 @@ impl ReviewAnalyzer {
                         eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file());
                     }
                     stats.units_unparseable += 1;
+                    stats.skipped.push(skip(SkipReason::Unparseable, e));
                 }
                 // Counted and skipped, not fatal. A hunk nobody can fit in the
                 // window is a fact about that hunk; failing the run over it
@@ -516,8 +651,22 @@ impl ReviewAnalyzer {
                         eprintln!("[debug] unit {} ({}) skipped: {why}", i + 1, unit.file());
                     }
                     stats.units_too_large += 1;
+                    stats.skipped.push(skip(SkipReason::TooLarge, why));
                 }
-                Err(e) => return Err(e),
+                // Anything else is the backend itself failing. This used to
+                // return immediately, discarding every finding gathered so far
+                // — the deterministic ones included — and leaving CI with a
+                // bare error and no report. Now the remaining units are marked
+                // not reviewed and the partial result travels inside the error,
+                // so `?` still fails the run while a caller can still report it.
+                Err(e) => {
+                    let why = e.to_string();
+                    stats.units_failed += 1;
+                    stats
+                        .skipped
+                        .push(skip(SkipReason::BackendFailed, why.clone()));
+                    backend_failure = Some(why);
+                }
             }
         }
 
@@ -529,6 +678,13 @@ impl ReviewAnalyzer {
         stats.completion_tokens = self.metering.completion_tokens;
         stats.tokens_estimated = self.metering.estimated;
 
+        if let Some(why) = backend_failure {
+            stats.backend_error = Some(why);
+            return Err(EngineError::Incomplete(Box::new(PartialReview {
+                summary,
+                stats,
+            })));
+        }
         Ok((summary, stats))
     }
 

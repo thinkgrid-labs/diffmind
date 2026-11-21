@@ -465,7 +465,8 @@ fn analyze(
         &stats,
         &prefilter,
     );
-    let rendered = crate::output::markdown(&summary, &stats, &backend_label);
+    let rendered =
+        crate::output::markdown(&summary, &stats, &backend_label, settings.require_complete);
     let _ = runs::save(&project_root, &record, &rendered);
 
     let _ = tx.send(Msg::Done(Box::new(stats)));

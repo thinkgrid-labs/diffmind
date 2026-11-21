@@ -362,6 +362,8 @@ fn clone_args_for_subcommand(
         debug: args.debug,
         no_cache: args.no_cache,
         no_daemon: args.no_daemon,
+        require_complete: args.require_complete,
+        allow_incomplete: args.allow_incomplete,
         ..Default::default()
     }
 }
@@ -1039,10 +1041,19 @@ fn review(
         );
 
         spinner.set_message("Analyzing diff...");
-        let (summary, stats) =
-            run_with_progress(&mut analyzer, diff, &context_for, settings, &spinner)?;
+        let outcome = run_with_progress(&mut analyzer, diff, &context_for, settings, &spinner);
         spinner.finish_and_clear();
-        (summary, stats, backend_label)
+        match outcome {
+            Ok((summary, stats)) => (summary, stats, backend_label),
+            // The backend failed part-way. Still emit the report — it carries
+            // the deterministic findings, everything reviewed before the
+            // failure, and the completeness record that says what was not —
+            // then exit 2 below.
+            Err(core_engine::EngineError::Incomplete(partial)) => {
+                (partial.summary, partial.stats, backend_label)
+            }
+            Err(e) => return Err(anyhow::anyhow!("{e}")),
+        }
     };
 
     // Report at --min-severity; gate at --fail-on.
@@ -1064,7 +1075,20 @@ fn review(
 
     if is_text {
         output::print_positives_and_suggestions(&filtered.positives, &filtered.suggestions);
-        output::print_footer(shown.len(), gated, &stats);
+        output::print_footer(shown.len(), gated, &stats, settings.require_complete);
+    } else if !stats.is_complete() {
+        // Machine-readable output owns stdout; the warning still has to reach
+        // a human reading the CI log.
+        eprintln!(
+            "  !  review incomplete: {} of {} unit(s) not reviewed{}",
+            stats.units_skipped(),
+            stats.units_total,
+            stats
+                .backend_error
+                .as_deref()
+                .map(|e| format!(" — backend failed: {e}"))
+                .unwrap_or_default()
+        );
     }
     emit(settings, &filtered, &stats, &backend_label)?;
 
@@ -1078,12 +1102,31 @@ fn review(
         &stats,
         prefilter,
     );
-    let rendered = output::markdown(&filtered, &stats, &backend_label);
+    let rendered = output::markdown(&filtered, &stats, &backend_label, settings.require_complete);
     if let Err(e) = runs::save(project_root, &record, &rendered) {
         eprintln!("  !  could not record this run: {e}");
     }
 
-    Ok(if gated > 0 { EXIT_FINDINGS } else { 0 })
+    Ok(exit_code(&stats, gated, settings.require_complete))
+}
+
+/// The exit-code contract, in one place.
+///
+/// - **2** when the backend failed part-way — always, whatever the gate
+///   settings, because before 0.9.3 that was a hard error and it must not
+///   become a pass now that a partial report is written first; and when units
+///   went unreviewed and the run requires a complete review.
+/// - **1** when the review is complete (or incompleteness is allowed) and
+///   findings reached `--fail-on`.
+/// - **0** otherwise.
+fn exit_code(stats: &AnalysisStats, gated: usize, require_complete: bool) -> i32 {
+    if stats.backend_error.is_some() || (require_complete && !stats.is_complete()) {
+        EXIT_ERROR
+    } else if gated > 0 {
+        EXIT_FINDINGS
+    } else {
+        0
+    }
 }
 
 /// Drive the analyzer with a live spinner and streamed findings.
@@ -1093,7 +1136,7 @@ fn run_with_progress(
     context_for: &dyn Fn(&str) -> String,
     settings: &Settings,
     spinner: &ProgressBar,
-) -> Result<(ReviewSummary, AnalysisStats)> {
+) -> Result<(ReviewSummary, AnalysisStats), core_engine::EngineError> {
     // The model blocks the calling thread, so a background ticker keeps the
     // elapsed time honest during a long single-chunk inference.
     let label = Arc::new(std::sync::Mutex::new(String::from("unit 1/1")));
@@ -1153,7 +1196,7 @@ fn run_with_progress(
     );
 
     done.store(true, Ordering::Relaxed);
-    result.map_err(|e| anyhow::anyhow!("{e}"))
+    result
 }
 
 fn print_header(
@@ -1265,12 +1308,13 @@ fn emit(
         return Ok(());
     }
 
+    let required = settings.require_complete;
     let rendered = if settings.format == OutputFormat::Text {
         // `--output report.md` with the default format still deserves a
         // readable document rather than an empty file.
-        output::render(OutputFormat::Markdown, summary, stats, model)
+        output::render(OutputFormat::Markdown, summary, stats, model, required)
     } else {
-        output::render(settings.format, summary, stats, model)
+        output::render(settings.format, summary, stats, model, required)
     };
 
     match &settings.output_path {
@@ -1510,9 +1554,21 @@ fn run_baseline(
             );
 
             let spinner = make_spinner("Analyzing...", false);
-            let (summary, _) =
-                run_with_progress(&mut analyzer, &diff, &context_for, &settings, &spinner)?;
+            let (summary, stats) =
+                run_with_progress(&mut analyzer, &diff, &context_for, &settings, &spinner)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             spinner.finish_and_clear();
+            if !stats.is_complete() {
+                // A baseline accepts what it records, so one built from a
+                // partial review under-records: later runs will report the
+                // skipped units' findings as new. Safe, but worth saying.
+                eprintln!(
+                    "  !  {} of {} unit(s) could not be reviewed; their findings are not in \
+                     this baseline and will be reported as new.",
+                    stats.units_skipped(),
+                    stats.units_total
+                );
+            }
 
             let baseline =
                 Baseline::from_findings(&summary.findings, chrono::Utc::now().to_rfc3339());
@@ -1686,6 +1742,16 @@ fn run_serve(
                 stats: (&stats).into(),
                 backend: backend_label,
             })),
+            // A partial review travels as a normal response: its stats carry
+            // `backend_error`, which the client turns into exit 2 after
+            // writing the report — exactly as the in-process path does.
+            Err(core_engine::EngineError::Incomplete(partial)) => {
+                daemon::Response::Ok(Box::new(daemon::ReviewResponse {
+                    summary: partial.summary,
+                    stats: (&partial.stats).into(),
+                    backend: backend_label,
+                }))
+            }
             Err(e) => daemon::Response::Error {
                 message: e.to_string(),
             },
@@ -1695,4 +1761,99 @@ fn run_serve(
     daemon::clear_info(home);
     result?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(total: usize) -> AnalysisStats {
+        AnalysisStats {
+            units_total: total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_complete_review_exits_by_the_gate() {
+        assert_eq!(exit_code(&stats(3), 0, true), 0);
+        assert_eq!(exit_code(&stats(3), 2, true), EXIT_FINDINGS);
+    }
+
+    /// The defect this guards: before 0.9.3 a unit that came back unparseable
+    /// was counted and then ignored, so a review that saw nothing still exited
+    /// 0 — "no findings" from a review that did not happen.
+    #[test]
+    fn an_incomplete_review_fails_when_completeness_is_required() {
+        let mut s = stats(3);
+        s.units_unparseable = 1;
+        assert_eq!(exit_code(&s, 0, true), EXIT_ERROR);
+        assert_eq!(
+            exit_code(&s, 5, true),
+            EXIT_ERROR,
+            "not trustworthy either way"
+        );
+
+        let mut s = stats(3);
+        s.units_too_large = 1;
+        assert_eq!(exit_code(&s, 0, true), EXIT_ERROR);
+    }
+
+    #[test]
+    fn an_incomplete_review_is_judged_by_the_gate_when_allowed() {
+        let mut s = stats(3);
+        s.units_unparseable = 1;
+        assert_eq!(exit_code(&s, 0, false), 0);
+        assert_eq!(exit_code(&s, 1, false), EXIT_FINDINGS);
+    }
+
+    /// A backend failure was always exit 2. Writing a partial report first
+    /// must not turn it into a pass, even where incompleteness is allowed.
+    #[test]
+    fn a_backend_failure_always_exits_2() {
+        let mut s = stats(3);
+        s.units_failed = 2;
+        s.backend_error = Some("could not connect".into());
+        assert_eq!(exit_code(&s, 0, false), EXIT_ERROR);
+        assert_eq!(exit_code(&s, 0, true), EXIT_ERROR);
+        assert_eq!(exit_code(&s, 3, false), EXIT_ERROR);
+    }
+
+    fn tmp_home(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("diffmind-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_cache_secret_is_created_once_private_and_stable() {
+        let home = tmp_home("secret");
+        let a = cache_secret(&home).expect("created on first use");
+        let b = cache_secret(&home).expect("read back");
+        assert_eq!(a, b, "the secret must persist, or the cache never hits");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.join(".diffmind/cache-secret"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "cache secret must be owner-only");
+        }
+        let other = tmp_home("secret-other");
+        assert_ne!(a, cache_secret(&other).unwrap(), "secrets are per user");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_corrupt_cache_secret_is_replaced_not_trusted() {
+        let home = tmp_home("secret-corrupt");
+        std::fs::create_dir_all(home.join(".diffmind")).unwrap();
+        std::fs::write(home.join(".diffmind/cache-secret"), "not hex").unwrap();
+        let s = cache_secret(&home).expect("a fresh secret");
+        assert_eq!(cache_secret(&home), Some(s));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
