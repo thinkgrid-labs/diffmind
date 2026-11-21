@@ -172,8 +172,10 @@ runs:
       with:
         script: |
           const fs = require('fs');
-          // From the environment, not `${{ }}`: an expression inside this
-          // script would be pasted into the JavaScript source.
+          // From the environment, not an inline expression: one inside this
+          // script would be pasted into the JavaScript source. (Never write
+          // the expression syntax here, even in a comment: GitHub evaluates
+          // it anywhere in a `with:` value, and an empty one fails the load.)
           const path = process.env.DM_OUTPUT;
           if (!path || !fs.existsSync(path)) return;
           // GitHub rejects comment bodies over 65,536 characters; a large
