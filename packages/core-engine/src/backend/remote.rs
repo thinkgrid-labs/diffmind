@@ -855,11 +855,17 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let mut b = live(&format!("http://127.0.0.1:{port}"), Duration::from_secs(5));
+        // What must hold is that a refused connection fails well before the
+        // request timeout, not after MAX_ATTEMPTS × timeout. A refusal is
+        // immediate on Linux and macOS, but Windows retries a SYN answered
+        // with RST, so each connect to a closed loopback port takes ~2 s and
+        // the three attempts ~6 s. A hang would take 3 × CONNECT_TIMEOUT.
+        let mut b = live(&format!("http://127.0.0.1:{port}"), Duration::from_secs(30));
         let started = std::time::Instant::now();
         let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
         assert!(err.contains("could not connect"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
     }
 
     #[test]
