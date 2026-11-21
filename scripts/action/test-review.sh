@@ -39,6 +39,7 @@ cat >"$STUB_DIR/diffmind" <<'STUB'
 if [ "${1:-}" = "--help" ]; then
   if [ "${STUB_SUPPORTS_REQUIRE_COMPLETE:-1}" = "1" ]; then
     echo "      --require-complete   Fail (exit 2) when part of the diff was not reviewed"
+    echo "      --allow-incomplete   Report unreviewed units without failing"
   fi
   if [ "${STUB_SUPPORTS_BACKEND:-1}" = "1" ]; then
     echo "      --backend <KIND>     Inference backend"
@@ -331,10 +332,27 @@ else
 fi
 reset_records
 run_review "$WORK" GITHUB_BASE_REF=main DM_ALLOW_INCOMPLETE=true
-if ! argv_has --require-complete; then
-  pass "allow-incomplete: true omits --require-complete"
+# Omitting --require-complete is not enough: diffmind requires a complete
+# review whenever CI is set, so the input must pass --allow-incomplete.
+if argv_has --allow-incomplete && ! argv_has --require-complete; then
+  pass "allow-incomplete: true passes --allow-incomplete"
 else
-  failed "allow-incomplete: true omits --require-complete"
+  failed "allow-incomplete: true passes --allow-incomplete"
+fi
+reset_records
+run_review "$WORK" GITHUB_BASE_REF=main "DM_ARGS=--require-complete"
+if [ "$(grep -cxF -- --require-complete "$SANDBOX/last.argv")" -eq 1 ] && ! argv_has --allow-incomplete; then
+  pass "a completeness flag chosen in args is respected and not duplicated"
+else
+  failed "a completeness flag chosen in args is respected and not duplicated"
+fi
+reset_records
+run_review "$WORK" GITHUB_BASE_REF=main DM_ALLOW_INCOMPLETE=true STUB_SUPPORTS_REQUIRE_COMPLETE=0
+st=$?
+if [ "$st" -eq 0 ] && ! argv_has --allow-incomplete; then
+  pass "allow-incomplete: true does not hand an older binary --allow-incomplete"
+else
+  failed "allow-incomplete: true does not hand an older binary --allow-incomplete" "exit $st"
 fi
 reset_records
 run_review "$WORK" GITHUB_BASE_REF=main STUB_SUPPORTS_REQUIRE_COMPLETE=0

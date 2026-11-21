@@ -172,9 +172,17 @@ if ! has_extra_flag --backend && supports_flag --backend; then
   ARGS+=(--backend local)
 fi
 
-# A CI gate must fail closed when part of the diff was never reviewed. The flag
-# is new in v0.9.3, so only pass it to a binary that understands it.
-if [ "${DM_ALLOW_INCOMPLETE:-false}" != "true" ] && ! has_extra_flag --allow-incomplete; then
+# A CI gate must fail closed when part of the diff was never reviewed. The flags
+# are new in v0.9.3, so only pass them to a binary that understands them.
+# `allow-incomplete: true` has to say so explicitly: diffmind requires a
+# complete review whenever CI is set, so leaving the flag out is not enough.
+if has_extra_flag --allow-incomplete || has_extra_flag --require-complete; then
+  : # the workflow chose in `args`
+elif [ "${DM_ALLOW_INCOMPLETE:-false}" = "true" ]; then
+  if supports_flag --allow-incomplete; then
+    ARGS+=(--allow-incomplete)
+  fi
+else
   if supports_flag --require-complete; then
     ARGS+=(--require-complete)
   else
