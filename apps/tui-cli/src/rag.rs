@@ -42,6 +42,19 @@ pub fn build_context(
     max_bytes: usize,
 ) -> Option<String> {
     let files = parse_diff(diff);
+
+    // Everything below reads the working tree and the graph built from it.
+    // That is only evidence about *this* diff if the working tree is the
+    // diff's post-image — true for the default branch review and for CI's
+    // `git diff base...HEAD`, but not for `--range a..b` while another commit
+    // is checked out, `--staged` with unstaged edits on top, or a `--stdin`
+    // diff of some other revision. Then the enclosing "function" for a line is
+    // whatever happens to sit at that line number now. Confidently wrong
+    // context is worse than none, so a mismatch means no context at all.
+    if !worktree_matches_diff(&files, project_root) {
+        return None;
+    }
+
     let mut out = String::new();
     let mut included: HashSet<(String, u32)> = HashSet::new();
 
@@ -94,6 +107,18 @@ pub fn build_context(
     // 2. Blast radius. Who depends on what just changed.
     let mut caller_count = 0;
     'callers: for symbol in &changed_symbols {
+        // Callers are found by name. When several definitions share the name
+        // the graph cannot tell which one a reference means, and saying
+        // "caller of" would present a guess as a dependency.
+        let namesakes = graph.definition_count(&symbol.name);
+        let relation = if namesakes > 1 {
+            format!(
+                "Possible caller of `{}` (matched by name; {namesakes} definitions share it)",
+                symbol.name
+            )
+        } else {
+            format!("Caller of `{}`", symbol.name)
+        };
         for caller in graph.callers_of(&symbol.name, MAX_CALLERS_PER_SYMBOL) {
             if caller_count >= MAX_CALLERS_TOTAL {
                 break 'callers;
@@ -105,8 +130,8 @@ pub fn build_context(
                 continue;
             };
             let entry = format!(
-                "\n--- Caller of `{}`: {} `{}` ({}:{}) ---\n{body}\n",
-                symbol.name, caller.kind, caller.name, caller.path, caller.start_line
+                "\n--- {relation}: {} `{}` ({}:{}) ---\n{body}\n",
+                caller.kind, caller.name, caller.path, caller.start_line
             );
             if out.len() + entry.len() > max_bytes {
                 break 'callers;
@@ -145,12 +170,21 @@ pub fn build_context(
         };
         // A definition in the file the name was seen in is far likelier to be
         // the referent than a same-named symbol elsewhere.
-        let Some(def) = defs
-            .iter()
-            .find(|d| &d.path == seen_in)
-            .or_else(|| defs.first())
-        else {
+        let local = defs.iter().find(|d| &d.path == seen_in);
+        let Some(def) = local.or_else(|| defs.first()) else {
             continue;
+        };
+        // Same rule as callers: a lone definition, or one in the file that
+        // uses the name, is a resolution; first-of-several is a guess and is
+        // labelled as one.
+        let label = if local.is_none() && defs.len() > 1 {
+            format!(
+                "Possible definition of `{}` (one of {} with this name)",
+                def.name,
+                defs.len()
+            )
+        } else {
+            format!("Definition of `{}`", def.name)
         };
         if !included.insert((def.path.clone(), def.start_line)) {
             continue;
@@ -159,8 +193,8 @@ pub fn build_context(
             continue;
         };
         let entry = format!(
-            "\n--- Definition of `{}` ({}:{}) ---\n{body}\n",
-            def.name, def.path, def.start_line
+            "\n--- {label} ({}:{}) ---\n{body}\n",
+            def.path, def.start_line
         );
         if out.len() + entry.len() > max_bytes {
             break;
@@ -171,10 +205,7 @@ pub fn build_context(
 
     // 4. The test file, which says what the code is *supposed* to do.
     for file in &files {
-        let Some(test) = test_file_for(&file.path, project_root) else {
-            continue;
-        };
-        let Ok(body) = std::fs::read_to_string(project_root.join(&test)) else {
+        let Some((test, body)) = test_file_for(&file.path, project_root) else {
             continue;
         };
         let head: String = body
@@ -194,9 +225,52 @@ pub fn build_context(
     (!out.trim().is_empty()).then_some(out)
 }
 
-/// The test file for `path`, by convention. No graph needed — conventions are
-/// how humans find tests, and they are right often enough to be worth 20 lines.
-fn test_file_for(path: &str, project_root: &Path) -> Option<String> {
+/// Whether the working tree holds the post-image of every file in `files`.
+///
+/// Checked by sampling: the first few added lines of each file must appear at
+/// the line numbers the diff gives them. Cheap — at most a handful of files are
+/// read, and only when a diff is being reviewed — and decisive, because a
+/// different revision of a file almost never has the same text at the same
+/// line numbers. Deleted files have no post-image and are skipped; a file the
+/// diff adds but the tree lacks is a mismatch.
+fn worktree_matches_diff(files: &[FileDiff], project_root: &Path) -> bool {
+    const SAMPLES_PER_FILE: usize = 3;
+    for file in files {
+        if file.is_deletion {
+            continue;
+        }
+        let samples: Vec<(u32, &str)> = file
+            .hunks
+            .iter()
+            .flat_map(|h| h.added())
+            .filter_map(|l| l.new_line.map(|n| (n, l.text.as_str())))
+            .filter(|(_, t)| !t.trim().is_empty())
+            .take(SAMPLES_PER_FILE)
+            .collect();
+        if samples.is_empty() {
+            continue;
+        }
+        let Some(text) = crate::graph::read_repo_file(project_root, &file.path) else {
+            return false;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, expected) in samples {
+            let Some(actual) = (n as usize).checked_sub(1).and_then(|i| lines.get(i)) else {
+                return false;
+            };
+            if actual.trim_end() != expected.trim_end() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The test file for `path`, by convention, and its content. No graph needed —
+/// conventions are how humans find tests, and they are right often enough to
+/// be worth 20 lines. Read through [`crate::graph::read_repo_file`], so a
+/// "test file" that is a symlink out of the repository is never quoted.
+fn test_file_for(path: &str, project_root: &Path) -> Option<(String, String)> {
     let (dir, file) = match path.rsplit_once('/') {
         Some((d, f)) => (d.to_string(), f.to_string()),
         None => (String::new(), path.to_string()),
@@ -222,9 +296,10 @@ fn test_file_for(path: &str, project_root: &Path) -> Option<String> {
         joined(&dir, &format!("test_{stem}.{ext}")),
         format!("tests/{stem}.{ext}"),
     ];
-    candidates
-        .into_iter()
-        .find(|c| project_root.join(c).is_file())
+    candidates.into_iter().find_map(|c| {
+        let body = crate::graph::read_repo_file(project_root, &c)?;
+        Some((c, body))
+    })
 }
 
 /// Candidate symbol names from the added lines, in order of first appearance,
@@ -291,7 +366,8 @@ mod tests {
         write(
             &root,
             "src/auth.rs",
-            "pub fn validate_token(t: &str) -> bool {\n    !t.is_empty()\n}\n",
+            // The working tree is the diff's post-image, as in a real review.
+            "pub fn validate_token(t: &str) -> Result<(), Error> {\n    !t.is_empty()\n}\n",
         );
         write(
             &root,
@@ -329,7 +405,7 @@ diff --git a/src/auth.rs b/src/auth.rs
         write(
             &root,
             "src/glob.rs",
-            "const A: u32 = 1;\nconst B: u32 = 2;\n\npub fn matches(p: &str) -> bool {\n    !p.is_empty()\n}\n",
+            "const A: u32 = 1;\nconst B: u32 = 2;\n\npub fn matches(p: &str, strict: bool) -> bool {\n    !p.is_empty()\n}\n",
         );
         write(
             &root,
@@ -366,7 +442,7 @@ diff --git a/src/glob.rs b/src/glob.rs
         write(
             &root,
             "src/math.ts",
-            "export function add(a, b) { return a + b; }\n",
+            "export function add(a, b) { return a - b; }\n",
         );
         write(
             &root,
@@ -403,7 +479,7 @@ diff --git a/src/math.ts b/src/math.ts
         let graph = indexed(&root);
 
         let diff =
-            "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -2,1 +2,1 @@\n+    let x = 2;\n";
+            "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -2,1 +2,1 @@\n+    let x = 1;\n";
         let ctx = build_context(diff, &graph, &root, 200);
         assert!(ctx.as_deref().map(str::len).unwrap_or(0) <= 400);
         let _ = std::fs::remove_dir_all(&root);
@@ -434,7 +510,7 @@ diff --git a/src/math.ts b/src/math.ts
         write(
             &root,
             "src/z.rs",
-            "pub fn shared_helper() {\n    let from_z = 2;\n}\n",
+            "pub fn caller() { shared_helper(); }\npub fn shared_helper() {\n    let from_z = 2;\n}\n",
         );
         let graph = indexed(&root);
 
@@ -468,12 +544,17 @@ diff --git a/src/z.rs b/src/z.rs
             "src/lib.rs",
             "pub fn real_target() {\n    let m = 1;\n}\n",
         );
-        let graph = indexed(&root);
-
         // Plenty of noise words before the one symbol that matters.
         let noise: String = (0..40)
             .map(|i| format!("+    let unknown_word_{i} = {i};\n"))
             .collect();
+        let post_image: String = noise
+            .lines()
+            .map(|l| format!("{}\n", &l[1..]))
+            .chain(std::iter::once("    real_target();\n".to_string()))
+            .collect();
+        write(&root, "src/use.rs", &post_image);
+        let graph = indexed(&root);
         let diff = format!(
             "diff --git a/src/use.rs b/src/use.rs\n+++ b/src/use.rs\n@@ -1,50 +1,50 @@\n{noise}+    real_target();\n"
         );
@@ -511,6 +592,116 @@ diff --git a/src/a.rs b/src/a.rs
             1,
             "duplicated context wastes the budget:\n{ctx}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The working tree is the only source of context, so it must be the
+    /// diff's post-image. Reviewing `--range a..b` with another commit checked
+    /// out used to hand the model whatever now sits at those line numbers,
+    /// labelled as the enclosing function.
+    #[test]
+    fn no_context_is_given_when_the_working_tree_is_not_the_diffs_post_image() {
+        let root = project("stale-tree");
+        write(
+            &root,
+            "src/auth.rs",
+            "pub fn unrelated_now() {\n    let other = 1;\n}\n",
+        );
+        let graph = indexed(&root);
+        let diff = "\
+diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,3 +1,3 @@
++pub fn validate_token(t: &str) -> bool {
+";
+        assert!(
+            build_context(diff, &graph, &root, 8000).is_none(),
+            "mismatched working tree must yield no context"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edit, re-index, re-assemble: context follows the edit rather than
+    /// serving the previous version's body.
+    #[test]
+    fn context_follows_an_edit_and_a_branch_switch() {
+        let root = project("fresh");
+        write(&root, "src/a.rs", "pub fn f() {\n    let version = 1;\n}\n");
+        let mut graph = Graph::open(&root).unwrap();
+        graph.index(&root, &|_| {}).unwrap();
+        let diff_v1 = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -2,1 +2,1 @@\n+    let version = 1;\n";
+        let ctx = build_context(diff_v1, &graph, &root, 8000).unwrap();
+        assert!(ctx.contains("version = 1"));
+
+        // "Switch branch": same path, different content and shape. No sleep —
+        // the rewrite may land in the same mtime tick.
+        write(
+            &root,
+            "src/a.rs",
+            "// header\n// header\npub fn g() {\n    let version = 2;\n}\n",
+        );
+        graph.index(&root, &|_| {}).unwrap();
+        let diff_v2 = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -4,1 +4,1 @@\n+    let version = 2;\n";
+        let ctx = build_context(diff_v2, &graph, &root, 8000).unwrap();
+        assert!(ctx.contains("Enclosing function `g`"), "{ctx}");
+        assert!(!ctx.contains("version = 1"), "stale body served:\n{ctx}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two functions share a name; the graph cannot tell which one a call
+    /// means, so the relationship must be presented as a guess.
+    #[test]
+    fn a_name_shared_by_several_definitions_is_labelled_as_uncertain() {
+        let root = project("namesakes");
+        write(&root, "src/a.rs", "pub fn parse(x: u8) -> u8 {\n    x\n}\n");
+        write(
+            &root,
+            "src/b.rs",
+            "pub fn parse(s: &str) -> u8 {\n    0\n}\n",
+        );
+        write(&root, "src/c.rs", "pub fn run() -> u8 {\n    parse(1)\n}\n");
+        let graph = indexed(&root);
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n+pub fn parse(x: u8) -> u8 {\n";
+        let ctx = build_context(diff, &graph, &root, 8000).unwrap();
+        assert!(ctx.contains("Possible caller of `parse`"), "{ctx}");
+        assert!(!ctx.contains("--- Caller of `parse`"), "{ctx}");
+
+        // And a referenced name defined twice elsewhere, not locally.
+        write(&root, "src/d.rs", "pub fn go() {\n    parse(2);\n}\n");
+        let graph = indexed(&root);
+        let diff =
+            "diff --git a/src/d.rs b/src/d.rs\n+++ b/src/d.rs\n@@ -2,1 +2,1 @@\n+    parse(2);\n";
+        let ctx = build_context(diff, &graph, &root, 8000).unwrap();
+        assert!(
+            ctx.contains("Possible definition of `parse` (one of 2"),
+            "{ctx}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_test_file_symlinked_out_of_the_repository_is_never_quoted() {
+        let root = project("symlinked-test");
+        write(
+            &root,
+            "src/auth.ts",
+            "export function check() { return 1; }\n",
+        );
+        let secret = root
+            .parent()
+            .unwrap()
+            .join(format!("diffmind-rag-secret-{}", std::process::id()));
+        std::fs::write(&secret, "AWS_SECRET_ACCESS_KEY=do-not-leak").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("src/auth.test.ts")).unwrap();
+        let graph = indexed(&root);
+        let diff = "diff --git a/src/auth.ts b/src/auth.ts\n+++ b/src/auth.ts\n@@ -1,1 +1,1 @@\n+export function check() { return 1; }\n";
+        let ctx = build_context(diff, &graph, &root, 8000).unwrap_or_default();
+        assert!(
+            !ctx.contains("do-not-leak"),
+            "out-of-repo file quoted:\n{ctx}"
+        );
+        let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
