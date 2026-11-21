@@ -62,6 +62,14 @@ pub trait ReviewBackend: Send {
     /// Usable context window in tokens.
     fn context_tokens(&self) -> usize;
 
+    /// Everything about this backend that can change what it answers, for the
+    /// review cache. Defaults to [`Self::describe`]; backends that know more —
+    /// the exact weights file, a server-reported model digest — say so, so a
+    /// changed model can never replay another model's findings.
+    fn cache_identity(&self) -> String {
+        self.describe()
+    }
+
     /// Exact token count when the backend owns a tokenizer, else `None`.
     fn count_tokens(&self, _text: &str) -> Option<usize> {
         None
