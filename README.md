@@ -89,8 +89,12 @@ output is also neutralised before it reaches a terminal or a PR comment. None
 of that makes prompt injection impossible, and it is one more reason the
 deterministic tier is the one to block on. Configuration is the same: a pull
 request can edit `.diffmind/` like any other file. The GitHub Action reviews
-PRs under the base branch's configuration; in other CI, review changes there
-as you would review changes to CI.
+pull requests under the base branch's configuration. On events with no base
+branch (`merge_group`, `push`) it uses the checkout's own unless you set
+`base`; there, and in other CI, review changes to `.diffmind/` as you would
+review changes to CI. Generated-file markers are not covered either:
+a PR can mark a file `linguist-generated` in `.gitattributes`, or give it an
+`@generated` banner, and that file is not reviewed at all.
 
 ---
 
@@ -247,9 +251,10 @@ the PR's merge base is reachable, and fails the job (exit 2) rather than review
 an empty diff if it cannot. It requires a complete review — a unit the model
 could not answer for fails the job — unless you set `allow-incomplete: true`.
 It reviews a pull request under the base branch's `.diffmind/` configuration
-(`config-from: head` to use the PR's), and pins the bundled local model,
-because the PR's own config files are part of the code under review; choose a
-backend with `args` if you run your own.
+(`config-from: head` to use the PR's; on events with no base branch, such as
+`merge_group`, the checkout's own unless `base` is set), and pins the bundled
+local model, because the PR's own config files are part of the code under
+review; choose a backend with `args` if you run your own.
 
 ### Any other CI
 

@@ -33,13 +33,24 @@ whole diff can no longer pass as a clean one.**
 - **GitHub Action: pull requests are reviewed under the base branch's
   `.diffmind/` configuration.** `config.toml`, `rules.toml`, `rules/` and
   `baseline.json` are restored from the merge base before the review, so a PR
-  cannot relax the gate that reviews it (`ignore = ["**"]`, `min_confidence =
-  1.0` or a baseline listing its own findings all used to pass). Changes to
-  those files are still reviewed and take effect once merged; set
-  `config-from: head` for the old behaviour. The local backend is also pinned
-  unless `args` chooses one. `args` is now split like a quoted shell string
-  but never evaluated; an `args` value that relied on shell expansion no
-  longer expands.
+  cannot relax the gate that reviews it through those files (`ignore =
+  ["**"]`, `min_confidence = 1.0` or a baseline listing its own findings all
+  used to pass). Changes to those files are still reviewed and take effect
+  once merged; set `config-from: head` for the old behaviour. This needs a
+  base branch: on `merge_group`, `push` and other events without one, the
+  checkout's own `.diffmind/` still governs unless the `base` input is set.
+  It also does not cover the generated-file filter: a PR that marks a file
+  `linguist-generated` in `.gitattributes`, or gives it an `@generated`
+  banner, still drops that file from review, deterministic checks included.
+  The local backend is also pinned unless `args` chooses one. `args` is now
+  split like a quoted shell string but never evaluated; an `args` value that
+  relied on shell expansion no longer expands. The action requires a complete
+  review; set `allow-incomplete: true` to let an incomplete one pass.
+- **Local-model reviews take about 10–15 % longer on CPU.** The
+  prompt-injection boundary (see Security) adds roughly a quarter more prompt
+  text per unit. On a GitHub-hosted Linux x86_64 runner, a two-unit review
+  with the bundled 1.5B model went from 232 s to 259 s (+11.8 %, median of
+  3). Peak memory is unchanged.
 - **The npm wrapper exits 2, not 1, when it cannot run the binary** (missing
   platform package, unsupported platform, spawn failure). 1 means "blocking
   findings".
