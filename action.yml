@@ -59,8 +59,10 @@ inputs:
       Which revision's .diffmind/ configuration (config.toml, rules.toml,
       rules/, baseline.json) a pull request is reviewed under. "base" (the
       default) uses the merge base, so a PR cannot relax the gate that reviews
-      it; changes to those files are still reviewed and take effect once
-      merged. "head" uses the PR's own files.
+      it through those files; changes to them are still reviewed and take
+      effect once merged. "head" uses the PR's own files. On events with no
+      base branch (merge_group, push), the checkout's own files are used
+      unless the `base` input is set.
     required: false
     default: "base"
   allow-incomplete:
