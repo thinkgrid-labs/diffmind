@@ -400,6 +400,20 @@ else
   failed "--backend is only passed to a binary that supports it"
 fi
 
+# 16. action.yml only uses expressions as plain `key: value` mappings. GitHub
+# evaluates `${{` anywhere in a value, including inside a script's comments;
+# an empty one there made the whole action fail to load, and an expression in
+# a `run:` or `script:` body is pasted into source (the injection this action
+# avoids). YAML `#` comments are not evaluated, so they are allowed.
+bad_expr="$(grep -n '\${{' "$HERE/../../action.yml" |
+  grep -vE '^[0-9]+:[[:space:]]*#' |
+  grep -vE '^[0-9]+:[[:space:]]*[A-Za-z_-]+:[[:space:]]+[^[:space:]]*\$\{\{ [^}]*[^[:space:]}][^}]* \}\}' || true)"
+if [ -z "$bad_expr" ]; then
+  pass "action.yml has expressions only in key: value mappings"
+else
+  failed "action.yml has expressions only in key: value mappings" "$bad_expr"
+fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
