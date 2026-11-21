@@ -25,9 +25,14 @@ const RELEASES = "https://github.com/thinkgrid-labs/diffmind/releases";
 const INSTALL_SH =
   "curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash";
 
+// Exit 2 is diffmind's "could not run" code. This used to be 1, which the CLI
+// reserves for "the review found blocking issues" — so a missing platform
+// package in CI read as a review verdict rather than a broken install.
+const EXIT_ERROR = 2;
+
 function fail(lines) {
   console.error("\ndiffmind: " + lines.join("\ndiffmind: ") + "\n");
-  process.exit(1);
+  process.exit(EXIT_ERROR);
 }
 
 // The published Linux binaries are glibc-linked (the release matrix has no musl
@@ -126,7 +131,7 @@ function main() {
     return;
   }
 
-  process.exit(result.status === null ? 1 : result.status);
+  process.exit(result.status === null ? EXIT_ERROR : result.status);
 }
 
 main();
