@@ -132,8 +132,16 @@ has_extra_flag() {
   return 1
 }
 
+# Read --help once, into a variable. Piping it straight into `grep -q` races
+# under pipefail: grep exits at the first match, diffmind's next write to the
+# closed pipe fails, and the pipeline reports "not supported", which silently
+# dropped --backend local or --require-complete.
+unset DM_HELP_TEXT
 supports_flag() {
-  "$DIFFMIND_BIN" --help 2>/dev/null | grep -q -- "$1"
+  if [ -z "${DM_HELP_TEXT+set}" ]; then
+    DM_HELP_TEXT="$("$DIFFMIND_BIN" --help 2>/dev/null)"
+  fi
+  grep -qF -- "$1" <<<"$DM_HELP_TEXT"
 }
 
 ARGS=(
