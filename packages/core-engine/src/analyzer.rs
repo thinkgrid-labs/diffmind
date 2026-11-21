@@ -490,6 +490,7 @@ impl ReviewAnalyzer {
                         &mut emitted,
                         Attribution {
                             unit_id: Some(&unit.id),
+                            unit_files: Some(&unit.files),
                             rulebooks: &books,
                         },
                     );
@@ -542,6 +543,24 @@ impl ReviewAnalyzer {
         from: Attribution<'_>,
     ) -> Vec<ReviewFinding> {
         let (unit_id, rulebooks) = (from.unit_id, from.rulebooks);
+
+        // A model finding must be about the unit the model was shown. The
+        // prompt also carries surrounding code from other files, and a finding
+        // "about" one of those — or about another unit's file it has not seen
+        // — is speculation, or the product of instructions planted in that
+        // code. It is dropped and counted with the unanchorable ones.
+        if let Some(unit_files) = from.unit_files {
+            let before = findings.len();
+            let in_unit: Vec<FileDiff> = files
+                .iter()
+                .filter(|f| unit_files.iter().any(|u| u == &f.path))
+                .cloned()
+                .collect();
+            if !in_unit.is_empty() {
+                findings.retain(|f| crate::diff::matches_any_file(&f.file, &in_unit));
+                stats.unanchorable += before - findings.len();
+            }
+        }
         // Give model findings an explicit rule ID so they can be suppressed and
         // reported like any other, and record which unit produced them so a
         // reader can be shown the hunk the model was actually looking at.
@@ -840,6 +859,8 @@ fn applicable_to_unit<'a>(
 /// travel together and are meaningless apart.
 struct Attribution<'a> {
     unit_id: Option<&'a str>,
+    /// The files the unit covers; model findings outside them are rejected.
+    unit_files: Option<&'a [String]>,
     rulebooks: &'a [&'a Rulebook],
 }
 
@@ -848,6 +869,7 @@ impl Attribution<'_> {
     fn none() -> Self {
         Attribution {
             unit_id: None,
+            unit_files: None,
             rulebooks: &[],
         }
     }
@@ -973,6 +995,72 @@ fn split_in_half(chunk: &str) -> (String, String) {
 /// findings array. Uses the string-aware extractor so a `}` inside an `issue`
 /// no longer truncates the object.
 pub fn parse_review_response(response: &str) -> Result<ReviewSummary, EngineError> {
+    let mut summary = parse_review_response_raw(response)?;
+    sanitize_model_output(&mut summary);
+    Ok(summary)
+}
+
+/// Most findings one unit may contribute. A unit is a few hundred lines; past
+/// this the model is enumerating, not reviewing, and the output is better
+/// treated as noise than shipped to a PR.
+const MAX_FINDINGS_PER_UNIT: usize = 50;
+const MAX_NOTES_PER_UNIT: usize = 10;
+const MAX_ISSUE_CHARS: usize = 2_000;
+const MAX_FIX_CHARS: usize = 4_000;
+const MAX_NOTE_CHARS: usize = 500;
+const MAX_PATH_CHARS: usize = 512;
+
+/// Model output is untrusted text derived from untrusted input. Before it
+/// reaches a terminal, a SARIF file or a PR comment it is stripped of control
+/// characters — an ANSI escape in an `issue` would otherwise rewrite the
+/// reviewer's terminal — and bounded in size and count.
+fn sanitize_model_output(summary: &mut ReviewSummary) {
+    summary.findings.truncate(MAX_FINDINGS_PER_UNIT);
+    for f in &mut summary.findings {
+        f.file = clean_text(&f.file, MAX_PATH_CHARS, false);
+        f.issue = clean_text(&f.issue, MAX_ISSUE_CHARS, true);
+        f.suggested_fix = clean_text(&f.suggested_fix, MAX_FIX_CHARS, true);
+        if let Some(rule) = &f.rule {
+            f.rule = Some(clean_text(rule, 128, false));
+        }
+        // Only the engine assigns these; a model-supplied value would let the
+        // output claim a deterministic rule id or another unit's provenance.
+        f.rule_id = None;
+        f.unit_id = None;
+        if let Some(c) = f.confidence
+            && !c.is_finite()
+        {
+            f.confidence = None;
+        }
+    }
+    for list in [&mut summary.positives, &mut summary.suggestions] {
+        list.truncate(MAX_NOTES_PER_UNIT);
+        for item in list.iter_mut() {
+            *item = clean_text(item, MAX_NOTE_CHARS, false);
+        }
+        list.retain(|i| !i.trim().is_empty());
+    }
+}
+
+/// Drop control characters (keeping newlines and tabs only where allowed) and
+/// cap the length in characters, never splitting one.
+fn clean_text(s: &str, max_chars: usize, keep_newlines: bool) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control() || (keep_newlines && (*c == '\n' || *c == '\t')))
+        // Bidirectional overrides can make text read differently from what it
+        // is (CVE-2021-42574); there is no legitimate use for them here.
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+fn parse_review_response_raw(response: &str) -> Result<ReviewSummary, EngineError> {
     let Some(json) = extract_json(response) else {
         // A model that produced no JSON at all found nothing worth reporting
         // often enough that erroring here would be noisier than it is worth,
