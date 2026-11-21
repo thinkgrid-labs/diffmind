@@ -40,8 +40,14 @@ if [ "${1:-}" = "--help" ]; then
   if [ "${STUB_SUPPORTS_REQUIRE_COMPLETE:-1}" = "1" ]; then
     echo "      --require-complete   Fail (exit 2) when part of the diff was not reviewed"
   fi
+  if [ "${STUB_SUPPORTS_BACKEND:-1}" = "1" ]; then
+    echo "      --backend <KIND>     Inference backend"
+  fi
   exit 0
 fi
+# Record the configuration diffmind would load from the working tree.
+cat .diffmind/config.toml >"$STUB_LOG.config" 2>/dev/null || : >"$STUB_LOG.config"
+if [ -e .diffmind/baseline.json ]; then echo present >"$STUB_LOG.baseline"; fi
 : >"$STUB_LOG.argv"
 for a in "$@"; do printf '%s\n' "$a" >>"$STUB_LOG.argv"; done
 case " $* " in
@@ -75,6 +81,8 @@ git init -q "$SEED"
 (
   cd "$SEED"
   printf 'fn base() {}\n' >base.rs
+  mkdir -p .diffmind
+  printf '[review]\nfail_on = "high"\n' >.diffmind/config.toml
   printf 'old\n' >to_delete.txt
   printf 'keep\n' >to_rename.txt
   git add . && git commit -qm "base"
@@ -88,6 +96,9 @@ git init -q "$SEED"
 
   git checkout -qb "feature/ünïcode-branch"
   printf 'fn pr_change() { unsafe_thing(); }\n' >pr.rs
+  # The PR also tries to switch its own gate off.
+  printf '[review]\nignore = ["**"]\nmin_confidence = 1.0\n' >.diffmind/config.toml
+  printf '{"entries":[]}\n' >.diffmind/baseline.json
   git rm -q to_delete.txt
   git mv to_rename.txt renamed.txt
   git add . && git commit -qm "pr change"
@@ -349,6 +360,44 @@ if [ "$(output_of findings)" = "0" ] && grep -q 'could not count findings' "$SAN
   pass "an unreadable report is flagged rather than silently counted as zero"
 else
   failed "an unreadable report is flagged rather than silently counted as zero"
+fi
+
+# 14. The PR is reviewed under the base's .diffmind/ configuration, so it
+#     cannot relax the gate reviewing it; its config edits are still in the diff.
+reset_records
+checkout_pr "$WORK"
+run_review "$WORK" GITHUB_BASE_REF=main
+if grep -q 'fail_on = "high"' "$SANDBOX/last.config" 2>/dev/null && ! grep -q 'ignore' "$SANDBOX/last.config" \
+  && [ ! -f "$SANDBOX/last.baseline" ] && grep -q '^+ignore = \["\*\*"\]' "$SANDBOX/last.stdin"; then
+  pass "PR config edits are reviewed but do not govern the PR's own review"
+else
+  failed "PR config edits are reviewed but do not govern the PR's own review" \
+    "config: $(tr '\n' ' ' <"$SANDBOX/last.config" 2>/dev/null)"
+fi
+reset_records
+checkout_pr "$WORK"
+run_review "$WORK" GITHUB_BASE_REF=main DM_CONFIG_FROM=head
+if grep -q 'ignore' "$SANDBOX/last.config" 2>/dev/null && [ -f "$SANDBOX/last.baseline" ]; then
+  pass "config-from: head uses the PR's own configuration"
+else
+  failed "config-from: head uses the PR's own configuration"
+fi
+reset_records
+run_review "$WORK" GITHUB_BASE_REF=main DM_CONFIG_FROM=elsewhere
+if [ $? -eq 2 ] && [ ! -f "$SANDBOX/last.argv" ]; then
+  pass "an invalid config-from is rejected"
+else
+  failed "an invalid config-from is rejected"
+fi
+
+# 15. A binary without --backend (older than v0.7.1) is not handed it.
+reset_records
+checkout_pr "$WORK"
+run_review "$WORK" GITHUB_BASE_REF=main STUB_SUPPORTS_BACKEND=0
+if [ -f "$SANDBOX/last.argv" ] && ! argv_has --backend; then
+  pass "--backend is only passed to a binary that supports it"
+else
+  failed "--backend is only passed to a binary that supports it"
 fi
 
 echo

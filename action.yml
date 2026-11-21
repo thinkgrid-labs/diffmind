@@ -54,6 +54,15 @@ inputs:
       substitution or globbing.
     required: false
     default: ""
+  config-from:
+    description: >-
+      Which revision's .diffmind/ configuration (config.toml, rules.toml,
+      rules/, baseline.json) a pull request is reviewed under. "base" (the
+      default) uses the merge base, so a PR cannot relax the gate that reviews
+      it; changes to those files are still reviewed and take effect once
+      merged. "head" uses the PR's own files.
+    required: false
+    default: "base"
   allow-incomplete:
     description: >-
       Let the job pass when part of the diff could not be reviewed (a unit the
@@ -131,6 +140,7 @@ runs:
         DM_TICKET: ${{ inputs.ticket }}
         DM_ARGS: ${{ inputs.args }}
         DM_ALLOW_INCOMPLETE: ${{ inputs.allow-incomplete }}
+        DM_CONFIG_FROM: ${{ inputs.config-from }}
       run: bash "$GITHUB_ACTION_PATH/scripts/action/review.sh"
 
     # `always()` so a failing gate still publishes the annotations that explain

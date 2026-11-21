@@ -15,7 +15,7 @@
 #
 # Inputs (all optional unless noted):
 #   DM_MODEL DM_BASE DM_MIN_SEVERITY DM_FAIL_ON DM_FORMAT DM_OUTPUT DM_TICKET
-#   DM_ARGS DM_ALLOW_INCOMPLETE
+#   DM_ARGS DM_ALLOW_INCOMPLETE DM_CONFIG_FROM (base | head, default base)
 #   GITHUB_BASE_REF GITHUB_OUTPUT GITHUB_EVENT_NAME RUNNER_TEMP
 #   DIFFMIND_BIN  binary to run (default: diffmind); tests point it at a stub
 
@@ -70,6 +70,11 @@ esac
 case "$FAIL_ON" in
   low | medium | high | none) ;;
   *) fail "invalid fail-on (expected low, medium, high or none)" ;;
+esac
+CONFIG_FROM="${DM_CONFIG_FROM:-base}"
+case "$CONFIG_FROM" in
+  base | head) ;;
+  *) fail "invalid config-from (expected base or head)" ;;
 esac
 case "$FORMAT" in
   text | json | sarif | markdown) ;;
@@ -153,8 +158,9 @@ fi
 # its own server (receiving the code and context, and answering "no findings")
 # and name any environment variable as the API key. The action downloads and
 # runs the local model, so pin it unless the workflow author — who is trusted —
-# chose a backend in `args`.
-if ! has_extra_flag --backend; then
+# chose a backend in `args`. Binaries older than v0.7.1 have neither the flag
+# nor a [backend] section to pin.
+if ! has_extra_flag --backend && supports_flag --backend; then
   ARGS+=(--backend local)
 fi
 
@@ -223,12 +229,32 @@ STATUS=0
 if [ -n "$BASE" ]; then
   MB="$(merge_base_for "$BASE")" || fail "could not determine what this change is relative to '$BASE'"
   DIFF_FILE="$(mktemp "$TMP_ROOT/diffmind-diff.XXXXXX")" || fail "could not create a temp file"
-  if ! git diff --no-ext-diff --no-color --no-textconv "$MB" HEAD >"$DIFF_FILE"; then
+  # core.quotepath=false: non-ASCII paths as UTF-8, not git's octal-escaped
+  # quoted form, which diffmind's parser would not map back to the file.
+  if ! git -c core.quotepath=false diff --no-ext-diff --no-color --no-textconv "$MB" HEAD >"$DIFF_FILE"; then
     rm -f "$DIFF_FILE"
     fail "git diff failed; the review did not run"
   fi
   if [ ! -s "$DIFF_FILE" ]; then
     notice "no changes between $MB and HEAD — nothing to review"
+  fi
+  # Review the pull request under the configuration it is merging into, not
+  # the configuration it proposes. Everything under .diffmind/ that shapes the
+  # gate — ignore globs, min_confidence, fail_on, rule sets, the baseline — is
+  # a file the PR author can edit, so `ignore = ["**"]` or a baseline listing
+  # the new findings would otherwise switch the gate off for that very PR.
+  # Changes to these files are still part of the diff and still reviewed; they
+  # take effect once merged. `config-from: head` restores the old behaviour.
+  if [ "$CONFIG_FROM" = "base" ]; then
+    for p in .diffmind/config.toml .diffmind/rules.toml .diffmind/baseline.json .diffmind/rules; do
+      rm -rf -- "$p"
+      if git cat-file -e "$MB:$p" 2>/dev/null; then
+        if ! git checkout -q "$MB" -- "$p"; then
+          rm -f "$DIFF_FILE"
+          fail "could not restore $p from the merge base"
+        fi
+      fi
+    done
   fi
   "$DIFFMIND_BIN" --stdin "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} <"$DIFF_FILE"
   STATUS=$?
