@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: ["**"]
 
+# Nothing in CI writes to the repository or its security tab.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -66,6 +70,25 @@ jobs:
       # CLI's tests ever ran in CI. --all-targets covers lib, bin and tests.
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+  # ─── GitHub Action ─────────────────────────────────────────────────────────
+  # The action's review step is a script so it can be tested against real git
+  # repositories (shallow PR checkouts, missing bases, adversarial inputs) with
+  # a stub in place of the diffmind binary. No model download, no network.
+  action:
+    name: Action (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the action's review step
+        run: bash scripts/action/test-review.sh
 
   # ─── Build check (all platforms) ───────────────────────────────────────────
   build:
