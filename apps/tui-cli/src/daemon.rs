@@ -367,6 +367,56 @@ fn tokens_match(a: &str, b: &str) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+// ─── Handshake ───────────────────────────────────────────────────────────────
+//
+// The token authenticates the client to the server. Nothing authenticated the
+// server to the client: after a daemon crash its `daemon.json` survives, and
+// another local user listening on that loopback port would have been handed
+// the token, the full diff, the rule sets and the project path — and could
+// answer "no findings". So every connection starts with a challenge the
+// client checks *before* it sends anything secret:
+//
+//   client → {"hello": <32 random bytes, hex>}
+//   server → {"proof": HMAC-SHA256(token, DOMAIN || nonce), hex}
+//   client → Envelope { token, request }      (only if the proof verifies)
+//   server → Response
+
+const HANDSHAKE_DOMAIN: &[u8] = b"diffmind-daemon-server-proof-v1";
+
+/// Largest handshake line either side reads. A nonce or a proof is 64 hex
+/// characters plus JSON framing.
+const MAX_HANDSHAKE_BYTES: usize = 1024;
+
+#[derive(Serialize, Deserialize)]
+struct Hello {
+    hello: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Proof {
+    proof: String,
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The proof that the holder of `token` saw `nonce`. `None` if either is not
+/// well-formed, which the caller treats as a failed handshake.
+fn server_proof(token: &str, nonce: &str) -> Option<String> {
+    let key = decode_hex32(token)?;
+    let nonce = decode_hex32(nonce)?;
+    let mac = core_engine::cache::hmac_sha256(&key, &[HANDSHAKE_DOMAIN, &nonce]);
+    Some(crate::secure_fs::hex(&mac))
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 /// Envelope every client sends: the token plus the request.
@@ -470,6 +520,33 @@ impl Server {
         // Bounded in size and in total time *before* authentication, because
         // until the token is checked the peer is anyone on the machine.
         let deadline = Instant::now() + self.request_deadline;
+
+        // Prove the server's identity first; see the handshake notes above.
+        // The hello is capped at 1 KiB, so this is also where an oversized or
+        // stalled unauthenticated peer is turned away.
+        let refuse = |stream: &mut TcpStream, message: String| {
+            let _ = send(stream, &Response::Error { message });
+        };
+        let proof = match recv_line(&stream, MAX_HANDSHAKE_BYTES, Some(deadline)) {
+            Err(e) => {
+                refuse(&mut stream, format!("request refused: {e}"));
+                return false;
+            }
+            Ok(line) => match serde_json::from_slice::<Hello>(&line)
+                .ok()
+                .and_then(|h| server_proof(&self.token, &h.hello))
+            {
+                Some(p) => p,
+                None => {
+                    refuse(&mut stream, "malformed request".into());
+                    return false;
+                }
+            },
+        };
+        if send(&mut stream, &Proof { proof }).is_err() {
+            return false;
+        }
+
         let envelope: Envelope = match recv_line(&stream, MAX_REQUEST_BYTES, Some(deadline)) {
             Ok(line) => match serde_json::from_slice(&line) {
                 Ok(e) => e,
@@ -568,12 +645,40 @@ impl Client {
 
     fn call(&self, request: Request) -> Result<Response> {
         let mut stream = self.open()?;
+        self.authenticate_server(&mut stream)?;
         let envelope = Envelope {
             token: self.info.token.clone(),
             request,
         };
         send(&mut stream, &envelope)?;
         recv(&stream, MAX_RESPONSE_BYTES)
+    }
+
+    /// Check that whoever is listening knows the token, without revealing it.
+    fn authenticate_server(&self, stream: &mut TcpStream) -> Result<()> {
+        let nonce: [u8; 32] = crate::secure_fs::os_random()?;
+        let nonce = crate::secure_fs::hex(&nonce);
+        send(
+            stream,
+            &Hello {
+                hello: nonce.clone(),
+            },
+        )?;
+        // The connection's read timeout still applies: a daemon busy with a
+        // review answers the handshake when it reaches this connection, so a
+        // second client queues behind the first as it always has.
+        let reply: Proof = recv(stream, MAX_HANDSHAKE_BYTES)
+            .context("the daemon did not complete the handshake")?;
+        let expected = server_proof(&self.info.token, &nonce)
+            .context("the daemon token in daemon.json is malformed")?;
+        if !tokens_match(&reply.proof, &expected) {
+            anyhow::bail!(
+                "the process listening on 127.0.0.1:{} failed authentication; not sending it \
+                 anything (a stale daemon.json?)",
+                self.info.port
+            );
+        }
+        Ok(())
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -963,7 +1068,7 @@ mod tests {
             info: info(port_b, &token_a),
         };
         let err = stale.review(sample_request()).unwrap_err();
-        assert!(err.to_string().contains("invalid token"));
+        assert!(err.to_string().contains("failed authentication"), "{err}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         Client {
             info: info(port_b, &token_b),
@@ -971,6 +1076,66 @@ mod tests {
         .shutdown()
         .unwrap();
         handle_b.join().unwrap();
+    }
+
+    /// After a crash, daemon.json survives. Another local user listening on
+    /// that port must not receive the token or the diff: the client checks
+    /// the server's proof first, and an impostor cannot produce one.
+    #[test]
+    fn an_impostor_on_the_daemon_port_never_receives_the_token_or_the_diff() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let seen = received.clone();
+        let impostor = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_millis(800)))
+                .unwrap();
+            // Read the hello, answer with a made-up proof, then keep listening
+            // for anything else the client might send.
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = conn.read(&mut buf) {
+                seen.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+            let _ = conn.write_all(format!("{{\"proof\":\"{}\"}}\n", "a".repeat(64)).as_bytes());
+            while let Ok(n) = conn.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+
+        let token = generate_token().unwrap();
+        let client = Client {
+            info: info(port, &token),
+        };
+        let mut req = sample_request();
+        req.diff = "TOP-SECRET-DIFF".into();
+        let err = client.review(req).unwrap_err();
+        assert!(err.to_string().contains("failed authentication"), "{err}");
+        impostor.join().unwrap();
+
+        let got = String::from_utf8_lossy(&received.lock().unwrap()).into_owned();
+        assert!(got.contains("hello"), "the handshake was attempted: {got}");
+        assert!(!got.contains(&token), "token leaked to an impostor");
+        assert!(
+            !got.contains("TOP-SECRET-DIFF"),
+            "diff leaked to an impostor"
+        );
+    }
+
+    #[test]
+    fn server_proofs_are_bound_to_the_token_and_the_nonce() {
+        let t1 = generate_token().unwrap();
+        let t2 = generate_token().unwrap();
+        let n1 = "1".repeat(64);
+        let n2 = "2".repeat(64);
+        assert_eq!(server_proof(&t1, &n1), server_proof(&t1, &n1));
+        assert_ne!(server_proof(&t1, &n1), server_proof(&t2, &n1));
+        assert_ne!(server_proof(&t1, &n1), server_proof(&t1, &n2));
+        assert!(server_proof("not hex", &n1).is_none());
+        assert!(server_proof(&t1, "short").is_none());
     }
 
     #[test]
@@ -1285,26 +1450,39 @@ mod tests {
                 .unwrap();
         });
 
+        // A well-behaved client with the wrong token stops at the handshake:
+        // the server's proof does not verify, so nothing is sent.
         let attacker = Client {
             info: info(port, &"0".repeat(64)),
         };
-        let err = attacker
-            .review(ReviewRequest {
-                diff: "secret code".into(),
-                requirements: None,
-                max_tokens: 16,
-                min_confidence: 0.0,
-                triage: "off".into(),
-                temperature: 0.0,
-                seed: core_engine::DEFAULT_SEED,
-                rules: vec![],
-                rulebooks: vec![],
-                baseline: None,
-                use_cache: false,
-                project_root: ".".into(),
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid token"));
+        let err = attacker.review(sample_request()).unwrap_err();
+        assert!(err.to_string().contains("failed authentication"), "{err}");
+
+        // An attacker speaking the protocol by hand skips that check and sends
+        // a guessed token anyway: the server must refuse it.
+        let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        send(
+            &mut raw,
+            &Hello {
+                hello: "1".repeat(64),
+            },
+        )
+        .unwrap();
+        let _proof: Proof = recv(&raw, MAX_HANDSHAKE_BYTES).unwrap();
+        send(
+            &mut raw,
+            &Envelope {
+                token: "0".repeat(64),
+                request: Request::Review(Box::new(sample_request())),
+            },
+        )
+        .unwrap();
+        let reply: Response = recv(&raw, MAX_RESPONSE_BYTES).unwrap();
+        assert!(
+            matches!(&reply, Response::Error { message } if message == "invalid token"),
+            "{reply:?}"
+        );
         assert!(
             !handler_ran.load(std::sync::atomic::Ordering::SeqCst),
             "an unauthenticated request must be rejected before any inference runs"

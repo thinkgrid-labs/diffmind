@@ -97,9 +97,10 @@ pub struct CacheKeyInput<'a> {
     pub json: bool,
 }
 
-/// HMAC-SHA256 (RFC 2104). Implemented over `sha2` rather than pulling in a
-/// crate for twenty lines; the construction is the standard one.
-fn hmac_sha256(key: &[u8; 32], message_parts: &[&[u8]]) -> [u8; 32] {
+/// HMAC-SHA256 (RFC 2104) with a 32-byte key. Implemented over `sha2` rather
+/// than pulling in a crate for twenty lines; the construction is the standard
+/// one. Public because the daemon's handshake uses it too.
+pub fn hmac_sha256(key: &[u8; 32], message_parts: &[&[u8]]) -> [u8; 32] {
     const BLOCK: usize = 64;
     // A 32-byte key is shorter than the block, so it is zero-padded as is.
     let mut ipad = [0x36u8; BLOCK];
