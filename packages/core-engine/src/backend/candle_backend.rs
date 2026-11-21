@@ -133,9 +133,20 @@ pub struct CandleBackend {
     context_tokens: usize,
     model_label: String,
     eos_ids: Vec<u32>,
+    /// SHA-256 of the GGUF this backend was built from, when the caller knows
+    /// it (the CLI pins one per model and verifies it at download). Part of the
+    /// cache identity, so weights from a different revision — same file name,
+    /// same label — can never replay each other's findings.
+    weights_digest: Option<String>,
 }
 
 impl CandleBackend {
+    /// Record which exact weights are loaded. See `weights_digest`.
+    pub fn with_weights_digest(mut self, sha256: impl Into<String>) -> Self {
+        self.weights_digest = Some(sha256.into());
+        self
+    }
+
     /// Load from a memory-mapped GGUF file.
     ///
     /// Reading the file into a `Vec` first (as the CLI used to) doubles peak
@@ -202,6 +213,7 @@ impl CandleBackend {
             context_tokens,
             model_label,
             eos_ids,
+            weights_digest: None,
         })
     }
 
@@ -268,6 +280,16 @@ impl ReviewBackend for CandleBackend {
 
     fn context_tokens(&self) -> usize {
         self.context_tokens
+    }
+
+    fn cache_identity(&self) -> String {
+        format!(
+            "candle|{}|{}|ctx={}|sha256={}",
+            self.model_label,
+            self.device_label,
+            self.context_tokens,
+            self.weights_digest.as_deref().unwrap_or("unpinned")
+        )
     }
 
     fn count_tokens(&self, text: &str) -> Option<usize> {

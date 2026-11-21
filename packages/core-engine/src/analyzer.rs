@@ -653,18 +653,21 @@ impl ReviewAnalyzer {
             return Ok((first, cached_a && cached_b));
         }
 
-        let cache_key = self.cache.as_ref().map(|_| {
-            ReviewCache::key(&CacheKeyInput {
-                backend: &self.backend.describe(),
+        let opts = self.gen_options(max_tokens as usize);
+        let cache_key = self.cache.as_ref().map(|cache| {
+            cache.key(&CacheKeyInput {
+                backend: &self.backend.cache_identity(),
                 prompt_version: PROMPT_VERSION,
-                chunk,
-                context: &context,
-                languages: self.languages.as_deref().unwrap_or(""),
-                rulebook_digest: &rulebook::digest(rulebooks),
-                requirements: self.requirements.as_deref().unwrap_or(""),
+                // The prompt as rendered — after the context, rule sets and
+                // requirements have been fitted to this backend's window at
+                // this depth — so the key cannot drift from what is asked.
+                prompt: &prompt.to_chatml(),
                 max_tokens,
-                temperature: self.temperature,
-                seed: self.seed,
+                temperature: opts.temperature,
+                seed: opts.seed,
+                repeat_penalty: opts.repeat_penalty,
+                repeat_last_n: opts.repeat_last_n,
+                json: opts.json,
             })
         });
 
@@ -674,7 +677,6 @@ impl ReviewAnalyzer {
             return Ok((hit, true));
         }
 
-        let opts = self.gen_options(max_tokens as usize);
         let response = self.generate_metered(&prompt, &opts)?;
         let summary = parse_review_response(&response)?;
 
@@ -1572,18 +1574,25 @@ diff --git a/src/auth.js b/src/auth.js
     /// an unrelated file in the same diff changes.
     #[test]
     fn an_unrelated_files_edit_does_not_change_a_chunks_cache_key() {
+        // The key is taken over the rendered prompt, so this is the property
+        // end to end: a.rs's prompt is a function of a.rs and its own context.
+        let analyzer = ReviewAnalyzer::new(Box::new(RecordingBackend {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let cache = ReviewCache::new(std::path::PathBuf::from("unused"));
+        let chunk = "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n";
         let key_for = |ctx: &str| {
-            ReviewCache::key(&CacheKeyInput {
+            let prompt = analyzer.build_prompt(chunk, ctx, &[], 512, 0);
+            cache.key(&CacheKeyInput {
                 backend: "recording",
                 prompt_version: PROMPT_VERSION,
-                chunk: "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n",
-                context: ctx,
-                languages: "Rust",
-                rulebook_digest: "",
-                requirements: "",
+                prompt: &prompt.to_chatml(),
                 max_tokens: 512,
                 temperature: 0.0,
                 seed: 7,
+                repeat_penalty: 1.1,
+                repeat_last_n: 64,
+                json: true,
             })
         };
 

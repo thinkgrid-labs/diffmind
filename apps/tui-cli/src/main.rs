@@ -530,7 +530,13 @@ pub fn build_backend(choice: &BackendChoice, model_dir: &Path) -> Result<Box<dyn
 
             let backend =
                 core_engine::CandleBackend::from_path(&model_path, &tokenizer_path, device.clone())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    // The download verified this digest before moving the
+                    // file into place, and `looks_truncated` above re-checks
+                    // the size. A same-size substitution after download is not
+                    // detected here (hashing 1 GB per run is not worth it);
+                    // `diffmind download --verify` checks the full digest.
+                    .with_weights_digest(info.sha256);
             Ok(Box::new(backend))
         }
 
@@ -665,12 +671,52 @@ pub fn build_analyzer(
         .with_debug(settings.debug);
 
     if settings.use_cache {
-        analyzer = analyzer.with_cache(ReviewCache::open(&project_root.join(".diffmind")));
+        analyzer = analyzer.with_cache(open_review_cache(project_root));
     }
     if let Some(req) = ticket {
         analyzer = analyzer.with_requirements(req);
     }
     analyzer
+}
+
+/// The project's review cache, keyed under this user's secret and pruned to a
+/// bounded size. `None` (no cache) whenever any part of that cannot be done —
+/// a cache is an optimisation and never a reason to fail a review, and an
+/// unkeyed cache in a directory a branch can write into is not safe to read.
+fn open_review_cache(project_root: &Path) -> Option<ReviewCache> {
+    let secret = home_dir().ok().and_then(|h| cache_secret(&h))?;
+    let cache = ReviewCache::open(&project_root.join(".diffmind"))?.with_secret(secret);
+    cache.prune(core_engine::cache::DEFAULT_MAX_ENTRIES);
+    Some(cache)
+}
+
+/// This user's cache secret, from `~/.diffmind/cache-secret`, created on first
+/// use. Outside the repository on purpose: anything inside it is controlled by
+/// whoever wrote the branch being reviewed.
+fn cache_secret(home: &Path) -> Option<[u8; 32]> {
+    let path = home.join(".diffmind").join("cache-secret");
+    let parse = |raw: &str| -> Option<[u8; 32]> {
+        let hex = raw.trim();
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(out)
+    };
+    if let Ok(raw) = std::fs::read_to_string(&path)
+        && let Some(secret) = parse(&raw)
+    {
+        return Some(secret);
+    }
+    // Missing or unreadable: mint a new one. A concurrent run may do the same;
+    // the last rename wins and the loser's entries simply become misses.
+    let secret: [u8; 32] = secure_fs::os_random().ok()?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    secure_fs::write_private_atomic(&path, secure_fs::hex(&secret).as_bytes()).ok()?;
+    Some(secret)
 }
 
 /// Report what the recorded runs say about whether this tool is earning its
