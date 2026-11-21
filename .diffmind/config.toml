@@ -1,0 +1,5 @@
+# Trusted gate configuration on the validation base branch.
+[review]
+min_confidence = 0.0
+fail_on = "high"
+require_complete = true

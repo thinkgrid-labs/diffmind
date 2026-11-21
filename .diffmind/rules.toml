@@ -1,0 +1,9 @@
+# Deterministic rule the validation PRs trip on purpose.
+[[rule]]
+id       = "validation.no-eval"
+pattern  = '\beval\('
+message  = "eval() executes arbitrary code"
+fix      = "Parse the input instead, e.g. ast.literal_eval"
+severity = "high"
+category = "security"
+files    = ["*.py"]
