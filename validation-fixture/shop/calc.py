@@ -1,6 +1,3 @@
-import ast
-
-
 def evaluate(expr: str) -> float:
-    """Evaluate a numeric literal safely."""
-    return float(ast.literal_eval(expr))
+    """Evaluate a numeric expression."""
+    return float(eval(expr))
