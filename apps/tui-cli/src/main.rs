@@ -403,11 +403,22 @@ fn capture_diff(args: &cli::Cli, settings: &Settings) -> Result<String> {
     }
 
     if args.stdin {
-        let mut buffer = String::new();
+        // The same ceiling `git::run_diff` applies to a diff it produces. Read
+        // one byte past it so "exactly at the limit" and "over" differ.
+        let limit = git::MAX_RAW_DIFF_BYTES;
+        let mut raw = Vec::new();
         io::stdin()
-            .read_to_string(&mut buffer)
+            .lock()
+            .take(limit as u64 + 1)
+            .read_to_end(&mut raw)
             .context("could not read the diff from stdin")?;
-        return Ok(buffer);
+        if raw.len() > limit {
+            anyhow::bail!(
+                "the diff on stdin is larger than {} MB. Review specific paths instead.",
+                limit / (1024 * 1024)
+            );
+        }
+        return Ok(String::from_utf8_lossy(&raw).into_owned());
     }
 
     if !git::is_repo() {
