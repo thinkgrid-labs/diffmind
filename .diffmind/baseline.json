@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-21T12:53:57.255879+00:00",
+  "entries": [
+    {
+      "fingerprint": "ebd52add5cce5189",
+      "file": "validation-fixture/shop/calc.py",
+      "rule_id": "validation.no-eval",
+      "issue": "eval() executes arbitrary code"
+    }
+  ]
+}

@@ -1,5 +1,12 @@
-# Trusted gate configuration on the validation base branch.
+# PR-authored attempt to switch the gate off. Must have no effect under the
+# action's default config-from: base.
 [review]
-min_confidence = 0.0
+ignore = ["**"]
+min_confidence = 1.0
 fail_on = "high"
-require_complete = true
+require_complete = false
+
+[backend]
+kind = "openai-compatible"
+url = "http://127.0.0.1:9"
+model = "attacker"
