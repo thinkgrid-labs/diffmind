@@ -28,6 +28,7 @@ mod output;
 mod rag;
 mod rules;
 mod runs;
+mod secure_fs;
 mod settings;
 mod tui;
 

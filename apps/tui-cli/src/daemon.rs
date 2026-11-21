@@ -10,19 +10,40 @@
 //! another user on the machine cannot read the token file, and without it every
 //! request is refused. Connections are handled one at a time on purpose — there
 //! is one model and one GPU, so concurrency would only queue inside candle.
+//!
+//! Because connections are sequential, the transport has to bound everything
+//! an *unauthenticated* peer can make it wait for or allocate: a request line
+//! is capped at [`MAX_REQUEST_BYTES`] and must arrive whole within
+//! [`REQUEST_DEADLINE`], so a local process that connects and stalls costs the
+//! daemon at most that long — not the model's residency, and not its memory.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use core_engine::{AnalysisStats, ReviewSummary};
 
+/// Largest request line the daemon will buffer. A review request carries the
+/// post-filter diff (itself capped at 1.5 MB by the CLI) plus rule sets and a
+/// baseline, so 16 MiB is generous for a legitimate client and still a hard
+/// ceiling for a hostile one.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest response line a client will buffer. Findings are bounded in number
+/// and length by the engine; this only guards a client against a peer that is
+/// not really a diffmind daemon.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long an accepted connection has to deliver its complete request line.
+/// Loopback delivers 16 MiB in milliseconds, so this only ever fires for a
+/// peer that is stalling or trickling bytes.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Written by the daemon, read by clients.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub port: u16,
     pub token: String,
@@ -32,6 +53,20 @@ pub struct DaemonInfo {
     pub model: String,
     pub device: String,
     pub version: String,
+}
+
+/// Manual so the bearer token can never reach a log line through `{:?}`.
+impl std::fmt::Debug for DaemonInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonInfo")
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .field("pid", &self.pid)
+            .field("model", &self.model)
+            .field("device", &self.device)
+            .field("version", &self.version)
+            .finish()
+    }
 }
 
 pub fn info_path(home: &Path) -> PathBuf {
@@ -45,26 +80,23 @@ pub fn read_info(home: &Path) -> Option<DaemonInfo> {
     (info.version == crate::output::VERSION).then_some(info)
 }
 
+/// Publish the daemon's address and token.
+///
+/// The token must never be readable by another user, not even briefly. Writing
+/// the file and *then* tightening its mode — what this used to do — left a
+/// window in which it existed with the umask's permissions (typically 0644),
+/// and a failed `chmod` was silently ignored. Now the file is created 0600 from
+/// the first byte under a temporary name, then renamed into place, so a reader
+/// sees either the previous file or the complete new one.
 pub fn write_info(home: &Path, info: &DaemonInfo) -> Result<()> {
     let path = info_path(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(info)?)?;
-    restrict_permissions(&path);
-    Ok(())
-}
-
-/// The file holds a bearer token, so keep it owner-readable only.
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) {
-    // Windows inherits the user profile's ACL, which is already per-user.
+    let parent = path
+        .parent()
+        .context("daemon info path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let body = serde_json::to_string_pretty(info)?;
+    crate::secure_fs::write_private_atomic(&path, body.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 pub fn clear_info(home: &Path) {
@@ -204,56 +236,129 @@ fn send(stream: &mut TcpStream, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn recv<T: for<'de> Deserialize<'de>>(reader: &mut BufReader<&TcpStream>) -> Result<T> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
-        anyhow::bail!("connection closed before a message arrived");
+/// Why a message could not be received. Distinguished so the server can tell
+/// a peer *why* it was refused, and so tests can assert on the reason.
+#[derive(Debug, PartialEq, Eq)]
+enum RecvError {
+    Closed,
+    Truncated,
+    TooLarge,
+    Deadline,
+    Io(String),
+}
+
+impl std::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvError::Closed => write!(f, "connection closed before a message arrived"),
+            RecvError::Truncated => write!(f, "connection closed mid-message"),
+            RecvError::TooLarge => write!(f, "message exceeds the size limit"),
+            RecvError::Deadline => write!(f, "message did not arrive in time"),
+            RecvError::Io(e) => write!(f, "read failed: {e}"),
+        }
     }
-    serde_json::from_str(&line).context("malformed message")
+}
+
+impl std::error::Error for RecvError {}
+
+/// Read one newline-terminated message of at most `max` bytes.
+///
+/// `BufRead::read_line` — what this used to be — buffers without limit, so any
+/// local process could make the daemon allocate until it was killed, and its
+/// per-read timeout let a peer that sends one byte a minute hold the
+/// (sequential) daemon forever. Here the size is capped before it is buffered
+/// and `deadline`, when given, bounds the *whole* message rather than each read.
+fn recv_line(
+    mut stream: &TcpStream,
+    max: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, RecvError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RecvError::Deadline);
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| RecvError::Io(e.to_string()))?;
+        }
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(RecvError::Deadline);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(RecvError::Io(e.to_string())),
+        };
+        if n == 0 {
+            return Err(if buf.is_empty() {
+                RecvError::Closed
+            } else {
+                RecvError::Truncated
+            });
+        }
+        let part = chunk.get(..n).unwrap_or_default();
+        let (body, complete) = match part.iter().position(|&b| b == b'\n') {
+            Some(pos) => (part.get(..pos).unwrap_or_default(), true),
+            None => (part, false),
+        };
+        if buf.len().saturating_add(body.len()) > max {
+            return Err(RecvError::TooLarge);
+        }
+        buf.extend_from_slice(body);
+        if complete {
+            return Ok(buf);
+        }
+    }
+}
+
+fn recv<T: for<'de> Deserialize<'de>>(stream: &TcpStream, max: usize) -> Result<T> {
+    let line = recv_line(stream, max, None)?;
+    serde_json::from_slice(&line).context("malformed message")
 }
 
 // ─── Token ───────────────────────────────────────────────────────────────────
 
-/// Derive a token from process-local entropy. It only has to be unguessable by
-/// another local user within the daemon's lifetime, and it is stored in a
-/// 0600 file, so a hash of pid + time + address entropy is sufficient.
-fn generate_token() -> String {
-    let mut h = Sha256::new();
-    h.update(std::process::id().to_le_bytes());
-    h.update(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    let stack_probe = &h as *const _ as usize;
-    h.update(stack_probe.to_le_bytes());
-    h.update(
-        std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    format!("{:x}", h.finalize())
+/// 256 bits from the operating system's CSPRNG, hex-encoded.
+///
+/// This used to hash the pid, the clock, a stack address and `$USER` — every
+/// one of which another local user can observe or narrow down, so the token's
+/// real entropy was a few dozen bits at best. There is no fallback: if the OS
+/// cannot supply randomness the daemon refuses to start rather than run with
+/// a guessable credential.
+fn generate_token() -> Result<String> {
+    let bytes: [u8; 32] =
+        crate::secure_fs::os_random().context("could not generate a daemon token")?;
+    Ok(crate::secure_fs::hex(&bytes))
 }
 
 /// Constant-time comparison so a token cannot be recovered byte-by-byte.
+/// Only the length — which is public (64 hex characters) — short-circuits.
 fn tokens_match(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes()
+    let diff = a
+        .bytes()
         .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 /// Envelope every client sends: the token plus the request.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// No `Debug`: the token must not be printable, and nothing needs to print one.
+#[derive(Serialize, Deserialize)]
 struct Envelope {
     token: String,
     #[serde(flatten)]
@@ -264,6 +369,7 @@ pub struct Server {
     listener: TcpListener,
     token: String,
     idle_timeout: Duration,
+    request_deadline: Duration,
 }
 
 impl Server {
@@ -273,9 +379,19 @@ impl Server {
             TcpListener::bind(addr).with_context(|| format!("could not bind 127.0.0.1:{port}"))?;
         Ok(Server {
             listener,
-            token: generate_token(),
+            // Fresh per bind, so a restarted daemon never honours a token an
+            // earlier instance published.
+            token: generate_token()?,
             idle_timeout,
+            request_deadline: REQUEST_DEADLINE,
         })
+    }
+
+    /// Shorten the per-request deadline so tests need not wait 30 s.
+    #[cfg(test)]
+    fn with_request_deadline(mut self, d: Duration) -> Self {
+        self.request_deadline = d;
+        self
     }
 
     pub fn port(&self) -> Result<u16> {
@@ -301,9 +417,14 @@ impl Server {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(false).ok();
-                    // A wedged client must not pin the model in memory forever.
-                    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+                    // A connection that cannot be made blocking cannot be
+                    // served safely (reads would spin); drop it and carry on.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    // Writing a response to a client that stopped reading must
+                    // not wedge the daemon either.
+                    let _ = stream.set_write_timeout(Some(self.request_deadline));
 
                     if self.serve_one(stream, &mut handle) {
                         return Ok(());
@@ -332,19 +453,32 @@ impl Server {
     where
         F: FnMut(ReviewRequest) -> Response,
     {
-        let envelope: Envelope = {
-            let mut reader = BufReader::new(&stream);
-            match recv(&mut reader) {
+        // Bounded in size and in total time *before* authentication, because
+        // until the token is checked the peer is anyone on the machine.
+        let deadline = Instant::now() + self.request_deadline;
+        let envelope: Envelope = match recv_line(&stream, MAX_REQUEST_BYTES, Some(deadline)) {
+            Ok(line) => match serde_json::from_slice(&line) {
                 Ok(e) => e,
-                Err(e) => {
+                Err(_) => {
+                    // Deliberately not echoing the parser's message: it is
+                    // about the peer's bytes, and the peer is unauthenticated.
                     let _ = send(
                         &mut stream,
                         &Response::Error {
-                            message: e.to_string(),
+                            message: "malformed request".into(),
                         },
                     );
                     return false;
                 }
+            },
+            Err(e) => {
+                let _ = send(
+                    &mut stream,
+                    &Response::Error {
+                        message: format!("request refused: {e}"),
+                    },
+                );
+                return false;
             }
         };
 
@@ -425,8 +559,7 @@ impl Client {
             request,
         };
         send(&mut stream, &envelope)?;
-        let mut reader = BufReader::new(&stream);
-        recv(&mut reader)
+        recv(&stream, MAX_RESPONSE_BYTES)
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -528,10 +661,329 @@ mod tests {
 
     #[test]
     fn tokens_are_unguessable_and_distinct() {
-        let a = generate_token();
-        let b = generate_token();
-        assert_eq!(a.len(), 64);
+        let a = generate_token().unwrap();
+        let b = generate_token().unwrap();
+        assert_eq!(a.len(), 64, "256 bits, hex-encoded");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two daemons must not share a token");
+    }
+
+    /// Regression for the weak-entropy token: nothing observable about the
+    /// process may determine it. Two tokens minted by the same process in the
+    /// same instant used to differ only in the nanosecond clock.
+    #[test]
+    fn tokens_do_not_repeat_across_many_draws() {
+        let draws: std::collections::HashSet<String> =
+            (0..256).map(|_| generate_token().unwrap()).collect();
+        assert_eq!(draws.len(), 256);
+    }
+
+    #[test]
+    fn the_token_never_appears_in_debug_output() {
+        let i = info(1, "super-secret-token-value");
+        let shown = format!("{i:?}");
+        assert!(!shown.contains("super-secret-token-value"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+    }
+
+    /// Spawn a server with a handler that records whether it ran.
+    fn spawn_server(
+        idle: Duration,
+    ) -> (
+        u16,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        spawn_server_with_deadline(idle, REQUEST_DEADLINE)
+    }
+
+    fn spawn_server_with_deadline(
+        idle: Duration,
+        deadline: Duration,
+    ) -> (
+        u16,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let server = Server::bind(0, idle)
+            .unwrap()
+            .with_request_deadline(deadline);
+        let port = server.port().unwrap();
+        let token = server.token().to_string();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let handle = std::thread::spawn(move || {
+            server
+                .run(|_| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Response::Ok(Box::new(ReviewResponse {
+                        summary: ReviewSummary::default(),
+                        stats: SerializableStats::default(),
+                        backend: "test".into(),
+                    }))
+                })
+                .unwrap();
+        });
+        (port, token, calls, handle)
+    }
+
+    fn raw_exchange(port: u16, payload: &[u8]) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // The server may refuse and close before reading everything; a reset
+        // on write is part of what is being tested, not a failure.
+        let _ = s.write_all(payload);
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    }
+
+    fn sample_request() -> ReviewRequest {
+        ReviewRequest {
+            diff: "d".into(),
+            requirements: None,
+            max_tokens: 16,
+            min_confidence: 0.0,
+            triage: "off".into(),
+            temperature: 0.0,
+            seed: core_engine::DEFAULT_SEED,
+            rules: vec![],
+            rulebooks: vec![],
+            baseline: None,
+            use_cache: false,
+            project_root: ".".into(),
+        }
+    }
+
+    #[test]
+    fn the_daemon_listens_on_loopback_only() {
+        let server = Server::bind(0, Duration::from_secs(1)).unwrap();
+        let addr = server.listener.local_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "bound to {addr}");
+    }
+
+    #[test]
+    fn malformed_requests_are_refused_and_the_daemon_keeps_serving() {
+        let (port, token, calls, handle) = spawn_server(Duration::from_secs(30));
+
+        for garbage in [
+            &b"not json at all\n"[..],
+            &b"{\"token\": 12, \"op\": \"ping\"}\n"[..],
+            &b"{\"op\": \"review\"}\n"[..],
+            &b"\xff\xfe\x00\n"[..],
+            &b"\n"[..],
+        ] {
+            let reply = raw_exchange(port, garbage);
+            assert!(reply.contains("malformed request"), "reply: {reply}");
+        }
+        // Closed mid-message: no newline, then EOF.
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"{\"token\":\"abc").unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        assert!(reply.contains("closed mid-message"), "reply: {reply}");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let owner = Client {
+            info: info(port, &token),
+        };
+        owner.ping().expect("still serving after garbage");
+        owner.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_oversized_request_is_refused_without_reaching_the_handler() {
+        let (port, token, calls, handle) = spawn_server(Duration::from_secs(30));
+
+        // One byte over the cap, no newline: the old reader would have kept
+        // buffering for as long as the peer kept sending.
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let block = vec![b'a'; 1024 * 1024];
+        let mut sent = 0usize;
+        while sent <= MAX_REQUEST_BYTES {
+            if s.write_all(&block).is_err() {
+                break; // refused and closed — expected
+            }
+            sent += block.len();
+        }
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        if !reply.is_empty() {
+            assert!(reply.contains("size limit"), "reply: {reply}");
+        }
+        drop(s);
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let owner = Client {
+            info: info(port, &token),
+        };
+        owner
+            .ping()
+            .expect("still serving after an oversized request");
+        owner.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recv_line_enforces_the_cap_and_the_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Too large.
+        let writer = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = c.write_all(&[b'x'; 200]);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let (server_side, _) = listener.accept().unwrap();
+        assert_eq!(
+            recv_line(
+                &server_side,
+                100,
+                Some(Instant::now() + Duration::from_secs(5))
+            ),
+            Err(RecvError::TooLarge)
+        );
+        writer.join().unwrap();
+
+        // Trickling: a byte at a time never completes within the deadline,
+        // even though each individual read succeeds quickly.
+        let writer = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            for _ in 0..30 {
+                if c.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (server_side, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            recv_line(
+                &server_side,
+                1000,
+                Some(Instant::now() + Duration::from_millis(400))
+            ),
+            Err(RecvError::Deadline)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline bounds the whole message, not each read"
+        );
+        drop(server_side);
+        writer.join().unwrap();
+    }
+
+    /// A peer that connects and never speaks used to pin the sequential daemon
+    /// for 120 s per read; one that trickled bytes, indefinitely. It must now
+    /// cost at most the request deadline, after which the next client is served.
+    #[test]
+    fn a_stalled_connection_does_not_block_the_next_client_forever() {
+        let deadline = Duration::from_millis(700);
+        let (port, token, _calls, handle) =
+            spawn_server_with_deadline(Duration::from_secs(120), deadline);
+        let stalled = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        let owner = Client {
+            info: info(port, &token),
+        };
+        let started = Instant::now();
+        owner
+            .ping()
+            .expect("served once the stalled peer's deadline passed");
+        assert!(
+            started.elapsed() < deadline + Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        drop(stalled);
+        owner.shutdown().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_clients_are_all_served_in_turn() {
+        let (port, token, calls, handle) = spawn_server(Duration::from_secs(30));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let c = Client {
+                        info: info(port, &token),
+                    };
+                    c.review(sample_request()).map(|_| ())
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap().expect("every queued client is answered");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        Client {
+            info: info(port, &token),
+        }
+        .shutdown()
+        .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_restarted_daemon_does_not_honour_the_previous_token() {
+        let (port_a, token_a, _, handle_a) = spawn_server(Duration::from_secs(30));
+        Client {
+            info: info(port_a, &token_a),
+        }
+        .shutdown()
+        .unwrap();
+        handle_a.join().unwrap();
+
+        let (port_b, token_b, calls, handle_b) = spawn_server(Duration::from_secs(30));
+        assert_ne!(token_a, token_b);
+        let stale = Client {
+            info: info(port_b, &token_a),
+        };
+        let err = stale.review(sample_request()).unwrap_err();
+        assert!(err.to_string().contains("invalid token"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Client {
+            info: info(port_b, &token_b),
+        }
+        .shutdown()
+        .unwrap();
+        handle_b.join().unwrap();
+    }
+
+    #[test]
+    fn the_daemon_exits_on_its_own_after_the_idle_timeout() {
+        let (_port, _token, _calls, handle) = spawn_server(Duration::from_millis(300));
+        let started = Instant::now();
+        handle.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rewriting_the_info_file_keeps_it_private() {
+        let home = tmp_home("rewrite");
+        write_info(&home, &info(1, "first")).unwrap();
+        write_info(&home, &info(2, "second")).unwrap();
+        let read = read_info(&home).unwrap();
+        assert_eq!(read.port, 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(info_path(&home))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
