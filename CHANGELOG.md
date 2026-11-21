@@ -1,5 +1,148 @@
 # Changelog
 
+## [Unreleased] — v0.9.3
+
+A stabilization release: security, correctness and reliability hardening, with
+no new review features. The headline is that **a review that did not cover the
+whole diff can no longer pass as a clean one.**
+
+### Changed — behaviour you may notice
+
+- **Incomplete reviews fail in CI (exit 2).** A unit whose model output could
+  not be parsed, or that was too large for the context window, used to be
+  counted and then ignored: a review could report "No issues found", exit 0,
+  and have looked at none of the code. A review is now *complete*,
+  *incomplete* or *failed*, and an incomplete one exits 2 when completeness is
+  required. It is required by default when the `CI` environment variable is
+  set, and can be set with `--require-complete` / `--allow-incomplete` or
+  `[review] require_complete` in `.diffmind/config.toml` (the flags win, so a
+  pull request cannot relax a gate the workflow set). Local runs default to
+  reporting the skip loudly and letting `--fail-on` decide.
+- **A backend failure part-way through a review still exits 2, but now writes
+  the report first** — deterministic findings, every unit reviewed before the
+  failure, and which units were not — instead of a bare error.
+- **Every machine-readable format says whether the review was complete.** JSON
+  gains a `completeness` object (`status`, `units_planned`, `units_reviewed`,
+  `units_skipped` with reasons, `trustworthy`, …). SARIF sets
+  `invocations[0].executionSuccessful` and lists skipped units as
+  `toolExecutionNotifications`. Markdown leads with a warning. Existing fields
+  are unchanged.
+- **The review cache is invalidated once on upgrade.** Keys now cover the exact
+  rendered prompt and the backend's identity (see Security), so 0.9.2 entries
+  are never reused.
+- **GitHub Action: pull requests are reviewed under the base branch's
+  `.diffmind/` configuration.** `config.toml`, `rules.toml`, `rules/` and
+  `baseline.json` are restored from the merge base before the review, so a PR
+  cannot relax the gate that reviews it (`ignore = ["**"]`, `min_confidence =
+  1.0` or a baseline listing its own findings all used to pass). Changes to
+  those files are still reviewed and take effect once merged; set
+  `config-from: head` for the old behaviour. The local backend is also pinned
+  unless `args` chooses one. `args` is now split like a quoted shell string
+  but never evaluated; an `args` value that relied on shell expansion no
+  longer expands.
+- **The npm wrapper exits 2, not 1, when it cannot run the binary** (missing
+  platform package, unsupported platform, spawn failure). 1 means "blocking
+  findings".
+- **An API key is refused over plain HTTP to a non-loopback host.** Use
+  `https://`, a loopback address, or set `DIFFMIND_ALLOW_INSECURE_API_KEY=1`.
+
+### Fixed — security
+
+- **Daemon token from the OS CSPRNG.** `diffmind serve` derived its bearer token
+  from the pid, the clock, a stack address and `$USER`. It is now 256 bits from
+  the operating system, and the daemon refuses to start if none is available.
+- **Daemon token file is private from the first byte.** It was written with the
+  umask's permissions and `chmod`ed afterwards (ignoring a `chmod` failure); it
+  is now created `0600`, written to a temporary file and renamed into place.
+  The token is redacted from `Debug` output.
+- **Daemon clients authenticate the daemon.** Every connection starts with a
+  challenge (a random nonce answered with an HMAC under the token), and the
+  token and diff are sent only if it verifies. A process squatting on a
+  crashed daemon's port no longer receives either.
+- **The daemon bounds what an unauthenticated peer can cost it.** Requests are
+  capped at 16 MiB and must arrive whole within 30 s; previously any local
+  process could make it buffer without limit, or hold the (sequential) daemon
+  indefinitely by trickling bytes.
+- **GitHub Action inputs are no longer interpolated into shell or JavaScript.**
+  Every `${{ inputs.* }}` inside a `run:` or `github-script` block was pasted
+  into the source before it was parsed, so an input such as `$(…)` executed.
+  Inputs now travel as environment variables, are validated (model, severity,
+  format, version, base ref via `git check-ref-format`, output path), and are
+  passed as argv entries.
+- **Review cache entries cannot be planted by a branch.** The cache lives in the
+  repository, and every input to a key was public, so a branch could ship an
+  entry saying "no findings" for its own change. Keys are now an HMAC under a
+  per-user secret in `~/.diffmind/cache-secret`, and each entry records the key
+  it was written for.
+- **Context assembly no longer follows symlinks out of the repository.** The
+  "test file" for `src/auth.ts` could be a committed symlink to any file the
+  reviewer can read, quoted into the prompt. Reads are now confined to the
+  repository, without `..` or absolute paths, and size-capped.
+- **Model output is inert in Markdown.** Findings are rendered into PR comments
+  and job summaries; model text derived from planted instructions could emit
+  images (fetched on render — an exfiltration channel), HTML, links or
+  `@`-mentions. All of it is now escaped. Control characters and bidi
+  overrides are stripped from model output in every format.
+- **A configured base branch starting with `-` is refused** before it reaches
+  `git` as an option.
+- **Credentials never reach a label, report, run record or error.** Remote
+  backend URLs are shown without `user:password@` or query string, reqwest
+  errors are stripped of their URL, and an echoed API key is masked.
+
+### Fixed — correctness and reliability
+
+- **GitHub Action: a failed fetch or diff fails the job.** The action ran
+  `git fetch … || true` and then `git diff origin/<base>...HEAD`. With
+  `actions/checkout`'s default depth of 1 there is no merge base, so the diff
+  failed, diffmind received an empty diff, wrote a clean SARIF report — which
+  was uploaded — and the job exited with an unexplained 128. The action now
+  deepens a shallow clone until the merge base is reachable, and exits 2 with a
+  clear error if it cannot.
+- **GitHub Action: `fail-on: none` no longer fails on the first finding.** With
+  no `--fail-on`, the CLI defaults the gate to `--min-severity` (default
+  `low`). `none` now reports everything and maps "blocking findings" to a pass,
+  while still failing a review that did not complete. Abnormal exits (a crash,
+  an OOM kill) are reported as 2; a new `status` output carries the exit code.
+- **Cache keys cover everything that changes the answer.** Keys were built from
+  a hand-maintained list of prompt ingredients that omitted the rendered
+  context and rule-set budgets; they are now taken over the exact prompt, the
+  sampling options, and the backend's identity — including the pinned GGUF
+  digest for the local model and Ollama's model digest for a re-pulled tag.
+  OpenAI-compatible servers expose no revision; their identity says
+  `revision=unverified`, and `diffmind cache clear` is the remedy if the model
+  behind a name changes. The cache is also pruned (it never was).
+- **Code-graph freshness no longer trusts mtime alone.** An edit within one
+  timestamp tick, or one that restored an old mtime (`cp -p`, `rsync -t`), left
+  stale symbols and line ranges in the graph. Freshness now uses mtime, inode
+  change time and size, re-hashes "racily clean" files, and compares content.
+  A file that stops parsing drops its old symbols instead of keeping them.
+- **Context is withheld when the working tree is not the diff's post-image**
+  (`--range a..b` with another commit checked out, committed work reviewed with
+  uncommitted edits on top), instead of describing whatever now sits at those
+  line numbers. The run says so, once, naming a file.
+- **Non-ASCII paths** are diffed with `core.quotepath=false`, so context,
+  anchoring and generated-file checks find the file.
+- **Ambiguous graph relationships are labelled as such.** A caller or
+  definition matched by name when several definitions share it is shown as
+  "Possible caller/definition", not as a resolved dependency.
+- **A corrupt `graph.db` is rebuilt** instead of silently disabling code context
+  on every later review. Concurrent indexers wait for each other rather than
+  failing with "database is locked", and opening an up-to-date graph no longer
+  takes the write lock.
+- **Remote backends are bounded.** A 10 s connect timeout separate from the
+  generation timeout; responses capped at 8 MiB; HTTP 429/5xx and dropped
+  connections retried at most twice with backoff (honouring `Retry-After` up to
+  30 s); timeouts and other 4xx not retried; redirects not followed.
+- **Prompt-injection boundary.** Diff, surrounding code, ticket text and triage
+  previews are fenced with markers the content cannot forge (built in linear
+  time), chat-template control tokens such as `<|im_end|>` in repository text
+  are broken up so they cannot close the prompt's turn, and the system prompt
+  states that fenced text is data, never instructions. Model findings
+  must name a file in the unit that produced them, and a model can no longer
+  assign a rule id or unit id itself. This reduces, and does not eliminate,
+  prompt-injection risk; see the README.
+- **`--stdin` diffs are size-capped** at the same 64 MB as git-produced ones.
+
 ## [0.9.2] — 08-12-2026
 
 ### Fixed

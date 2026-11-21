@@ -48,9 +48,29 @@ inputs:
     required: false
     default: ""
   args:
-    description: "Extra flags passed through to diffmind."
+    description: >-
+      Extra flags passed through to diffmind. Split like a shell would split a
+      quoted string, but never evaluated by one: no variable expansion, command
+      substitution or globbing.
     required: false
     default: ""
+  config-from:
+    description: >-
+      Which revision's .diffmind/ configuration (config.toml, rules.toml,
+      rules/, baseline.json) a pull request is reviewed under. "base" (the
+      default) uses the merge base, so a PR cannot relax the gate that reviews
+      it; changes to those files are still reviewed and take effect once
+      merged. "head" uses the PR's own files.
+    required: false
+    default: "base"
+  allow-incomplete:
+    description: >-
+      Let the job pass when part of the diff could not be reviewed (a unit the
+      model's output could not be parsed for, or one too large for the context
+      window). Off by default: an incomplete review is reported as a failure
+      (exit 2) rather than as a clean result.
+    required: false
+    default: "false"
 
 outputs:
   findings:
@@ -59,6 +79,9 @@ outputs:
   report:
     description: "Path to the written report."
     value: ${{ steps.review.outputs.report }}
+  status:
+    description: "diffmind's exit status: 0 clean, 1 blocking findings, 2 did not run or did not complete."
+    value: ${{ steps.review.outputs.status }}
 
 runs:
   using: composite
@@ -73,80 +96,59 @@ runs:
 
     - name: Install diffmind
       shell: bash
+      env:
+        DM_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-        if [ "${{ inputs.version }}" = "latest" ]; then
+        # Validated before it reaches a URL or the installer's environment.
+        if [ "$DM_VERSION" = "latest" ]; then
           curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/latest/download/install.sh | bash
+        elif printf '%s' "$DM_VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+          curl -fsSL "https://github.com/thinkgrid-labs/diffmind/releases/download/${DM_VERSION}/install.sh" \
+            | VERSION="$DM_VERSION" bash
         else
-          curl -fsSL https://github.com/thinkgrid-labs/diffmind/releases/download/${{ inputs.version }}/install.sh \
-            | VERSION="${{ inputs.version }}" bash
+          echo "::error::invalid version input (expected 'latest' or a release tag such as v0.9.3)"
+          exit 2
         fi
         diffmind --version
 
     - name: Download model
       shell: bash
-      run: diffmind download --model "${{ inputs.model }}"
+      env:
+        DM_MODEL: ${{ inputs.model }}
+      run: |
+        set -euo pipefail
+        case "$DM_MODEL" in
+          0.5b|1.5b|3b|7b|14b|32b) ;;
+          *) echo "::error::invalid model input"; exit 2 ;;
+        esac
+        diffmind download --model "$DM_MODEL"
 
     - name: Run review
       id: review
       shell: bash
+      # Inputs travel as environment variables and are validated by the script.
+      # Never interpolate `${{ inputs.* }}` into a `run:` block: the expression
+      # is pasted into the script source before bash parses it.
       env:
-        DIFFMIND_TICKET: ${{ inputs.ticket }}
-      run: |
-        set -uo pipefail
-
-        BASE="${{ inputs.base }}"
-        if [ -z "$BASE" ]; then
-          BASE="${GITHUB_BASE_REF:-}"
-        fi
-
-        ARGS=(
-          --model "${{ inputs.model }}"
-          --min-severity "${{ inputs.min-severity }}"
-          --format "${{ inputs.format }}"
-          --output "${{ inputs.output }}"
-        )
-
-        # 'none' means report everything but never fail the job.
-        if [ "${{ inputs.fail-on }}" != "none" ]; then
-          ARGS+=(--fail-on "${{ inputs.fail-on }}")
-        fi
-        if [ -n "${DIFFMIND_TICKET}" ]; then
-          ARGS+=(--ticket "${DIFFMIND_TICKET}")
-        fi
-        # shellcheck disable=SC2206
-        EXTRA=(${{ inputs.args }})
-
-        if [ -n "$BASE" ]; then
-          # actions/checkout defaults to a shallow clone with no base branch.
-          git fetch --no-tags --depth=50 origin "$BASE" || true
-          git diff "origin/$BASE...HEAD" | diffmind --stdin "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
-        else
-          diffmind "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
-        fi
-        STATUS=$?
-
-        echo "report=${{ inputs.output }}" >> "$GITHUB_OUTPUT"
-
-        COUNT=0
-        if [ -f "${{ inputs.output }}" ] && [ "${{ inputs.format }}" = "sarif" ]; then
-          COUNT=$(python3 -c "import json,sys; print(len(json.load(open('${{ inputs.output }}'))['runs'][0]['results']))" 2>/dev/null || echo 0)
-        fi
-        echo "findings=${COUNT}" >> "$GITHUB_OUTPUT"
-
-        # Exit 2 is a diffmind failure; exit 1 is "found blocking issues".
-        # Only the latter should be reported as a review failure.
-        if [ "$STATUS" -eq 2 ]; then
-          echo "::error::diffmind failed to run"
-          exit 2
-        fi
-        echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
-        exit "$STATUS"
+        DM_MODEL: ${{ inputs.model }}
+        DM_BASE: ${{ inputs.base }}
+        DM_MIN_SEVERITY: ${{ inputs.min-severity }}
+        DM_FAIL_ON: ${{ inputs.fail-on }}
+        DM_FORMAT: ${{ inputs.format }}
+        DM_OUTPUT: ${{ inputs.output }}
+        DM_TICKET: ${{ inputs.ticket }}
+        DM_ARGS: ${{ inputs.args }}
+        DM_ALLOW_INCOMPLETE: ${{ inputs.allow-incomplete }}
+        DM_CONFIG_FROM: ${{ inputs.config-from }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/review.sh"
 
     # `always()` so a failing gate still publishes the annotations that explain
     # why it failed.
     - name: Upload SARIF
-      if: always() && inputs.upload-sarif == 'true' && inputs.format == 'sarif'
+      # Skipped when no report was written (diffmind failed before producing
+      # one), so the real error is not buried under "file not found".
+      if: always() && inputs.upload-sarif == 'true' && inputs.format == 'sarif' && hashFiles(inputs.output) != ''
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ inputs.output }}
@@ -155,17 +157,32 @@ runs:
     - name: Job summary
       if: always() && inputs.format == 'markdown'
       shell: bash
-      run: cat "${{ inputs.output }}" >> "$GITHUB_STEP_SUMMARY" || true
+      env:
+        DM_OUTPUT: ${{ inputs.output }}
+      run: |
+        if [ -f "$DM_OUTPUT" ]; then
+          cat -- "$DM_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Comment on PR
       if: always() && inputs.comment == 'true' && inputs.format == 'markdown' && github.event_name == 'pull_request'
       uses: actions/github-script@v7
+      env:
+        DM_OUTPUT: ${{ inputs.output }}
       with:
         script: |
           const fs = require('fs');
-          const path = '${{ inputs.output }}';
-          if (!fs.existsSync(path)) return;
-          const body = fs.readFileSync(path, 'utf8');
+          // From the environment, not `${{ }}`: an expression inside this
+          // script would be pasted into the JavaScript source.
+          const path = process.env.DM_OUTPUT;
+          if (!path || !fs.existsSync(path)) return;
+          // GitHub rejects comment bodies over 65,536 characters; a large
+          // review must still post, truncated, rather than fail the step.
+          const LIMIT = 60000;
+          let body = fs.readFileSync(path, 'utf8');
+          if (body.length > LIMIT) {
+            body = body.slice(0, LIMIT) + '\n\n_Report truncated; see the job summary or the uploaded report for the rest._\n';
+          }
           const marker = '<!-- diffmind-review -->';
 
           // Update the existing comment instead of adding one per push.
