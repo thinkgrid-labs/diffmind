@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +21,27 @@ use super::extract::{self, Lang};
 
 /// Bumped when the schema changes. A mismatch rebuilds from scratch rather than
 /// querying a shape this build does not understand.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// 2: files gained `ctime`, `size`, `hash` and `indexed_at` for content-based
+///    freshness.
+const SCHEMA_VERSION: i64 = 2;
+
+/// A file whose mtime is this close to (or after) the moment it was last
+/// indexed is "racily clean" in git's sense: it could have been written again
+/// within the filesystem's timestamp granularity — one or two seconds on FAT,
+/// HFS+ and many network filesystems — without its mtime moving. Such a file
+/// is re-hashed rather than trusted. Older files take the mtime fast path, so
+/// a review never hashes the whole repository.
+const RACY_WINDOW_SECS: f64 = 2.0;
+
+/// Wait this long for another process's index transaction instead of failing
+/// immediately with "database is locked".
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Files larger than this are not parsed. Hand-written source this size is
+/// vanishingly rare; bundles and generated files are common and would cost
+/// seconds of tree-sitter time on every change for symbols nobody wants.
+const MAX_INDEX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Directories never worth walking.
 const IGNORE_DIRS: &[&str] = &[
@@ -54,7 +75,7 @@ impl Def {
     /// stale, and staleness here means showing the model code that is not what
     /// it is reviewing.
     pub fn source(&self, project_root: &Path, max_lines: usize) -> Option<String> {
-        let text = std::fs::read_to_string(project_root.join(&self.path)).ok()?;
+        let text = super::read_repo_file(project_root, &self.path)?;
         let lines: Vec<&str> = text.lines().collect();
         let start = (self.start_line as usize).saturating_sub(1);
         if start >= lines.len() {
@@ -71,6 +92,9 @@ pub struct IndexStats {
     pub files_indexed: usize,
     pub files_unchanged: usize,
     pub files_removed: usize,
+    /// Files read and hashed because the metadata fast path could not vouch
+    /// for them. Reported so the cost of content checking stays visible.
+    pub files_hashed: usize,
     pub definitions: usize,
     pub references: usize,
 }
@@ -86,48 +110,98 @@ impl Graph {
 
     /// Open (creating if needed). A schema from another version is discarded —
     /// rebuilding costs seconds; querying a shape we misunderstand costs trust.
+    ///
+    /// A database SQLite reports as corrupt, or as not a database at all, is
+    /// deleted and rebuilt. It is a derived cache of the working tree, so
+    /// nothing is lost — and leaving it would silently disable code context on
+    /// every future review, since a failed open is (deliberately) not fatal.
     pub fn open(project_root: &Path) -> Result<Graph> {
         let path = Self::path(project_root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)
-            .with_context(|| format!("could not open {}", path.display()))?;
+        match Self::open_at(&path) {
+            Ok(g) => Ok(g),
+            Err(e) if is_corruption(&e) => {
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    let mut p = path.clone().into_os_string();
+                    p.push(suffix);
+                    let _ = std::fs::remove_file(PathBuf::from(p));
+                }
+                Self::open_at(&path)
+                    .with_context(|| format!("could not rebuild {}", path.display()))
+            }
+            Err(e) => Err(e).with_context(|| format!("could not open {}", path.display())),
+        }
+    }
+
+    fn open_at(path: &Path) -> rusqlite::Result<Graph> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+
+        // Per-connection, takes no lock.
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
-            conn.execute_batch(
+        if version == SCHEMA_VERSION {
+            // Already current: open read-only in effect. Running the schema
+            // batch anyway needs the write lock, so every open — including a
+            // review's — used to queue behind any index in progress and could
+            // fail with "database is locked" once the busy timeout ran out.
+            return Ok(Graph { conn });
+        }
+        // WAL lets reviews read while an index writes. It cannot be switched
+        // inside a transaction, and a concurrent opener may hold the database
+        // briefly; it is an optimisation, so a failure here is not fatal.
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+
+        // Migrate under the write lock and re-check the version inside it:
+        // two first-time openers must not both see "version 0" and have the
+        // second drop the tables the first just created and began filling.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let migrate = (|| -> rusqlite::Result<()> {
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version == SCHEMA_VERSION {
+                return Ok(());
+            }
+            conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS refs;
                  DROP TABLE IF EXISTS defs;
-                 DROP TABLE IF EXISTS files;",
-            )?;
+                 DROP TABLE IF EXISTS files;
+                 CREATE TABLE files (
+                     path       TEXT PRIMARY KEY,
+                     mtime      REAL NOT NULL,
+                     ctime      REAL NOT NULL,
+                     size       INTEGER NOT NULL,
+                     hash       TEXT NOT NULL,
+                     indexed_at REAL NOT NULL
+                 );
+                 CREATE TABLE defs (
+                     path       TEXT NOT NULL,
+                     name       TEXT NOT NULL,
+                     kind       TEXT NOT NULL,
+                     start_line INTEGER NOT NULL,
+                     end_line   INTEGER NOT NULL
+                 );
+                 CREATE TABLE refs (
+                     path TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     line INTEGER NOT NULL
+                 );
+                 CREATE INDEX defs_name ON defs(name);
+                 CREATE INDEX defs_path ON defs(path);
+                 CREATE INDEX refs_name ON refs(name);
+                 CREATE INDEX refs_path ON refs(path);
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
+        })();
+        match migrate {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
         }
-
-        conn.execute_batch(&format!(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS files (
-                 path   TEXT PRIMARY KEY,
-                 mtime  REAL NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS defs (
-                 path       TEXT NOT NULL,
-                 name       TEXT NOT NULL,
-                 kind       TEXT NOT NULL,
-                 start_line INTEGER NOT NULL,
-                 end_line   INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS refs (
-                 path TEXT NOT NULL,
-                 name TEXT NOT NULL,
-                 line INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS defs_name ON defs(name);
-             CREATE INDEX IF NOT EXISTS defs_path ON defs(path);
-             CREATE INDEX IF NOT EXISTS refs_name ON refs(name);
-             CREATE INDEX IF NOT EXISTS refs_path ON refs(path);
-             PRAGMA user_version = {SCHEMA_VERSION};"
-        ))?;
 
         Ok(Graph { conn })
     }
@@ -137,7 +211,19 @@ impl Graph {
     pub fn index(&mut self, project_root: &Path, on_file: &dyn Fn(usize)) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         let mut seen: HashSet<String> = HashSet::new();
-        let tx = self.conn.transaction()?;
+        // Taken once, before any file is read: a file modified after this
+        // instant is newer than its index row by construction.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        // IMMEDIATE takes the write lock up front. A deferred transaction reads
+        // first and upgrades later, and in WAL mode that upgrade fails with
+        // SQLITE_BUSY_SNAPSHOT whenever another indexer committed in between —
+        // an error no busy timeout can wait out.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         for entry in walkdir::WalkDir::new(project_root)
             .into_iter()
@@ -159,32 +245,96 @@ impl Graph {
             };
             let path = relative.to_string_lossy().replace('\\', "/");
 
-            let mtime = entry
-                .metadata()
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let mtime = meta
+                .modified()
                 .ok()
-                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
+            let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+            let ctime = change_time(&meta);
 
             seen.insert(path.clone());
 
-            let known: Option<f64> = tx
-                .query_row("SELECT mtime FROM files WHERE path = ?1", [&path], |r| {
-                    r.get(0)
-                })
+            let known: Option<(f64, f64, i64, String, f64)> = tx
+                .query_row(
+                    "SELECT mtime, ctime, size, hash, indexed_at FROM files WHERE path = ?1",
+                    [&path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
                 .ok();
-            if known == Some(mtime) {
+
+            // Fast path: same mtime, same inode change time, same size, and
+            // old enough that a second write could not have hidden inside the
+            // timestamp's resolution. The change time is what catches a file
+            // rewritten and then given back an old mtime (`cp -p`, `rsync -t`,
+            // `touch -r`): those tools can set mtime but not ctime. Windows
+            // has no ctime; there only the mtime, size and racy window apply.
+            if let Some((known_mtime, known_ctime, known_size, _, indexed_at)) = &known
+                && *known_mtime == mtime
+                && *known_ctime == ctime
+                && *known_size == size
+                && mtime + RACY_WINDOW_SECS < *indexed_at
+                && ctime + RACY_WINDOW_SECS < *indexed_at
+            {
                 stats.files_unchanged += 1;
                 continue;
             }
 
-            let Ok(source) = std::fs::read_to_string(entry.path()) else {
+            // Too big to be hand-written source worth parsing (a bundled or
+            // generated file); recorded with no symbols rather than read.
+            if meta.len() > MAX_INDEX_FILE_BYTES {
+                let marker = format!("too-large:{size}");
+                tx.execute("DELETE FROM defs WHERE path = ?1", [&path])?;
+                tx.execute("DELETE FROM refs WHERE path = ?1", [&path])?;
+                tx.execute(
+                    "INSERT INTO files (path, mtime, ctime, size, hash, indexed_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, \
+                     ctime = excluded.ctime, size = excluded.size, hash = excluded.hash, \
+                     indexed_at = excluded.indexed_at",
+                    params![path, mtime, ctime, size, marker, now],
+                )?;
+                stats.files_unchanged += 1;
+                continue;
+            }
+
+            // Otherwise the content decides. mtime alone was the old rule, and
+            // it misses an edit that lands in the same timestamp tick, a file
+            // restored with its original mtime (`cp -p`, `rsync -t`, `tar x`),
+            // and a clock that steps backwards.
+            // A read can fail transiently — a sharing violation from an editor
+            // or virus scanner on Windows. Leave the row untouched so the next
+            // run retries: recording it would store this mtime and size beside
+            // an empty hash, and the fast path would then trust that forever
+            // on a platform with no ctime to notice otherwise.
+            let Ok(bytes) = std::fs::read(entry.path()) else {
                 continue;
             };
-            let Some(extracted) = extract::extract(lang, &source) else {
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            stats.files_hashed += 1;
+            if let Some((_, _, _, known_hash, _)) = &known
+                && *known_hash == hash
+            {
+                tx.execute(
+                    "UPDATE files SET mtime = ?2, ctime = ?3, size = ?4, indexed_at = ?5 \
+                     WHERE path = ?1",
+                    params![path, mtime, ctime, size, now],
+                )?;
+                stats.files_unchanged += 1;
                 continue;
-            };
+            }
+
+            // A file that cannot be read as text or parsed must not keep the
+            // rows of the version that could: those line ranges now point at
+            // whatever the file holds instead. It is recorded with no symbols.
+            let extracted = String::from_utf8(bytes)
+                .ok()
+                .and_then(|source| extract::extract(lang, &source))
+                .unwrap_or_default();
 
             // Replace this file's rows wholesale. Anything subtler would have
             // to diff two symbol sets, and a stale definition is worse than a
@@ -208,9 +358,12 @@ impl Graph {
             }
 
             tx.execute(
-                "INSERT INTO files (path, mtime) VALUES (?1, ?2) \
-                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime",
-                params![path, mtime],
+                "INSERT INTO files (path, mtime, ctime, size, hash, indexed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, \
+                 ctime = excluded.ctime, size = excluded.size, hash = excluded.hash, \
+                 indexed_at = excluded.indexed_at",
+                params![path, mtime, ctime, size, hash, now],
             )?;
 
             stats.files_indexed += 1;
@@ -350,6 +503,17 @@ impl Graph {
         self.counts().1 == 0
     }
 
+    /// How many definitions share `name` across the repository. Used to tell
+    /// a resolved relationship from a name match that could be any of several.
+    pub fn definition_count(&self, name: &str) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM defs WHERE name = ?1", [name], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| usize::try_from(n).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     fn query_defs(&self, sql: &str, args: impl rusqlite::Params) -> Vec<Def> {
         let Ok(mut stmt) = self.conn.prepare(sql) else {
             return Vec::new();
@@ -368,6 +532,30 @@ impl Graph {
             Err(_) => Vec::new(),
         }
     }
+}
+
+/// The inode change time in seconds, or 0 where the platform has none.
+#[cfg(unix)]
+fn change_time(meta: &std::fs::Metadata) -> f64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ctime() as f64 + meta.ctime_nsec() as f64 / 1e9
+}
+
+#[cfg(not(unix))]
+fn change_time(_meta: &std::fs::Metadata) -> f64 {
+    0.0
+}
+
+/// SQLite's way of saying the file is not a usable database.
+fn is_corruption(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
 }
 
 #[cfg(test)]
@@ -805,6 +993,224 @@ pub fn refresh(token: &str) -> bool {
             g.is_empty(),
             "a shape we do not understand must be discarded"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Set a file's mtime explicitly, so a test can make two different
+    /// contents share one timestamp — what a coarse filesystem, `cp -p`,
+    /// `rsync -t` or an edit within one tick does.
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    /// The defect: freshness was mtime alone, so an edit that did not move the
+    /// mtime left the old symbols — and their line ranges — in the graph.
+    /// Here the edit even restores an hour-old mtime; the inode change time
+    /// still moves.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_keeps_the_same_mtime_and_size_is_still_detected() {
+        let root = project("same-mtime");
+        let file = root.join("src/a.rs");
+        let fixed = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+        write(&root, "src/a.rs", "pub fn alpha() {}\n");
+        set_mtime(&file, fixed);
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+        assert_eq!(defs_of(&g, "alpha").len(), 1);
+
+        // Same length, same mtime, different symbol.
+        write(&root, "src/a.rs", "pub fn bravo() {}\n");
+        set_mtime(&file, fixed);
+        let stats = g.index(&root, &|_| {}).unwrap();
+        assert_eq!(stats.files_indexed, 1, "the content changed");
+        assert!(defs_of(&g, "alpha").is_empty(), "stale symbol survived");
+        assert_eq!(defs_of(&g, "bravo").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The platform-independent half: an edit landing in the same timestamp
+    /// tick as the previous index (mtime within the racy window) is re-hashed.
+    #[test]
+    fn an_edit_within_one_timestamp_tick_is_detected() {
+        let root = project("racy");
+        let file = root.join("src/a.rs");
+        let tick = std::time::SystemTime::now() - std::time::Duration::from_millis(500);
+        write(&root, "src/a.rs", "pub fn alpha() {}\n");
+        set_mtime(&file, tick);
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+
+        write(&root, "src/a.rs", "pub fn bravo() {}\n");
+        set_mtime(&file, tick);
+        let stats = g.index(&root, &|_| {}).unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(defs_of(&g, "bravo").len(), 1);
+        assert!(defs_of(&g, "alpha").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Re-hashing is reserved for files that could be racy; an old, untouched
+    /// file takes the metadata fast path, so a large repository is not read
+    /// and hashed on every review.
+    #[test]
+    fn an_old_unchanged_file_is_not_reread() {
+        let root = project("fast-path");
+        let file = root.join("src/a.rs");
+        write(&root, "src/a.rs", LIB);
+        set_mtime(
+            &file,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+        // The first index ran within the racy window of the file's ctime, so
+        // wait it out once; after that the fast path holds.
+        std::thread::sleep(std::time::Duration::from_secs_f64(RACY_WINDOW_SECS + 0.2));
+        g.index(&root, &|_| {}).unwrap();
+
+        let stats = g.index(&root, &|_| {}).unwrap();
+        assert_eq!(stats.files_unchanged, 1);
+        assert_eq!(stats.files_hashed, 0, "an untouched old file was re-read");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rapid_consecutive_edits_all_land() {
+        let root = project("rapid");
+        let mut g = Graph::open(&root).unwrap();
+        for i in 0..5 {
+            write(&root, "src/a.rs", &format!("pub fn version_{i}() {{}}\n"));
+            g.index(&root, &|_| {}).unwrap();
+            assert_eq!(defs_of(&g, &format!("version_{i}")).len(), 1, "edit {i}");
+            if i > 0 {
+                assert!(defs_of(&g, &format!("version_{}", i - 1)).is_empty());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_renamed_file_moves_its_symbols() {
+        let root = project("rename");
+        write(&root, "src/old_name.rs", "pub fn moved() {}\n");
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+        std::fs::rename(root.join("src/old_name.rs"), root.join("src/new_name.rs")).unwrap();
+        let stats = g.index(&root, &|_| {}).unwrap();
+        assert_eq!(stats.files_removed, 1);
+        let d = defs_of(&g, "moved");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path, "src/new_name.rs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file that stops parsing (or stops being UTF-8) must not keep the
+    /// previous version's rows — their line ranges now point at other text.
+    #[test]
+    fn a_file_that_becomes_unparseable_drops_its_old_symbols() {
+        let root = project("unparseable");
+        write(&root, "src/a.rs", "pub fn was_here() {}\n");
+        let mut g = Graph::open(&root).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+        std::fs::write(root.join("src/a.rs"), [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        g.index(&root, &|_| {}).unwrap();
+        assert!(defs_of(&g, "was_here").is_empty());
+
+        // Malformed but valid UTF-8 never panics the indexer.
+        write(
+            &root,
+            "src/b.rs",
+            "pub fn ((( {{{ ]]] impl <<<\n\u{0}\u{FEFF}",
+        );
+        g.index(&root, &|_| {}).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unicode_paths_and_identifiers_round_trip() {
+        let root = project("unicode");
+        write(
+            &root,
+            "src/módulo_ñ.py",
+            "def función_ünïcode():\n    return 1\n",
+        );
+        let g = indexed(&root);
+        let d = defs_of(&g, "función_ünïcode");
+        assert_eq!(d.len(), 1, "{:?}", g.counts());
+        assert_eq!(d[0].path, "src/módulo_ñ.py");
+        assert!(d[0].source(&root, 10).unwrap().contains("return 1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_files_are_not_indexed() {
+        let root = project("symlink-index");
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("diffmind-outside-{}.rs", std::process::id()));
+        std::fs::write(&outside, "pub fn outside_repo() {}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("src/link.rs")).unwrap();
+        let g = indexed(&root);
+        assert!(defs_of(&g, "outside_repo").is_empty());
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A corrupt database used to make every `Graph::open` fail, and because a
+    /// failed open is not fatal, every later review silently ran without code
+    /// context. It is now discarded and rebuilt.
+    #[test]
+    fn a_corrupt_database_is_rebuilt() {
+        let root = project("corrupt-db");
+        write(&root, "src/a.rs", LIB);
+        indexed(&root);
+        std::fs::write(
+            Graph::path(&root),
+            b"this is not an sqlite database at all, just junk bytes......",
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(root.join(".diffmind/graph.db-wal"));
+        let _ = std::fs::remove_file(root.join(".diffmind/graph.db-shm"));
+        let mut g = Graph::open(&root).expect("rebuilt rather than failing");
+        g.index(&root, &|_| {}).unwrap();
+        assert_eq!(defs_of(&g, "validate_token").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two processes indexing at once (an editor hook and a review) must both
+    /// succeed: the second waits for the first's transaction rather than
+    /// failing with "database is locked".
+    #[test]
+    fn concurrent_indexing_waits_instead_of_failing() {
+        let root = project("concurrent-index");
+        for i in 0..12 {
+            write(
+                &root,
+                &format!("src/f{i}.rs"),
+                &format!("pub fn f{i}() {{}}\n"),
+            );
+        }
+        Graph::open(&root).unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut g = Graph::open(&root)?;
+                    g.index(&root, &|_| {}).map(|_| ())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("every concurrent index succeeds");
+        }
+        let g = Graph::open(&root).unwrap();
+        assert_eq!(g.counts().0, 12);
+        assert_eq!(defs_of(&g, "f7").len(), 1, "no duplicated or lost rows");
         let _ = std::fs::remove_dir_all(&root);
     }
 

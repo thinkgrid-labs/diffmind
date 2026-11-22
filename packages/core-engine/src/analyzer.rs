@@ -5,6 +5,7 @@ use crate::cache::{CacheKeyInput, ReviewCache};
 use crate::detectors;
 use crate::diff::{FileDiff, LineKind, anchor_findings, parse_diff};
 use crate::error::EngineError;
+use crate::error::PartialReview;
 use crate::json_guard::extract_json;
 use crate::prompt::{
     PROMPT_VERSION, Prompt, ReviewPromptInput, commit_message_prompt, pr_description_prompt,
@@ -79,6 +80,73 @@ impl TriageMode {
     }
 }
 
+/// Why a review unit was not reviewed by the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The model answered, but not with anything parseable as a review.
+    Unparseable,
+    /// No amount of splitting fit the unit in the context window.
+    TooLarge,
+    /// The backend failed before or while reviewing it.
+    BackendFailed,
+}
+
+impl SkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::Unparseable => "unparseable",
+            SkipReason::TooLarge => "too_large",
+            SkipReason::BackendFailed => "backend_failed",
+        }
+    }
+}
+
+/// One unit the model did not review, and why.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnitSkip {
+    pub unit_id: String,
+    pub files: Vec<String>,
+    pub reason: SkipReason,
+    pub detail: String,
+}
+
+/// Whether a review covered everything it set out to, in the shape the
+/// machine-readable outputs report it.
+///
+/// Four states, deliberately kept apart because a CI gate must treat them
+/// differently: *complete* with or without blocking findings (the exit code
+/// says which), *incomplete* (some units were never reviewed, so "no
+/// findings" proves nothing about them), and *failed* (the backend broke).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Completeness {
+    /// `complete`, `incomplete`, or `failed`.
+    pub status: String,
+    pub units_planned: usize,
+    pub units_reviewed: usize,
+    pub units_cached: usize,
+    pub units_skipped: usize,
+    pub skipped_unparseable: usize,
+    pub skipped_too_large: usize,
+    pub skipped_backend_failed: usize,
+    /// Files the triage pass chose not to send for deep review. A policy
+    /// decision rather than a failure, so it does not make a review incomplete,
+    /// but it is reported because "reviewed" should never be read as "every
+    /// file was looked at" when it was not.
+    pub files_skipped_by_triage: usize,
+    /// The deterministic detectors run before any inference and cannot be
+    /// skipped; this is true whenever a report exists.
+    pub deterministic_checks_completed: bool,
+    /// Whether the run was configured to require a complete review.
+    pub required: bool,
+    /// True only for a complete review. A gate result from an incomplete or
+    /// failed review says nothing about the units that were not reviewed.
+    pub trustworthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_error: Option<String>,
+    pub skipped: Vec<UnitSkip>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AnalysisStats {
     pub units_total: usize,
@@ -88,6 +156,13 @@ pub struct AnalysisStats {
     /// Units skipped because no amount of splitting fit them in the window.
     /// Distinct from `units_unparseable`: the model was never asked.
     pub units_too_large: usize,
+    /// Units never reviewed because the backend failed — the one that failed
+    /// and every one after it. Non-zero only alongside `backend_error`.
+    pub units_failed: usize,
+    /// The backend failure that stopped the review, if one did.
+    pub backend_error: Option<String>,
+    /// Every unit counted in the three fields above, with its reason.
+    pub skipped: Vec<UnitSkip>,
     pub files_skipped_by_triage: usize,
     pub suppressed: usize,
     pub below_confidence: usize,
@@ -105,6 +180,47 @@ pub struct AnalysisStats {
 }
 
 impl AnalysisStats {
+    /// Units the model did not review, for any reason.
+    pub fn units_skipped(&self) -> usize {
+        self.units_unparseable + self.units_too_large + self.units_failed
+    }
+
+    /// Units with a review result, fresh or cached.
+    pub fn units_reviewed(&self) -> usize {
+        self.units_total.saturating_sub(self.units_skipped())
+    }
+
+    /// Every planned unit was reviewed and the backend never failed.
+    pub fn is_complete(&self) -> bool {
+        self.units_skipped() == 0 && self.backend_error.is_none()
+    }
+
+    pub fn completeness(&self, required: bool) -> Completeness {
+        let status = if self.backend_error.is_some() {
+            "failed"
+        } else if self.is_complete() {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        Completeness {
+            status: status.to_string(),
+            units_planned: self.units_total,
+            units_reviewed: self.units_reviewed(),
+            units_cached: self.units_cached,
+            units_skipped: self.units_skipped(),
+            skipped_unparseable: self.units_unparseable,
+            skipped_too_large: self.units_too_large,
+            skipped_backend_failed: self.units_failed,
+            files_skipped_by_triage: self.files_skipped_by_triage,
+            deterministic_checks_completed: true,
+            required,
+            trustworthy: self.is_complete(),
+            backend_error: self.backend_error.clone(),
+            skipped: self.skipped.clone(),
+        }
+    }
+
     pub fn total_tokens(&self) -> usize {
         self.prompt_tokens + self.completion_tokens
     }
@@ -473,7 +589,25 @@ impl ReviewAnalyzer {
         // changes only the order work is done in.
         units.sort_by_key(|u| rulebook::group_key(&applicable_to_unit(&rulebooks, u)));
 
+        let mut backend_failure: Option<String> = None;
         for (i, unit) in units.iter().enumerate() {
+            let skip = |reason: SkipReason, detail: String| UnitSkip {
+                unit_id: unit.id.clone(),
+                files: unit.files.clone(),
+                reason,
+                detail,
+            };
+
+            // Once the backend has failed, asking it again for every remaining
+            // unit only multiplies timeouts. Record them as not reviewed.
+            if let Some(why) = &backend_failure {
+                stats.units_failed += 1;
+                stats
+                    .skipped
+                    .push(skip(SkipReason::BackendFailed, why.clone()));
+                continue;
+            }
+
             on_progress(i + 1, units.len(), unit);
             let books = applicable_to_unit(&rulebooks, unit);
 
@@ -490,6 +624,7 @@ impl ReviewAnalyzer {
                         &mut emitted,
                         Attribution {
                             unit_id: Some(&unit.id),
+                            unit_files: Some(&unit.files),
                             rulebooks: &books,
                         },
                     );
@@ -505,6 +640,7 @@ impl ReviewAnalyzer {
                         eprintln!("[debug] unit {} ({}) unparseable: {e}", i + 1, unit.file());
                     }
                     stats.units_unparseable += 1;
+                    stats.skipped.push(skip(SkipReason::Unparseable, e));
                 }
                 // Counted and skipped, not fatal. A hunk nobody can fit in the
                 // window is a fact about that hunk; failing the run over it
@@ -515,8 +651,22 @@ impl ReviewAnalyzer {
                         eprintln!("[debug] unit {} ({}) skipped: {why}", i + 1, unit.file());
                     }
                     stats.units_too_large += 1;
+                    stats.skipped.push(skip(SkipReason::TooLarge, why));
                 }
-                Err(e) => return Err(e),
+                // Anything else is the backend itself failing. This used to
+                // return immediately, discarding every finding gathered so far
+                // — the deterministic ones included — and leaving CI with a
+                // bare error and no report. Now the remaining units are marked
+                // not reviewed and the partial result travels inside the error,
+                // so `?` still fails the run while a caller can still report it.
+                Err(e) => {
+                    let why = e.to_string();
+                    stats.units_failed += 1;
+                    stats
+                        .skipped
+                        .push(skip(SkipReason::BackendFailed, why.clone()));
+                    backend_failure = Some(why);
+                }
             }
         }
 
@@ -528,6 +678,13 @@ impl ReviewAnalyzer {
         stats.completion_tokens = self.metering.completion_tokens;
         stats.tokens_estimated = self.metering.estimated;
 
+        if let Some(why) = backend_failure {
+            stats.backend_error = Some(why);
+            return Err(EngineError::Incomplete(Box::new(PartialReview {
+                summary,
+                stats,
+            })));
+        }
         Ok((summary, stats))
     }
 
@@ -542,6 +699,33 @@ impl ReviewAnalyzer {
         from: Attribution<'_>,
     ) -> Vec<ReviewFinding> {
         let (unit_id, rulebooks) = (from.unit_id, from.rulebooks);
+
+        // A model finding must be about the unit the model was shown. The
+        // prompt also carries surrounding code from other files, and a finding
+        // "about" one of those — or about another unit's file it has not seen
+        // — is speculation, or the product of instructions planted in that
+        // code. It is dropped and counted with the unanchorable ones.
+        //
+        // The match is by path — exact, or on a whole path-component suffix —
+        // never by bare basename against another directory: `src/b/mod.rs`
+        // must not pass for a unit covering `src/a/mod.rs`. Surviving findings
+        // are then anchored against the unit's files only, so the diff-wide
+        // fallback matching cannot re-attach one to another unit's file.
+        let in_unit: Option<Vec<FileDiff>> = from
+            .unit_files
+            .map(|unit_files| {
+                files
+                    .iter()
+                    .filter(|f| unit_files.iter().any(|u| u == &f.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+        if let Some(scope) = &in_unit {
+            let before = findings.len();
+            findings.retain(|f| names_a_unit_file(&f.file, scope));
+            stats.unanchorable += before - findings.len();
+        }
         // Give model findings an explicit rule ID so they can be suppressed and
         // reported like any other, and record which unit produced them so a
         // reader can be shown the hunk the model was actually looking at.
@@ -581,7 +765,7 @@ impl ReviewAnalyzer {
         }
 
         let before_anchor = findings.len();
-        anchor_findings(&mut findings, files);
+        anchor_findings(&mut findings, in_unit.as_deref().unwrap_or(files));
         stats.unanchorable += before_anchor - findings.len();
 
         let before_conf = findings.len();
@@ -653,18 +837,21 @@ impl ReviewAnalyzer {
             return Ok((first, cached_a && cached_b));
         }
 
-        let cache_key = self.cache.as_ref().map(|_| {
-            ReviewCache::key(&CacheKeyInput {
-                backend: &self.backend.describe(),
+        let opts = self.gen_options(max_tokens as usize);
+        let cache_key = self.cache.as_ref().map(|cache| {
+            cache.key(&CacheKeyInput {
+                backend: &self.backend.cache_identity(),
                 prompt_version: PROMPT_VERSION,
-                chunk,
-                context: &context,
-                languages: self.languages.as_deref().unwrap_or(""),
-                rulebook_digest: &rulebook::digest(rulebooks),
-                requirements: self.requirements.as_deref().unwrap_or(""),
+                // The prompt as rendered — after the context, rule sets and
+                // requirements have been fitted to this backend's window at
+                // this depth — so the key cannot drift from what is asked.
+                prompt: &prompt.to_chatml(),
                 max_tokens,
-                temperature: self.temperature,
-                seed: self.seed,
+                temperature: opts.temperature,
+                seed: opts.seed,
+                repeat_penalty: opts.repeat_penalty,
+                repeat_last_n: opts.repeat_last_n,
+                json: opts.json,
             })
         });
 
@@ -674,7 +861,6 @@ impl ReviewAnalyzer {
             return Ok((hit, true));
         }
 
-        let opts = self.gen_options(max_tokens as usize);
         let response = self.generate_metered(&prompt, &opts)?;
         let summary = parse_review_response(&response)?;
 
@@ -816,6 +1002,22 @@ impl ReviewAnalyzer {
     }
 }
 
+/// Whether a model-reported path names one of `scope`'s files: exactly, or by
+/// a suffix that starts at a path separator (`mod.rs` or `a/mod.rs` for
+/// `src/a/mod.rs`, never `b/mod.rs`). An empty path is accepted only when the
+/// unit has a single file.
+fn names_a_unit_file(reported: &str, scope: &[FileDiff]) -> bool {
+    let reported = reported.trim().trim_start_matches("./");
+    if reported.is_empty() {
+        return scope.len() == 1;
+    }
+    scope.iter().any(|f| {
+        f.path == reported
+            || f.path.ends_with(&format!("/{reported}"))
+            || reported.ends_with(&format!("/{}", f.path))
+    })
+}
+
 /// Rule sets governing any file in the unit. A merged unit spans more than one
 /// file, and a rule scoped to either of them still applies.
 fn applicable_to_unit<'a>(
@@ -838,6 +1040,8 @@ fn applicable_to_unit<'a>(
 /// travel together and are meaningless apart.
 struct Attribution<'a> {
     unit_id: Option<&'a str>,
+    /// The files the unit covers; model findings outside them are rejected.
+    unit_files: Option<&'a [String]>,
     rulebooks: &'a [&'a Rulebook],
 }
 
@@ -846,6 +1050,7 @@ impl Attribution<'_> {
     fn none() -> Self {
         Attribution {
             unit_id: None,
+            unit_files: None,
             rulebooks: &[],
         }
     }
@@ -971,6 +1176,72 @@ fn split_in_half(chunk: &str) -> (String, String) {
 /// findings array. Uses the string-aware extractor so a `}` inside an `issue`
 /// no longer truncates the object.
 pub fn parse_review_response(response: &str) -> Result<ReviewSummary, EngineError> {
+    let mut summary = parse_review_response_raw(response)?;
+    sanitize_model_output(&mut summary);
+    Ok(summary)
+}
+
+/// Most findings one unit may contribute. A unit is a few hundred lines; past
+/// this the model is enumerating, not reviewing, and the output is better
+/// treated as noise than shipped to a PR.
+const MAX_FINDINGS_PER_UNIT: usize = 50;
+const MAX_NOTES_PER_UNIT: usize = 10;
+const MAX_ISSUE_CHARS: usize = 2_000;
+const MAX_FIX_CHARS: usize = 4_000;
+const MAX_NOTE_CHARS: usize = 500;
+const MAX_PATH_CHARS: usize = 512;
+
+/// Model output is untrusted text derived from untrusted input. Before it
+/// reaches a terminal, a SARIF file or a PR comment it is stripped of control
+/// characters — an ANSI escape in an `issue` would otherwise rewrite the
+/// reviewer's terminal — and bounded in size and count.
+fn sanitize_model_output(summary: &mut ReviewSummary) {
+    summary.findings.truncate(MAX_FINDINGS_PER_UNIT);
+    for f in &mut summary.findings {
+        f.file = clean_text(&f.file, MAX_PATH_CHARS, false);
+        f.issue = clean_text(&f.issue, MAX_ISSUE_CHARS, true);
+        f.suggested_fix = clean_text(&f.suggested_fix, MAX_FIX_CHARS, true);
+        if let Some(rule) = &f.rule {
+            f.rule = Some(clean_text(rule, 128, false));
+        }
+        // Only the engine assigns these; a model-supplied value would let the
+        // output claim a deterministic rule id or another unit's provenance.
+        f.rule_id = None;
+        f.unit_id = None;
+        if let Some(c) = f.confidence
+            && !c.is_finite()
+        {
+            f.confidence = None;
+        }
+    }
+    for list in [&mut summary.positives, &mut summary.suggestions] {
+        list.truncate(MAX_NOTES_PER_UNIT);
+        for item in list.iter_mut() {
+            *item = clean_text(item, MAX_NOTE_CHARS, false);
+        }
+        list.retain(|i| !i.trim().is_empty());
+    }
+}
+
+/// Drop control characters (keeping newlines and tabs only where allowed) and
+/// cap the length in characters, never splitting one.
+fn clean_text(s: &str, max_chars: usize, keep_newlines: bool) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control() || (keep_newlines && (*c == '\n' || *c == '\t')))
+        // Bidirectional overrides can make text read differently from what it
+        // is (CVE-2021-42574); there is no legitimate use for them here.
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+fn parse_review_response_raw(response: &str) -> Result<ReviewSummary, EngineError> {
     let Some(json) = extract_json(response) else {
         // A model that produced no JSON at all found nothing worth reporting
         // often enough that erroring here would be noisier than it is worth,
@@ -1572,18 +1843,25 @@ diff --git a/src/auth.js b/src/auth.js
     /// an unrelated file in the same diff changes.
     #[test]
     fn an_unrelated_files_edit_does_not_change_a_chunks_cache_key() {
+        // The key is taken over the rendered prompt, so this is the property
+        // end to end: a.rs's prompt is a function of a.rs and its own context.
+        let analyzer = ReviewAnalyzer::new(Box::new(RecordingBackend {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let cache = ReviewCache::new(std::path::PathBuf::from("unused"));
+        let chunk = "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n";
         let key_for = |ctx: &str| {
-            ReviewCache::key(&CacheKeyInput {
+            let prompt = analyzer.build_prompt(chunk, ctx, &[], 512, 0);
+            cache.key(&CacheKeyInput {
                 backend: "recording",
                 prompt_version: PROMPT_VERSION,
-                chunk: "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n+let new_a = 2;\n",
-                context: ctx,
-                languages: "Rust",
-                rulebook_digest: "",
-                requirements: "",
+                prompt: &prompt.to_chatml(),
                 max_tokens: 512,
                 temperature: 0.0,
                 seed: 7,
+                repeat_penalty: 1.1,
+                repeat_last_n: 64,
+                json: true,
             })
         };
 

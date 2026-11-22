@@ -387,6 +387,12 @@ pub fn anchor_findings(findings: &mut Vec<crate::types::ReviewFinding>, files: &
     });
 }
 
+/// Whether a model-reported path resolves to one of `files`, by the same
+/// rules [`anchor_findings`] uses.
+pub fn matches_any_file(reported: &str, files: &[FileDiff]) -> bool {
+    match_file(reported, files).is_some()
+}
+
 /// Resolve a model-reported path against the diff's real paths.
 /// Matches exactly, then by suffix, then by basename.
 fn match_file<'a>(reported: &str, files: &'a [FileDiff]) -> Option<&'a FileDiff> {

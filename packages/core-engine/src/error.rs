@@ -1,5 +1,20 @@
 use thiserror::Error;
 
+use crate::analyzer::AnalysisStats;
+use crate::types::ReviewSummary;
+
+/// What a review produced before the backend failed: the deterministic
+/// findings and every unit reviewed so far, with the units that were not.
+///
+/// Carried inside the error so that any caller using `?` still fails exactly
+/// as before — a backend failure never silently becomes a clean result — while
+/// a caller that knows what to do with a partial report can recover it.
+#[derive(Debug)]
+pub struct PartialReview {
+    pub summary: ReviewSummary,
+    pub stats: AnalysisStats,
+}
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("failed to load tokenizer: {0}")]
@@ -34,6 +49,11 @@ pub enum EngineError {
     Backend { backend: String, message: String },
     #[error("configuration error: {0}")]
     Config(String),
+    /// The backend failed part-way through a review. The review is incomplete
+    /// and must be reported as a failure; the partial results are attached for
+    /// diagnostics. `stats.backend_error` holds the underlying message.
+    #[error("review incomplete: {}", .0.stats.backend_error.as_deref().unwrap_or("backend failed"))]
+    Incomplete(Box<PartialReview>),
 }
 
 impl From<std::io::Error> for EngineError {

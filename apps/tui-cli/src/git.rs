@@ -28,6 +28,10 @@ const EXCLUDES: &[&str] = &[
 /// leave a perfectly reviewable branch behind.
 const MAX_RAW_DIFF_MB: usize = 64;
 
+/// The same ceiling in bytes, for a diff that arrives on stdin rather than
+/// from git. It used to be read with no limit at all.
+pub const MAX_RAW_DIFF_BYTES: usize = MAX_RAW_DIFF_MB * 1024 * 1024;
+
 fn git(args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .args(args)
@@ -97,7 +101,11 @@ fn rev_exists(rev: &str) -> bool {
 }
 
 fn run_diff(range: Option<&str>, paths: &[String], cached: bool) -> Result<String> {
-    let mut args: Vec<String> = vec!["diff".into()];
+    // core.quotepath=false: non-ASCII paths come out as UTF-8 instead of git's
+    // octal-escaped quoted form (`"caf\303\251.rs"`), which the diff parser
+    // does not map back to the file — so context, anchoring and the generated
+    // check all missed it.
+    let mut args: Vec<String> = vec!["-c".into(), "core.quotepath=false".into(), "diff".into()];
     if cached {
         args.push("--cached".into());
     }
@@ -248,6 +256,12 @@ pub fn get_range_diff(range: &str, paths: &[String]) -> Result<String> {
 
 /// Returns the diff of this branch against `branch`.
 pub fn get_diff(branch: &str, paths: &[String]) -> Result<String> {
+    // The branch can come from `.diffmind/config.toml`, which is part of the
+    // repository under review. A value starting with `-` would reach git as an
+    // option — `--output=<file>` makes `git diff` write wherever it says.
+    if branch.starts_with('-') || branch.trim().is_empty() {
+        anyhow::bail!("'{branch}' is not a valid base branch name");
+    }
     // Prefer the merge-base form so unrelated commits landing on the base
     // branch do not show up as this branch's work.
     let candidates = [
@@ -317,6 +331,15 @@ pub fn git_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_branch_that_looks_like_an_option_is_refused_before_git_sees_it() {
+        for hostile in ["--output=/tmp/diffmind-pwned", "-p", "--no-index", "  "] {
+            let err = get_diff(hostile, &[]).unwrap_err().to_string();
+            assert!(err.contains("not a valid base branch"), "{hostile}: {err}");
+        }
+        assert!(!std::path::Path::new("/tmp/diffmind-pwned").exists());
+    }
 
     #[test]
     fn excludes_cover_only_the_never_read_directories() {

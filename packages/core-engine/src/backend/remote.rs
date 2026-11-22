@@ -42,15 +42,78 @@ pub struct RemoteBackend {
     client: reqwest::blocking::Client,
     protocol: RemoteProtocol,
     base_url: String,
+    /// `base_url` with any `user:password@` and query string removed. This is
+    /// the only form that is ever printed, written to a report or a run
+    /// record, or folded into a cache key.
+    display_url: String,
     model: String,
     api_key: Option<String>,
     context_tokens: usize,
+    /// First retry delay; doubles per attempt. A field so tests need not sleep.
+    retry_base: Duration,
+    /// Resolved on first use: a server round-trip is not free and only the
+    /// cache needs it.
+    identity: std::sync::OnceLock<String>,
 }
 
 /// Default assumption for a remote model's context window. Deliberately
 /// conservative: overrunning a server's real limit produces an opaque 400,
 /// whereas under-using it only costs an extra chunk.
 const DEFAULT_REMOTE_CONTEXT: usize = 8192;
+
+/// How long to wait for a TCP connection. Separate from the overall timeout,
+/// which has to allow minutes of generation: a server that is not there should
+/// be reported in seconds, not after the full generation budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest response body accepted. A review is a few KB of JSON; anything near
+/// this is a misbehaving server, and reading it unbounded is a memory DoS.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Attempts per generation, including the first. Bounded so a flapping server
+/// costs a known, small multiple of one request — never an open-ended wait.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Ceiling on a server-requested `Retry-After`.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Characters of a server error body worth showing.
+const MAX_ERROR_DETAIL: usize = 300;
+
+/// Strip credentials and query from a URL for display. Returns the input
+/// unchanged if it does not parse (it will be rejected anyway).
+pub fn redact_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// One attempt's failure, classified for the retry loop.
+enum Attempt {
+    Retry {
+        message: String,
+        after: Option<Duration>,
+    },
+    Fatal(String),
+}
 
 impl RemoteBackend {
     pub fn new(
@@ -61,29 +124,73 @@ impl RemoteBackend {
         context_tokens: Option<usize>,
         timeout: Duration,
     ) -> Result<Self, EngineError> {
+        let config_err = |m: String| EngineError::Config(m);
         if model.trim().is_empty() {
-            return Err(EngineError::Config(
+            return Err(config_err(
                 "--backend-model is required when using a remote backend".into(),
             ));
         }
 
+        // Validate the URL here, where the message can be specific, rather
+        // than on the first request in the middle of a review.
+        let parsed = reqwest::Url::parse(base_url.trim()).map_err(|e| {
+            config_err(format!(
+                "invalid backend URL '{}': {e}",
+                redact_url(base_url)
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+            return Err(config_err(format!(
+                "backend URL '{}' must be an http:// or https:// address with a host",
+                redact_url(base_url)
+            )));
+        }
+        // An API key over plain HTTP to another machine is a credential sent in
+        // clear text, along with the code. Loopback is exempt (nothing leaves
+        // the host); anything else needs https, or an explicit opt-out.
+        if api_key.is_some()
+            && parsed.scheme() == "http"
+            && !is_loopback_host(&parsed)
+            && std::env::var("DIFFMIND_ALLOW_INSECURE_API_KEY").as_deref() != Ok("1")
+        {
+            return Err(config_err(format!(
+                "refusing to send an API key over plain HTTP to {}. Use https://, a \
+                 loopback address, or set DIFFMIND_ALLOW_INSECURE_API_KEY=1 to accept the risk.",
+                redact_url(base_url)
+            )));
+        }
+
         let client = reqwest::blocking::Client::builder()
             .user_agent(concat!("diffmind/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
             .timeout(timeout)
+            // A redirect would re-send the code — and, cross-origin, possibly
+            // the key — somewhere the user did not configure. Fail instead.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| EngineError::Backend {
                 backend: protocol.as_str().into(),
-                message: format!("could not build HTTP client: {e}"),
+                message: format!("could not build HTTP client: {}", e.without_url()),
             })?;
 
+        let base = base_url.trim().trim_end_matches('/').to_string();
         Ok(RemoteBackend {
             client,
             protocol,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            display_url: redact_url(&base),
+            base_url: base,
             model: model.to_string(),
             api_key,
             context_tokens: context_tokens.unwrap_or(DEFAULT_REMOTE_CONTEXT),
+            retry_base: Duration::from_secs(1),
+            identity: std::sync::OnceLock::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_retry_base(mut self, d: Duration) -> Self {
+        self.retry_base = d;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -162,29 +269,68 @@ impl RemoteBackend {
             message: message.into(),
         }
     }
-}
 
-impl ReviewBackend for RemoteBackend {
-    fn describe(&self) -> String {
-        format!(
-            "{} · {} ({})",
-            self.model,
-            self.protocol.as_str(),
-            self.base_url
-        )
+    /// Text from the server, made safe to print: control characters removed,
+    /// the API key masked if the server echoed it, and the length capped.
+    fn sanitize_detail(&self, text: &str) -> String {
+        // Redact before truncating: a key straddling the cut would otherwise
+        // survive as a prefix.
+        let mut redacted = text.to_string();
+        if let Some(key) = &self.api_key
+            && key.len() >= 4
+        {
+            redacted = redacted.replace(key.as_str(), "<redacted>");
+        }
+        redacted
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .take(MAX_ERROR_DETAIL)
+            .collect()
     }
 
-    fn context_tokens(&self) -> usize {
-        self.context_tokens
+    /// Read a response body without trusting its size.
+    fn read_bounded(&self, response: reqwest::blocking::Response) -> Result<String, Attempt> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                // The overall timeout can expire while the body is still
+                // arriving (headers sent, then a stall). That has already
+                // spent the whole budget, so — as for a timeout before the
+                // headers — it is not retried.
+                let timed_out = e.kind() == std::io::ErrorKind::TimedOut
+                    || e.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout);
+                if timed_out {
+                    Attempt::Fatal(format!(
+                        "timed out reading the response from {}. Raise --backend-timeout.",
+                        self.display_url
+                    ))
+                } else {
+                    Attempt::Retry {
+                        message: format!(
+                            "the connection to {} was interrupted: {}",
+                            self.display_url,
+                            self.sanitize_detail(&e.to_string())
+                        ),
+                        after: None,
+                    }
+                }
+            })?;
+        if buf.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(Attempt::Fatal(format!(
+                "response from {} exceeded {} MB",
+                self.display_url,
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            )));
+        }
+        String::from_utf8(buf).map_err(|_| Attempt::Fatal("response was not valid UTF-8".into()))
     }
 
-    fn supports_constrained_json(&self) -> bool {
-        // The server is *asked* for JSON, but nothing guarantees it complies —
-        // the caller still needs the repair path.
-        false
-    }
-
-    fn generate(&mut self, prompt: &Prompt, opts: &GenOptions) -> Result<String, EngineError> {
+    fn attempt(&self, prompt: &Prompt, opts: &GenOptions) -> Result<String, Attempt> {
         let mut request = self
             .client
             .post(self.endpoint())
@@ -194,26 +340,43 @@ impl ReviewBackend for RemoteBackend {
         }
 
         let response = request.send().map_err(|e| {
-            // A connection refusal here almost always means "the server isn't
-            // running", which is worth saying out loud rather than dumping a
-            // reqwest chain on the user.
+            // reqwest's message embeds the full URL, credentials included;
+            // `without_url` drops it and the redacted form is named instead.
             if e.is_connect() {
-                self.err(format!(
-                    "could not connect to {}. Is the server running?",
-                    self.base_url
-                ))
+                Attempt::Retry {
+                    message: format!(
+                        "could not connect to {}. Is the server running?",
+                        self.display_url
+                    ),
+                    after: None,
+                }
             } else if e.is_timeout() {
-                self.err(format!(
+                // Not retried: the full timeout has already been spent, and
+                // retrying would multiply it.
+                Attempt::Fatal(format!(
                     "timed out waiting for {}. Try a smaller model or raise --backend-timeout.",
-                    self.base_url
+                    self.display_url
                 ))
             } else {
-                self.err(e.to_string())
+                Attempt::Retry {
+                    message: format!(
+                        "request to {} failed: {}",
+                        self.display_url,
+                        self.sanitize_detail(&e.without_url().to_string())
+                    ),
+                    after: None,
+                }
             }
         })?;
 
         let status = response.status();
-        let text = response.text().map_err(|e| self.err(e.to_string()))?;
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
+        let text = self.read_bounded(response)?;
 
         if !status.is_success() {
             let detail = serde_json::from_str::<Value>(&text)
@@ -222,15 +385,126 @@ impl ReviewBackend for RemoteBackend {
                     v.get("error")
                         .map(|e| e.get("message").unwrap_or(e).to_string())
                 })
-                .unwrap_or_else(|| text.chars().take(300).collect());
-            return Err(self.err(format!("HTTP {status}: {detail}")));
+                .unwrap_or_else(|| text.clone());
+            let message = format!("HTTP {status}: {}", self.sanitize_detail(&detail));
+            let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || matches!(status.as_u16(), 500 | 502 | 503 | 504);
+            return Err(if transient {
+                Attempt::Retry {
+                    message,
+                    after: retry_after,
+                }
+            } else {
+                Attempt::Fatal(message)
+            });
         }
 
         let body: Value = serde_json::from_str(&text)
-            .map_err(|e| self.err(format!("response was not JSON: {e}")))?;
+            .map_err(|e| Attempt::Fatal(format!("response was not JSON: {e}")))?;
 
         self.extract_content(&body)
-            .ok_or_else(|| self.err("response contained no message content".to_string()))
+            .ok_or_else(|| Attempt::Fatal("response contained no message content".to_string()))
+    }
+
+    /// Ask the server which exact model a name currently resolves to.
+    ///
+    /// Ollama reports a content digest per tag, so a re-pulled `qwen2.5-coder`
+    /// gets a new identity and cannot replay the old weights' cached findings.
+    /// OpenAI-compatible servers expose no revision; their identity says
+    /// `unverified` so the limitation is visible wherever the identity is.
+    fn resolve_identity(&self) -> String {
+        let revision = match self.protocol {
+            RemoteProtocol::Ollama => self
+                .ollama_digest()
+                .map(|d| format!("digest={d}"))
+                .unwrap_or_else(|| "digest=unverified".into()),
+            RemoteProtocol::OpenAiCompatible => "revision=unverified".into(),
+        };
+        format!(
+            "{}|{}|{}|ctx={}|{revision}",
+            self.protocol.as_str(),
+            self.display_url,
+            self.model,
+            self.context_tokens
+        )
+    }
+
+    fn ollama_digest(&self) -> Option<String> {
+        let mut req = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .timeout(Duration::from_secs(5));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = self.read_bounded(resp).ok()?;
+        let tags: Value = serde_json::from_str(&text).ok()?;
+        let wanted = if self.model.contains(':') {
+            self.model.clone()
+        } else {
+            format!("{}:latest", self.model)
+        };
+        tags.get("models")?.as_array()?.iter().find_map(|m| {
+            let name = m
+                .get("name")
+                .or_else(|| m.get("model"))
+                .and_then(|n| n.as_str())?;
+            (name == self.model || name == wanted)
+                .then(|| m.get("digest").and_then(|d| d.as_str()))
+                .flatten()
+                .filter(|d| !d.is_empty() && d.len() <= 128)
+                .map(str::to_string)
+        })
+    }
+}
+
+impl ReviewBackend for RemoteBackend {
+    fn describe(&self) -> String {
+        format!(
+            "{} · {} ({})",
+            self.model,
+            self.protocol.as_str(),
+            self.display_url
+        )
+    }
+
+    fn context_tokens(&self) -> usize {
+        self.context_tokens
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity
+            .get_or_init(|| self.resolve_identity())
+            .clone()
+    }
+
+    fn supports_constrained_json(&self) -> bool {
+        // The server is *asked* for JSON, but nothing guarantees it complies —
+        // the caller still needs the repair path.
+        false
+    }
+
+    fn generate(&mut self, prompt: &Prompt, opts: &GenOptions) -> Result<String, EngineError> {
+        let mut last = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.attempt(prompt, opts) {
+                Ok(text) => return Ok(text),
+                Err(Attempt::Fatal(message)) => return Err(self.err(message)),
+                Err(Attempt::Retry { message, after }) => {
+                    last = message;
+                    if attempt + 1 == MAX_ATTEMPTS {
+                        break;
+                    }
+                    let backoff = self.retry_base.saturating_mul(1u32 << attempt);
+                    std::thread::sleep(after.unwrap_or(backoff).min(MAX_RETRY_AFTER));
+                }
+            }
+        }
+        Err(self.err(format!("{last} (gave up after {MAX_ATTEMPTS} attempts)")))
     }
 }
 
@@ -344,6 +618,372 @@ mod tests {
         assert_eq!(oai.extract_content(&v).as_deref(), Some("hi"));
 
         assert_eq!(oai.extract_content(&json!({"choices": []})), None);
+    }
+
+    // ── Failure handling against a scripted local HTTP server ─────────────
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One scripted reply. `Close` drops the connection without answering;
+    /// `Stall` accepts and never answers; `StallBody` sends headers and part
+    /// of the body, then stalls.
+    #[derive(Clone)]
+    enum Reply {
+        Http(u16, Vec<(&'static str, String)>, Vec<u8>),
+        Close,
+        Stall,
+        StallBody,
+    }
+
+    fn ok_ollama(content: &str) -> Reply {
+        Reply::Http(
+            200,
+            vec![],
+            serde_json::to_vec(&json!({"message": {"content": content}})).unwrap(),
+        )
+    }
+
+    /// Serve `script` in order, one reply per connection; the last repeats.
+    /// Returns the base URL and a counter of requests received.
+    fn stub(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Drain the request head and body (Content-Length is small).
+                let mut buf = vec![0u8; 256 * 1024];
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = conn.read(&mut buf);
+                let reply = script
+                    .get(i)
+                    .or_else(|| script.last())
+                    .cloned()
+                    .unwrap_or(Reply::Close);
+                match reply {
+                    Reply::Close => drop(conn),
+                    Reply::Stall => {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    Reply::StallBody => {
+                        let _ = conn.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"mess",
+                        );
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    Reply::Http(code, headers, body) => {
+                        let mut head = format!(
+                            "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            body.len()
+                        );
+                        for (k, v) in headers {
+                            head.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        head.push_str("\r\n");
+                        let _ = conn.write_all(head.as_bytes());
+                        let _ = conn.write_all(&body);
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn live(url: &str, timeout: Duration) -> RemoteBackend {
+        RemoteBackend::new(RemoteProtocol::Ollama, url, "m", None, None, timeout)
+            .unwrap()
+            .with_retry_base(Duration::from_millis(10))
+    }
+
+    fn prompt() -> Prompt {
+        Prompt {
+            system: "s".into(),
+            user: "u".into(),
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_is_retried_and_then_succeeds() {
+        let (url, hits) = stub(vec![
+            Reply::Http(
+                429,
+                vec![("Retry-After", "0".into())],
+                b"slow down".to_vec(),
+            ),
+            Reply::Http(503, vec![], b"busy".to_vec()),
+            ok_ollama("{\"findings\": []}"),
+        ]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let out = b
+            .generate(&prompt(), &opts())
+            .expect("third attempt succeeds");
+        assert!(out.contains("findings"));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn server_errors_are_retried_a_bounded_number_of_times() {
+        let (url, hits) = stub(vec![Reply::Http(
+            500,
+            vec![],
+            b"{\"error\":\"boom\"}".to_vec(),
+        )]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 500") && err.contains("gave up after 3"),
+            "{err}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn a_client_error_is_not_retried() {
+        let (url, hits) = stub(vec![Reply::Http(
+            400,
+            vec![],
+            b"{\"error\":{\"message\":\"context length exceeded\"}}".to_vec(),
+        )]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("context length exceeded"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_dropped_connection_is_retried() {
+        let (url, hits) = stub(vec![Reply::Close, ok_ollama("{}")]);
+        let mut b = live(&url, Duration::from_secs(5));
+        b.generate(&prompt(), &opts())
+            .expect("retry after a dropped connection");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn invalid_json_and_missing_fields_are_reported_not_retried() {
+        let (url, hits) = stub(vec![Reply::Http(
+            200,
+            vec![],
+            b"<html>proxy page</html>".to_vec(),
+        )]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("not JSON"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let (url, _) = stub(vec![Reply::Http(
+            200,
+            vec![],
+            b"{\"unexpected\": true}".to_vec(),
+        )]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("no message content"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_response_is_refused() {
+        let huge = vec![b'x'; (MAX_RESPONSE_BYTES + 1024) as usize];
+        let (url, _) = stub(vec![Reply::Http(200, vec![], huge)]);
+        let mut b = live(&url, Duration::from_secs(20));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("exceeded"), "{err}");
+    }
+
+    #[test]
+    fn an_extremely_large_error_body_is_truncated_in_the_message() {
+        let body = vec![b'e'; 200_000];
+        let (url, _) = stub(vec![Reply::Http(418, vec![], body)]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.len() < 1000, "error message was {} bytes", err.len());
+    }
+
+    #[test]
+    fn a_stalled_server_times_out_without_retrying() {
+        let (url, hits) = stub(vec![Reply::Stall]);
+        let mut b = live(&url, Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_body_that_stalls_after_the_headers_times_out_without_retrying() {
+        let (url, hits) = stub(vec![Reply::StallBody]);
+        let mut b = live(&url, Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a timeout must not be retried"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_key_straddling_the_truncation_point_is_still_redacted() {
+        let key = "sk-0123456789abcdef";
+        let b = RemoteBackend::new(
+            RemoteProtocol::OpenAiCompatible,
+            "https://llm.example.invalid/v1",
+            "m",
+            Some(key.into()),
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let text = format!("{}{key}", "x".repeat(MAX_ERROR_DETAIL - 5));
+        assert!(!b.sanitize_detail(&text).contains("sk-01"));
+    }
+
+    #[test]
+    fn an_unreachable_server_is_named_and_bounded() {
+        // Bind and drop, so the port is very likely closed.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // What must hold is that a refused connection fails well before the
+        // request timeout, not after MAX_ATTEMPTS × timeout. A refusal is
+        // immediate on Linux and macOS, but Windows retries a SYN answered
+        // with RST, so each connect to a closed loopback port takes ~2 s and
+        // the three attempts ~6 s. A hang would take 3 × CONNECT_TIMEOUT.
+        let mut b = live(&format!("http://127.0.0.1:{port}"), Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("could not connect"), "{err}");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_redirect_is_not_followed() {
+        let (url, hits) = stub(vec![Reply::Http(
+            307,
+            vec![("Location", "http://127.0.0.1:9/elsewhere".into())],
+            vec![],
+        )]);
+        let mut b = live(&url, Duration::from_secs(5));
+        let err = b.generate(&prompt(), &opts()).unwrap_err().to_string();
+        assert!(err.contains("307"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn credentials_never_reach_a_label_or_an_error() {
+        let b = RemoteBackend::new(
+            RemoteProtocol::OpenAiCompatible,
+            "https://user:hunter2@llm.example.invalid/v1?api_key=sk-live-123",
+            "m",
+            Some("sk-secret-value".into()),
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let label = b.describe();
+        assert!(
+            !label.contains("hunter2") && !label.contains("sk-live-123"),
+            "{label}"
+        );
+        let id = b.cache_identity();
+        assert!(
+            !id.contains("hunter2") && !id.contains("sk-live-123"),
+            "{id}"
+        );
+        assert_eq!(
+            b.sanitize_detail("bad key sk-secret-value\u{1b}[31m"),
+            "bad key <redacted>[31m"
+        );
+    }
+
+    #[test]
+    fn invalid_urls_are_rejected_up_front() {
+        for bad in ["not a url", "ftp://host/x", "file:///etc/passwd", "http://"] {
+            let r = RemoteBackend::new(
+                RemoteProtocol::Ollama,
+                bad,
+                "m",
+                None,
+                None,
+                Duration::from_secs(1),
+            );
+            assert!(r.is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn an_api_key_is_not_sent_over_plain_http_to_another_host() {
+        let r = RemoteBackend::new(
+            RemoteProtocol::OpenAiCompatible,
+            "http://llm.example.invalid/v1",
+            "m",
+            Some("k".into()),
+            None,
+            Duration::from_secs(1),
+        );
+        let Err(e) = r else {
+            panic!("a cleartext key to a remote host must be refused")
+        };
+        assert!(e.to_string().contains("plain HTTP"));
+        // Loopback and https are fine.
+        for ok in [
+            "http://127.0.0.1:8000/v1",
+            "http://localhost:8000/v1",
+            "https://llm.example.invalid/v1",
+        ] {
+            assert!(
+                RemoteBackend::new(
+                    RemoteProtocol::OpenAiCompatible,
+                    ok,
+                    "m",
+                    Some("k".into()),
+                    None,
+                    Duration::from_secs(1)
+                )
+                .is_ok(),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_identity_tracks_the_ollama_model_digest() {
+        let tags = |digest: &str| {
+            Reply::Http(
+                200,
+                vec![],
+                serde_json::to_vec(&json!({"models": [
+                    {"name": "other:latest", "digest": "zzz"},
+                    {"name": "m:latest", "digest": digest},
+                ]}))
+                .unwrap(),
+            )
+        };
+        let (url, _) = stub(vec![tags("aaa111")]);
+        let a = live(&url, Duration::from_secs(5)).cache_identity();
+        let (url2, _) = stub(vec![tags("bbb222")]);
+        let b = live(&url2, Duration::from_secs(5)).cache_identity();
+        assert!(a.contains("digest=aaa111"), "{a}");
+        assert!(b.contains("digest=bbb222"), "{b}");
+
+        // A server that cannot say is labelled as such, never guessed.
+        let (url3, _) = stub(vec![Reply::Http(404, vec![], vec![])]);
+        let c = live(&url3, Duration::from_secs(5)).cache_identity();
+        assert!(c.contains("digest=unverified"), "{c}");
+        let oai = backend(RemoteProtocol::OpenAiCompatible).cache_identity();
+        assert!(oai.contains("revision=unverified"), "{oai}");
     }
 
     #[test]

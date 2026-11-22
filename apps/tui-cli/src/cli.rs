@@ -91,6 +91,16 @@ pub struct Cli {
     #[arg(long)]
     pub fail_on: Option<String>,
 
+    /// Fail (exit 2) when part of the diff was not reviewed — a unit whose
+    /// model output could not be parsed, or one too large for the context
+    /// window. [default: on when the CI environment variable is set]
+    #[arg(long, conflicts_with = "allow_incomplete")]
+    pub require_complete: bool,
+
+    /// Report an incomplete review with a warning instead of failing it
+    #[arg(long)]
+    pub allow_incomplete: bool,
+
     /// Output format: text, json, sarif, markdown [default: text]
     #[arg(short, long)]
     pub format: Option<String>,

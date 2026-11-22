@@ -110,6 +110,50 @@ pub fn to_sarif(summary: &ReviewSummary, tool_version: &str, model: &str) -> Val
     })
 }
 
+/// Record whether the review covered everything, in the places SARIF defines
+/// for it.
+///
+/// `invocations[].executionSuccessful` is SARIF's own "did the tool finish"
+/// flag; consumers that understand it will not read an empty `results` array
+/// from an incomplete run as "clean". Skipped units are listed as
+/// `toolExecutionNotifications`, and the full structured record sits under
+/// `runs[0].properties.completeness` for anything that wants the numbers.
+pub fn attach_completeness(sarif: &mut Value, completeness: &crate::analyzer::Completeness) {
+    let notifications: Vec<Value> = completeness
+        .skipped
+        .iter()
+        .map(|s| {
+            json!({
+                "level": "error",
+                "message": {
+                    "text": format!(
+                        "unit {} ({}) was not reviewed: {} — {}",
+                        s.unit_id,
+                        s.files.join(", "),
+                        s.reason.as_str(),
+                        truncate(&s.detail, 300)
+                    )
+                },
+                "descriptor": { "id": format!("diffmind/{}", s.reason.as_str()) },
+            })
+        })
+        .collect();
+    let invocation = json!({
+        "executionSuccessful": completeness.status == "complete",
+        "toolExecutionNotifications": notifications,
+    });
+    if let Some(run) = sarif
+        .get_mut("runs")
+        .and_then(|r| r.as_array_mut())
+        .and_then(|r| r.first_mut())
+    {
+        run["invocations"] = json!([invocation]);
+        if let Ok(c) = serde_json::to_value(completeness) {
+            run["properties"]["completeness"] = c;
+        }
+    }
+}
+
 fn message_text(f: &ReviewFinding) -> String {
     if f.suggested_fix.trim().is_empty() {
         f.issue.clone()
