@@ -29,7 +29,7 @@
     "access": "public"
   },
   "bin": {
-    "diffmind": "./bin/diffmind.js"
+    "diffmind": "bin/diffmind.js"
   },
   "files": [
     "bin/diffmind.js",

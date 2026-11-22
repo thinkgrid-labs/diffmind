@@ -245,39 +245,43 @@ jobs:
       # packages that do not exist — `npm i -g @diffmind/cli` then installs a
       # launcher with no binary to launch. That went unnoticed for several
       # releases, so assert the whole set is really on the registry.
+      #
+      # Don't use `npm view` here. It reads the packument through npm's CDN,
+      # which keeps serving a cached "not found" for minutes after a publish.
+      # v0.9.3 failed this step with all six packages live: three were
+      # reported MISSING after a 50 s window. Instead, query the per-version
+      # document with a unique query string, so the CDN can't serve a cached
+      # copy (the response has cf-cache-status: DYNAMIC). Poll the packages
+      # still missing until a 5-minute deadline.
       - name: Verify all six packages published
         run: |
           set -uo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGES="@diffmind/cli"
+          PENDING="@diffmind/cli"
           for dir in ./npm/platform/*/; do
-            PACKAGES="${PACKAGES} @diffmind/cli-$(basename "${dir}")"
+            PENDING="${PENDING} @diffmind/cli-$(basename "${dir}")"
           done
 
-          MISSING=""
-          for pkg in ${PACKAGES}; do
-            # The registry is read-through-cached, so a fresh publish can take a
-            # moment to become visible.
-            FOUND=""
-            for attempt in 1 2 3 4 5; do
-              if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
-                FOUND="yes"
-                break
+          DEADLINE=$(( $(date +%s) + 300 ))
+          while :; do
+            STILL=""
+            for pkg in ${PENDING}; do
+              url="https://registry.npmjs.org/${pkg/\//%2F}/${VERSION}?nocache=$(date +%s%N)"
+              code=$(curl -s -o /dev/null -w '%{http_code}' "${url}")
+              if [ "${code}" = "200" ]; then
+                echo "  ok       ${pkg}@${VERSION}"
+              else
+                STILL="${STILL} ${pkg}"
               fi
-              sleep 10
             done
-            if [ -n "${FOUND}" ]; then
-              echo "  ok       ${pkg}@${VERSION}"
-            else
-              echo "  MISSING  ${pkg}@${VERSION}"
-              MISSING="${MISSING} ${pkg}"
+            PENDING="${STILL# }"
+            [ -z "${PENDING}" ] && break
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              for pkg in ${PENDING}; do echo "  MISSING  ${pkg}@${VERSION}"; done
+              echo "::error::not on the registry after 5 min: ${PENDING}"
+              exit 1
             fi
+            echo "  waiting on: ${PENDING}"
+            sleep 15
           done
-
-          if [ -n "${MISSING}" ]; then
-            echo "::error::not published:${MISSING}"
-            exit 1
-          fi
           echo "All packages published at ${VERSION}."
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
