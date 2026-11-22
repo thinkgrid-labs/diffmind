@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — v0.9.3
+## [0.9.3] — 11-22-2026
 
 A stabilization release: security, correctness and reliability hardening, with
 no new review features. The headline is that **a review that did not cover the
